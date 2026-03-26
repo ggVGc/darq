@@ -1,6 +1,8 @@
 pub mod engine;
 pub mod error;
+pub mod ir;
+pub mod lower;
 pub mod rdf;
+pub mod resource_store;
 pub mod schema;
 pub mod sparql;
-pub mod store;

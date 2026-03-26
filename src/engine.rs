@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
-use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
+use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
+use crate::rdf::{Iri, Term, RDF_TYPE};
+use crate::resource_store::ResourceStore;
 use crate::schema::Schema;
 use crate::sparql::ast::*;
 use crate::sparql::{self, parser};
-use crate::store::{self, Binding, IriPattern, TermPattern, TripleStore};
+
+/// One solution row: a mapping from variable names to bound terms.
+pub type Binding = HashMap<String, Term>;
 
 /// The result of a SELECT query.
 #[derive(Debug)]
@@ -14,11 +18,11 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Option<Term>>>,
 }
 
-/// Execute a SPARQL SELECT query against a store with a known schema.
+/// Execute a SPARQL SELECT query against a resource store with a known schema.
 pub fn execute(
     query_str: &str,
     schema: &Schema,
-    store: &TripleStore,
+    store: &ResourceStore,
 ) -> Result<QueryResult, DarqError> {
     // 1. Parse
     let mut query = parser::parse(query_str)?;
@@ -29,20 +33,23 @@ pub fn execute(
     // 3. Validate predicates against schema
     validate_predicates(&query, schema)?;
 
-    // 4. Evaluate basic graph pattern
-    let bindings = evaluate_bgp(&query.where_pattern, store, schema);
+    // 4. Lower to resource-level IR
+    let plan = crate::lower::lower(&query, schema)?;
 
-    // 5. Apply solution modifiers
-    let bindings = apply_modifiers(bindings, &query.modifier);
+    // 5. Evaluate plan
+    let bindings = evaluate_plan(&plan, store, schema);
 
-    // 6. Project to selected variables
-    project(bindings, &query.select, &query.where_pattern)
+    // 6. Apply solution modifiers
+    let bindings = apply_modifiers(bindings, &plan.modifier);
+
+    // 7. Project to selected variables
+    project(bindings, &plan)
 }
 
 /// Validate that all concrete predicates in the query are known to the schema.
 fn validate_predicates(query: &SelectQuery, schema: &Schema) -> Result<(), DarqError> {
     for pattern in &query.where_pattern.patterns {
-        if let Some(iri) = as_concrete_iri(&pattern.predicate) {
+        if let TermOrVariable::Iri(iri) = &pattern.predicate {
             if !schema.is_known_predicate(iri) {
                 return Err(DarqError::UnknownPredicate(iri.clone()));
             }
@@ -51,117 +58,108 @@ fn validate_predicates(query: &SelectQuery, schema: &Schema) -> Result<(), DarqE
     Ok(())
 }
 
-/// Extract a concrete IRI from a TermOrVariable, if it is one.
-fn as_concrete_iri(tov: &TermOrVariable) -> Option<&Iri> {
-    match tov {
-        TermOrVariable::Iri(iri) => Some(iri),
-        TermOrVariable::RdfType => None, // rdf:type is always valid
-        _ => None,
-    }
-}
-
-/// Convert an AST node in subject/predicate position to an IriPattern.
-fn to_iri_pattern(tov: &TermOrVariable, binding: &Binding) -> IriPattern {
-    match tov {
-        TermOrVariable::Variable(Variable(name)) => {
-            if let Some(term) = binding.get(name) {
-                match term {
-                    Term::Iri(iri) => IriPattern::Bound(iri.clone()),
-                    _ => IriPattern::Variable(name.clone()), // shouldn't happen
-                }
-            } else {
-                IriPattern::Variable(name.clone())
-            }
-        }
-        TermOrVariable::Iri(iri) => IriPattern::Bound(iri.clone()),
-        TermOrVariable::RdfType => IriPattern::Bound(Iri::new(RDF_TYPE)),
-        TermOrVariable::Literal(_) => {
-            unreachable!("literal cannot appear in subject/predicate position")
-        }
-        TermOrVariable::PrefixedName { .. } => {
-            unreachable!("prefixed names should be expanded before evaluation")
-        }
-    }
-}
-
-/// Convert an AST node in object position to a TermPattern.
-fn to_term_pattern(tov: &TermOrVariable, binding: &Binding) -> TermPattern {
-    match tov {
-        TermOrVariable::Variable(Variable(name)) => {
-            if let Some(term) = binding.get(name) {
-                TermPattern::Bound(term.clone())
-            } else {
-                TermPattern::Variable(name.clone())
-            }
-        }
-        TermOrVariable::Iri(iri) => TermPattern::Bound(Term::Iri(iri.clone())),
-        TermOrVariable::RdfType => TermPattern::Bound(Term::Iri(Iri::new(RDF_TYPE))),
-        TermOrVariable::Literal(lit) => TermPattern::Bound(ast_lit_to_term(lit)),
-        TermOrVariable::PrefixedName { .. } => {
-            unreachable!("prefixed names should be expanded before evaluation")
-        }
-    }
-}
-
-fn ast_lit_to_term(lit: &AstLiteral) -> Term {
-    match lit {
-        AstLiteral::String(s) => Term::Literal(Literal::String(s.clone())),
-        AstLiteral::Integer(n) => Term::Literal(Literal::Integer(*n)),
-        AstLiteral::Boolean(b) => Term::Literal(Literal::Boolean(*b)),
-    }
-}
-
-/// If the predicate is an unbound variable, return its name.
-fn unbound_predicate_var(tov: &TermOrVariable, binding: &Binding) -> Option<String> {
-    if let TermOrVariable::Variable(Variable(name)) = tov {
-        if !binding.contains_key(name) {
-            return Some(name.clone());
-        }
-    }
-    None
-}
-
-/// Evaluate a basic graph pattern using nested-loop join.
-/// Variable predicates are expanded over all known predicates in the schema.
-fn evaluate_bgp(
-    pattern: &GroupGraphPattern,
-    store: &TripleStore,
+/// Evaluate a resource-level query plan using nested-loop join.
+fn evaluate_plan(
+    plan: &QueryPlan,
+    store: &ResourceStore,
     schema: &Schema,
 ) -> Vec<Binding> {
     let mut solutions: Vec<Binding> = vec![HashMap::new()];
 
-    for triple_pattern in &pattern.patterns {
+    for pattern in &plan.patterns {
         let mut next_solutions = Vec::new();
 
         for existing in &solutions {
-            if let Some(var_name) = unbound_predicate_var(&triple_pattern.predicate, existing) {
-                // Variable predicate: expand over all known predicates, union results
-                for pred_iri in schema.known_predicates() {
-                    let store_pattern = store::TriplePattern {
-                        subject: to_iri_pattern(&triple_pattern.subject, existing),
-                        predicate: IriPattern::Bound(pred_iri.clone()),
-                        object: to_term_pattern(&triple_pattern.object, existing),
+            match pattern {
+                QueryPattern::Resource {
+                    subject,
+                    type_iri,
+                    constraints,
+                    type_variable,
+                } => {
+                    let instances: Vec<_> = match type_iri {
+                        Some(ti) => store.instances_of(ti).iter().collect(),
+                        None => store.all_instances().collect(),
                     };
 
-                    for mut new_binding in store.match_pattern(&store_pattern) {
-                        new_binding.insert(var_name.clone(), Term::Iri(pred_iri.clone()));
-                        let mut merged = existing.clone();
-                        merged.extend(new_binding);
-                        next_solutions.push(merged);
+                    for instance in instances {
+                        if let Some(binding) = match_resource(
+                            subject,
+                            constraints,
+                            type_variable.as_deref(),
+                            instance,
+                            existing,
+                        ) {
+                            let mut merged = existing.clone();
+                            merged.extend(binding);
+                            next_solutions.push(merged);
+                        }
                     }
                 }
-            } else {
-                // Concrete or already-bound predicate: normal path
-                let store_pattern = store::TriplePattern {
-                    subject: to_iri_pattern(&triple_pattern.subject, existing),
-                    predicate: to_iri_pattern(&triple_pattern.predicate, existing),
-                    object: to_term_pattern(&triple_pattern.object, existing),
-                };
+                QueryPattern::FieldScan {
+                    subject,
+                    predicate_var,
+                    object,
+                    type_iri,
+                } => {
+                    let instances: Vec<_> = match type_iri {
+                        Some(ti) => store.instances_of(ti).iter().collect(),
+                        None => store.all_instances().collect(),
+                    };
 
-                for new_binding in store.match_pattern(&store_pattern) {
-                    let mut merged = existing.clone();
-                    merged.extend(new_binding);
-                    next_solutions.push(merged);
+                    for instance in instances {
+                        let subject_binding =
+                            match check_subject(subject, &instance.subject, existing) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+
+                        let fields_for_type =
+                            schema.fields_for_type(&instance.type_iri).unwrap_or(&[]);
+
+                        // Synthetic rdf:type field
+                        {
+                            let pred_term = Term::Iri(Iri::new(RDF_TYPE));
+                            let obj_term = Term::Iri(instance.type_iri.clone());
+                            if let Some(obj_binding) =
+                                check_value(object, &obj_term, existing, &subject_binding)
+                            {
+                                let mut merged = existing.clone();
+                                merged.extend(subject_binding.clone());
+                                if check_and_bind_var(
+                                    predicate_var,
+                                    &pred_term,
+                                    existing,
+                                    &mut merged,
+                                ) {
+                                    merged.extend(obj_binding);
+                                    next_solutions.push(merged);
+                                }
+                            }
+                        }
+
+                        // Real fields
+                        for fd in fields_for_type {
+                            if let Some(field_value) = instance.fields.get(fd.name) {
+                                let pred_term = Term::Iri(fd.predicate.clone());
+                                if let Some(obj_binding) =
+                                    check_value(object, field_value, existing, &subject_binding)
+                                {
+                                    let mut merged = existing.clone();
+                                    merged.extend(subject_binding.clone());
+                                    if check_and_bind_var(
+                                        predicate_var,
+                                        &pred_term,
+                                        existing,
+                                        &mut merged,
+                                    ) {
+                                        merged.extend(obj_binding);
+                                        next_solutions.push(merged);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -172,9 +170,188 @@ fn evaluate_bgp(
     solutions
 }
 
+/// Try to match a resource instance against a Resource pattern.
+fn match_resource(
+    subject: &Subject,
+    constraints: &[FieldConstraint],
+    type_variable: Option<&str>,
+    instance: &crate::resource_store::ResourceInstance,
+    existing: &Binding,
+) -> Option<Binding> {
+    let mut new_bindings = Binding::new();
+
+    // Check/bind subject
+    match subject {
+        Subject::Variable(name) => {
+            let term = Term::Iri(instance.subject.clone());
+            if let Some(existing_val) = existing.get(name) {
+                if *existing_val != term {
+                    return None;
+                }
+            } else if let Some(already) = new_bindings.get(name) {
+                if *already != term {
+                    return None;
+                }
+            } else {
+                new_bindings.insert(name.clone(), term);
+            }
+        }
+        Subject::Bound(iri) => {
+            if *iri != instance.subject {
+                return None;
+            }
+        }
+    }
+
+    // Bind type variable if requested
+    if let Some(tv) = type_variable {
+        let term = Term::Iri(instance.type_iri.clone());
+        if let Some(existing_val) = existing.get(tv) {
+            if *existing_val != term {
+                return None;
+            }
+        } else if let Some(already) = new_bindings.get(tv) {
+            if *already != term {
+                return None;
+            }
+        } else {
+            new_bindings.insert(tv.to_string(), term);
+        }
+    }
+
+    // Check all field constraints
+    for constraint in constraints {
+        let field_value = instance.fields.get(&constraint.field_name)?;
+
+        match &constraint.value {
+            Value::Bound(expected) => {
+                if field_value != expected {
+                    return None;
+                }
+            }
+            Value::Variable(name) => {
+                if let Some(existing_val) = existing.get(name) {
+                    if existing_val != field_value {
+                        return None;
+                    }
+                } else if let Some(already) = new_bindings.get(name) {
+                    if already != field_value {
+                        return None;
+                    }
+                } else {
+                    new_bindings.insert(name.clone(), field_value.clone());
+                }
+            }
+        }
+    }
+
+    Some(new_bindings)
+}
+
+/// Check if a subject pattern matches an instance subject.
+fn check_subject(
+    subject: &Subject,
+    actual: &Iri,
+    existing: &Binding,
+) -> Option<Binding> {
+    let mut binding = Binding::new();
+    match subject {
+        Subject::Variable(name) => {
+            let term = Term::Iri(actual.clone());
+            if let Some(existing_val) = existing.get(name) {
+                if *existing_val != term {
+                    return None;
+                }
+            } else {
+                binding.insert(name.clone(), term);
+            }
+        }
+        Subject::Bound(iri) => {
+            if *iri != *actual {
+                return None;
+            }
+        }
+    }
+    Some(binding)
+}
+
+/// Check/bind a variable against a term. Returns true if consistent.
+fn check_and_bind_var(
+    var_name: &str,
+    term: &Term,
+    existing: &Binding,
+    merged: &mut Binding,
+) -> bool {
+    if let Some(existing_val) = existing.get(var_name) {
+        if *existing_val != *term {
+            return false;
+        }
+    } else if let Some(already) = merged.get(var_name) {
+        if *already != *term {
+            return false;
+        }
+    } else {
+        merged.insert(var_name.to_string(), term.clone());
+    }
+    true
+}
+
+/// Check a Value constraint against an actual term.
+fn check_value(
+    value: &Value,
+    actual: &Term,
+    existing: &Binding,
+    subject_binding: &Binding,
+) -> Option<Binding> {
+    let mut binding = Binding::new();
+    match value {
+        Value::Bound(expected) => {
+            if expected != actual {
+                return None;
+            }
+        }
+        Value::Variable(name) => {
+            if let Some(existing_val) = existing.get(name) {
+                if *existing_val != *actual {
+                    return None;
+                }
+            } else if let Some(subj_val) = subject_binding.get(name) {
+                if *subj_val != *actual {
+                    return None;
+                }
+            } else {
+                binding.insert(name.clone(), actual.clone());
+            }
+        }
+    }
+    Some(binding)
+}
+
+/// Project bindings to the requested variables.
+fn project(
+    bindings: Vec<Binding>,
+    plan: &QueryPlan,
+) -> Result<QueryResult, DarqError> {
+    let variables = match &plan.select {
+        SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect(),
+        SelectClause::Star => plan.collect_variables(),
+    };
+
+    let rows = bindings
+        .into_iter()
+        .map(|binding| {
+            variables
+                .iter()
+                .map(|var| binding.get(var).cloned())
+                .collect()
+        })
+        .collect();
+
+    Ok(QueryResult { variables, rows })
+}
+
 /// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
 fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
-    // DISTINCT
     if modifier.distinct {
         let mut seen = HashSet::new();
         bindings.retain(|b| {
@@ -184,7 +361,6 @@ fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> V
         });
     }
 
-    // ORDER BY
     if !modifier.order_by.is_empty() {
         bindings.sort_by(|a, b| {
             for cond in &modifier.order_by {
@@ -203,7 +379,6 @@ fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> V
         });
     }
 
-    // OFFSET
     if let Some(offset) = modifier.offset {
         if offset < bindings.len() {
             bindings = bindings.into_iter().skip(offset).collect();
@@ -212,7 +387,6 @@ fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> V
         }
     }
 
-    // LIMIT
     if let Some(limit) = modifier.limit {
         bindings.truncate(limit);
     }
@@ -220,56 +394,12 @@ fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> V
     bindings
 }
 
-/// Project bindings to the requested variables.
-fn project(
-    bindings: Vec<Binding>,
-    select: &SelectClause,
-    pattern: &GroupGraphPattern,
-) -> Result<QueryResult, DarqError> {
-    let variables = match select {
-        SelectClause::Variables(vars) => {
-            vars.iter().map(|v| v.0.clone()).collect()
-        }
-        SelectClause::Star => {
-            // Collect all variables mentioned in the pattern
-            let mut vars = Vec::new();
-            let mut seen = HashSet::new();
-            for tp in &pattern.patterns {
-                collect_variables(&tp.subject, &mut vars, &mut seen);
-                collect_variables(&tp.predicate, &mut vars, &mut seen);
-                collect_variables(&tp.object, &mut vars, &mut seen);
-            }
-            vars
-        }
-    };
-
-    let rows = bindings
-        .into_iter()
-        .map(|binding| {
-            variables
-                .iter()
-                .map(|var| binding.get(var).cloned())
-                .collect()
-        })
-        .collect();
-
-    Ok(QueryResult { variables, rows })
-}
-
-fn collect_variables(tov: &TermOrVariable, vars: &mut Vec<String>, seen: &mut HashSet<String>) {
-    if let TermOrVariable::Variable(Variable(name)) = tov {
-        if seen.insert(name.clone()) {
-            vars.push(name.clone());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rdf::{Iri, Literal, Term};
+    use crate::resource_store::ResourceStore;
     use crate::schema::{FieldDescriptor, Resource, Schema};
-    use crate::store::TripleStore;
 
     struct Person {
         id: String,
@@ -304,11 +434,11 @@ mod tests {
         }
     }
 
-    fn setup() -> (Schema, TripleStore) {
+    fn setup() -> (Schema, ResourceStore) {
         let mut schema = Schema::new();
         schema.register::<Person>();
 
-        let mut store = TripleStore::new();
+        let mut store = ResourceStore::new();
         store.load(&Person { id: "alice".into(), name: "Alice".into(), age: 30 });
         store.load(&Person { id: "bob".into(), name: "Bob".into(), age: 25 });
 
@@ -415,10 +545,8 @@ mod tests {
         ).unwrap();
 
         assert_eq!(result.rows.len(), 2);
-        // Alice, 30
         assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
         assert_eq!(result.rows[0][1], Some(Term::Literal(Literal::Integer(30))));
-        // Bob, 25
         assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
         assert_eq!(result.rows[1][1], Some(Term::Literal(Literal::Integer(25))));
     }

@@ -48,12 +48,4 @@ impl std::fmt::Display for Term {
     }
 }
 
-/// A single RDF triple. Subject and predicate are always IRIs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Triple {
-    pub subject: Iri,
-    pub predicate: Iri,
-    pub object: Term,
-}
-
 pub const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";

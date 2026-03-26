@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use darq::engine;
 use darq::rdf::{Iri, Term};
+use darq::resource_store::ResourceStore;
 use darq::schema::{FieldDescriptor, Resource, Schema};
-use darq::store::TripleStore;
 
 struct Person {
     id: String,
@@ -47,7 +47,7 @@ fn main() {
 
     println!("Loading {} people...", count);
     let t = Instant::now();
-    let mut store = TripleStore::new();
+    let mut store = ResourceStore::new();
     for i in 0..count {
         store.load(&Person {
             id: format!("{}", i),

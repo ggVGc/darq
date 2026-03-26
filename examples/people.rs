@@ -1,7 +1,7 @@
 use darq::engine;
 use darq::rdf::{Iri, Term};
+use darq::resource_store::ResourceStore;
 use darq::schema::{FieldDescriptor, Resource, Schema};
-use darq::store::TripleStore;
 
 // ---------------------------------------------------------------------------
 // Data model: each struct maps to an RDF type, fields map to predicates.
@@ -49,7 +49,7 @@ fn main() {
     let mut schema = Schema::new();
     schema.register::<Person>();
 
-    let mut store = TripleStore::new();
+    let mut store = ResourceStore::new();
     store.load(&Person { id: "alice".into(), name: "Alice".into(), age: 30 });
     store.load(&Person { id: "bob".into(), name: "Bob".into(), age: 25 });
     store.load(&Person { id: "carol".into(), name: "Carol".into(), age: 35 });
@@ -94,7 +94,7 @@ fn main() {
     run_query(query, &schema, &store);
 }
 
-fn run_query(query: &str, schema: &Schema, store: &TripleStore) {
+fn run_query(query: &str, schema: &Schema, store: &ResourceStore) {
     match engine::execute(query, schema, store) {
         Ok(result) => {
             // Header

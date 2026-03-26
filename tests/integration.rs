@@ -1,8 +1,8 @@
 use darq::engine;
 use darq::error::DarqError;
 use darq::rdf::{Iri, Literal, Term};
+use darq::resource_store::ResourceStore;
 use darq::schema::{FieldDescriptor, Resource, Schema};
-use darq::store::TripleStore;
 
 // ---------------------------------------------------------------------------
 // Test data model
@@ -41,11 +41,11 @@ impl Resource for Person {
     }
 }
 
-fn setup() -> (Schema, TripleStore) {
+fn setup() -> (Schema, ResourceStore) {
     let mut schema = Schema::new();
     schema.register::<Person>();
 
-    let mut store = TripleStore::new();
+    let mut store = ResourceStore::new();
     store.load(&Person { id: "alice".into(), name: "Alice".into(), age: 30 });
     store.load(&Person { id: "bob".into(), name: "Bob".into(), age: 25 });
     store.load(&Person { id: "carol".into(), name: "Carol".into(), age: 35 });
@@ -230,7 +230,7 @@ fn test_empty_result() {
 #[test]
 fn test_variable_predicate_expansion() {
     let (schema, store) = setup();
-    // ?s ?p ?o should expand over all known predicates and return all triples
+    // ?s ?p ?o should expand over all fields and return all data
     let result = engine::execute(
         "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
         &schema,
@@ -238,7 +238,7 @@ fn test_variable_predicate_expansion() {
     )
     .unwrap();
 
-    // 3 people x 3 predicates (rdf:type, name, age) = 9 triples
+    // 3 people x 3 fields (rdf:type, name, age) = 9 rows
     assert_eq!(result.rows.len(), 9);
     // ?p should be bound to actual predicate IRIs
     assert!(result.variables.contains(&"p".to_string()));
@@ -254,7 +254,7 @@ fn test_variable_predicate_expansion() {
 #[test]
 fn test_variable_predicate_constrained_by_prior_pattern() {
     let (schema, store) = setup();
-    // First pattern binds ?p to ex:name, second pattern reuses ?p (already bound)
+    // First pattern binds ?person via ex:name, second pattern scans fields
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -270,6 +270,6 @@ fn test_variable_predicate_constrained_by_prior_pattern() {
     )
     .unwrap();
 
-    // Each of 3 people has 3 triples matched by ?person ?p ?o = 9 rows
+    // Each of 3 people has 3 fields scanned by ?person ?p ?o = 9 rows
     assert_eq!(result.rows.len(), 9);
 }

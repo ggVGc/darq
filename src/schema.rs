@@ -1,14 +1,15 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use crate::rdf::{Iri, Literal, Term, Triple, RDF_TYPE};
+use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 
 /// Describes one field on a Resource: its predicate IRI and Rust field name.
+#[derive(Clone)]
 pub struct FieldDescriptor {
     pub predicate: Iri,
     pub name: &'static str,
 }
 
-/// Implemented by any Rust type that can be projected into RDF triples.
+/// Implemented by any Rust type that can be stored and queried as a resource.
 pub trait Resource {
     /// The rdf:type IRI for this resource (e.g. `<http://example.org/Person>`).
     fn rdf_type() -> Iri;
@@ -23,64 +24,98 @@ pub trait Resource {
     /// Return the object Term for each field, in the same order as
     /// `field_descriptors()`.
     fn field_values(&self) -> Vec<Term>;
-
-    /// Convert this instance into a set of triples.
-    fn to_triples(&self) -> Vec<Triple> {
-        let subject = self.subject_iri();
-        let mut triples = Vec::new();
-
-        // rdf:type triple
-        triples.push(Triple {
-            subject: subject.clone(),
-            predicate: Iri::new(RDF_TYPE),
-            object: Term::Iri(Self::rdf_type()),
-        });
-
-        // One triple per field
-        for (descriptor, value) in Self::field_descriptors()
-            .into_iter()
-            .zip(self.field_values())
-        {
-            triples.push(Triple {
-                subject: subject.clone(),
-                predicate: descriptor.predicate,
-                object: value,
-            });
-        }
-
-        triples
-    }
 }
 
-/// The schema knows every valid predicate across all registered resource types.
-/// Used to validate queries before execution.
+/// Static information about a registered resource type.
+pub struct TypeInfo {
+    pub type_iri: Iri,
+    pub fields: Vec<FieldDescriptor>,
+}
+
+/// The schema knows every registered resource type and its fields.
+/// Used to validate queries and map predicates to field names.
 pub struct Schema {
-    known_predicates: HashSet<Iri>,
+    types: HashMap<Iri, TypeInfo>,
+    predicate_to_types: HashMap<Iri, Vec<Iri>>,
 }
 
 impl Schema {
     pub fn new() -> Self {
-        let mut known_predicates = HashSet::new();
-        // rdf:type is always valid
-        known_predicates.insert(Iri::new(RDF_TYPE));
-        Schema { known_predicates }
+        Schema {
+            types: HashMap::new(),
+            predicate_to_types: HashMap::new(),
+        }
     }
 
-    /// Register a Resource type's predicates.
+    /// Register a Resource type and all its predicates.
     pub fn register<R: Resource>(&mut self) {
-        for fd in R::field_descriptors() {
-            self.known_predicates.insert(fd.predicate);
+        let type_iri = R::rdf_type();
+        let fields = R::field_descriptors();
+
+        for fd in &fields {
+            self.predicate_to_types
+                .entry(fd.predicate.clone())
+                .or_default()
+                .push(type_iri.clone());
         }
+
+        self.types.insert(
+            type_iri.clone(),
+            TypeInfo {
+                type_iri,
+                fields,
+            },
+        );
     }
 
     /// Check whether a predicate IRI is known.
     pub fn is_known_predicate(&self, pred: &Iri) -> bool {
-        self.known_predicates.contains(pred)
+        *pred == Iri::new(RDF_TYPE) || self.predicate_to_types.contains_key(pred)
     }
 
-    /// Return all known predicate IRIs.
-    pub fn known_predicates(&self) -> &HashSet<Iri> {
-        &self.known_predicates
+    /// Return all known predicate IRIs (including rdf:type).
+    pub fn known_predicates(&self) -> HashSet<Iri> {
+        let mut preds: HashSet<Iri> = self.predicate_to_types.keys().cloned().collect();
+        preds.insert(Iri::new(RDF_TYPE));
+        preds
+    }
+
+    /// Look up the field name for a predicate on a given type.
+    pub fn field_name(&self, type_iri: &Iri, predicate: &Iri) -> Option<&str> {
+        self.types.get(type_iri).and_then(|info| {
+            info.fields
+                .iter()
+                .find(|fd| fd.predicate == *predicate)
+                .map(|fd| fd.name)
+        })
+    }
+
+    /// Look up the predicate IRI for a field name on a given type.
+    pub fn predicate_for_field(&self, type_iri: &Iri, field_name: &str) -> Option<&Iri> {
+        self.types.get(type_iri).and_then(|info| {
+            info.fields
+                .iter()
+                .find(|fd| fd.name == field_name)
+                .map(|fd| &fd.predicate)
+        })
+    }
+
+    /// Return which types have a given predicate.
+    pub fn types_for_predicate(&self, predicate: &Iri) -> &[Iri] {
+        self.predicate_to_types
+            .get(predicate)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Return the field descriptors for a type.
+    pub fn fields_for_type(&self, type_iri: &Iri) -> Option<&[FieldDescriptor]> {
+        self.types.get(type_iri).map(|info| info.fields.as_slice())
+    }
+
+    /// Iterate over all registered type IRIs.
+    pub fn known_types(&self) -> impl Iterator<Item = &Iri> {
+        self.types.keys()
     }
 }
 
@@ -147,35 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn test_to_triples() {
-        let alice = Person {
-            id: "alice".into(),
-            name: "Alice".into(),
-            age: 30,
-        };
-        let triples = alice.to_triples();
-        assert_eq!(triples.len(), 3);
-
-        // rdf:type triple
-        assert_eq!(triples[0].predicate, Iri::new(RDF_TYPE));
-        assert_eq!(
-            triples[0].object,
-            Term::Iri(Iri::new("http://example.org/Person"))
-        );
-
-        // name triple
-        assert_eq!(
-            triples[1].predicate,
-            Iri::new("http://example.org/name")
-        );
-        assert_eq!(triples[1].object, Term::Literal(Literal::String("Alice".into())));
-
-        // age triple
-        assert_eq!(triples[2].predicate, Iri::new("http://example.org/age"));
-        assert_eq!(triples[2].object, Term::Literal(Literal::Integer(30)));
-    }
-
-    #[test]
     fn test_schema_register() {
         let mut schema = Schema::new();
         schema.register::<Person>();
@@ -184,5 +190,23 @@ mod tests {
         assert!(schema.is_known_predicate(&Iri::new("http://example.org/name")));
         assert!(schema.is_known_predicate(&Iri::new("http://example.org/age")));
         assert!(!schema.is_known_predicate(&Iri::new("http://example.org/email")));
+    }
+
+    #[test]
+    fn test_schema_type_lookups() {
+        let mut schema = Schema::new();
+        schema.register::<Person>();
+
+        let person_type = Iri::new("http://example.org/Person");
+        let name_pred = Iri::new("http://example.org/name");
+
+        assert_eq!(schema.field_name(&person_type, &name_pred), Some("name"));
+        assert_eq!(
+            schema.predicate_for_field(&person_type, "name"),
+            Some(&name_pred)
+        );
+        assert_eq!(schema.types_for_predicate(&name_pred), &[person_type.clone()]);
+        assert!(schema.fields_for_type(&person_type).is_some());
+        assert_eq!(schema.fields_for_type(&person_type).unwrap().len(), 2);
     }
 }
