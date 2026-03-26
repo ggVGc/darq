@@ -1,204 +1,328 @@
-use nom::{
-    IResult,
-    branch::alt,
-    bytes::complete::{tag, tag_no_case, take_while, take_while1},
-    character::complete::{char, digit1},
-    combinator::{map, map_res, opt, value},
-    multi::separated_list1,
-    sequence::{delimited, pair, terminated, tuple},
-};
-
 use crate::error::DarqError;
 use crate::rdf::Iri;
 use super::ast::*;
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
+/// Parser state: wraps the input string with a cursor position.
+struct Parser<'a> {
+    input: &'a str,
+    pos: usize,
+}
 
-pub fn parse(input: &str) -> Result<SelectQuery, DarqError> {
-    let input = input.trim();
-    match select_query(input) {
-        Ok(("", query)) => Ok(query),
-        Ok((rest, _)) => Err(DarqError::ParseError(format!(
-            "unexpected trailing input: {:?}",
-            truncate(rest, 50)
-        ))),
-        Err(e) => Err(DarqError::ParseError(format!("{}", e))),
+impl<'a> Parser<'a> {
+    fn new(input: &'a str) -> Self {
+        Parser { input, pos: 0 }
     }
-}
 
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
-}
-
-// ---------------------------------------------------------------------------
-// Whitespace / comments
-// ---------------------------------------------------------------------------
-
-fn ws(input: &str) -> IResult<&str, &str> {
-    take_while(|c: char| c.is_ascii_whitespace())(input)
-}
-
-/// Consume at least some whitespace (required separator).
-fn ws1(input: &str) -> IResult<&str, &str> {
-    take_while1(|c: char| c.is_ascii_whitespace())(input)
-}
-
-// ---------------------------------------------------------------------------
-// Top-level: SELECT query
-// ---------------------------------------------------------------------------
-
-fn select_query(input: &str) -> IResult<&str, SelectQuery> {
-    let (input, (base, prefixes)) = prologue(input)?;
-    let (input, _) = ws(input)?;
-    let (input, (select, distinct)) = select_clause(input)?;
-    let (input, _) = ws(input)?;
-    let (input, where_pattern) = where_clause(input)?;
-    let (input, _) = ws(input)?;
-    let (input, mut modifier) = solution_modifier(input)?;
-    modifier.distinct = distinct;
-
-    Ok((
-        input,
-        SelectQuery {
-            prefixes,
-            base,
-            select,
-            where_pattern,
-            modifier,
-        },
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Prologue: BASE and PREFIX declarations
-// ---------------------------------------------------------------------------
-
-fn prologue(input: &str) -> IResult<&str, (Option<Iri>, Vec<PrefixDecl>)> {
-    let mut base = None;
-    let mut prefixes = Vec::new();
-    let mut input = input;
-
-    loop {
-        let (rest, _) = ws(input)?;
-        if let Ok((rest2, iri)) = base_decl(rest) {
-            base = Some(iri);
-            input = rest2;
-        } else if let Ok((rest2, pd)) = prefix_decl(rest) {
-            prefixes.push(pd);
-            input = rest2;
-        } else {
-            return Ok((rest, (base, prefixes)));
-        }
+    fn remaining(&self) -> &'a str {
+        &self.input[self.pos..]
     }
-}
 
-fn base_decl(input: &str) -> IResult<&str, Iri> {
-    let (input, _) = tag_no_case("BASE")(input)?;
-    let (input, _) = ws1(input)?;
-    iri_ref(input)
-}
+    fn is_empty(&self) -> bool {
+        self.pos >= self.input.len()
+    }
 
-fn prefix_decl(input: &str) -> IResult<&str, PrefixDecl> {
-    let (input, _) = tag_no_case("PREFIX")(input)?;
-    let (input, _) = ws1(input)?;
-    let (input, prefix) = pname_ns_prefix(input)?;
-    let (input, _) = ws(input)?;
-    let (input, iri) = iri_ref(input)?;
-    Ok((input, PrefixDecl { prefix, iri }))
-}
+    /// Peek at the next character without consuming it.
+    fn peek(&self) -> Option<char> {
+        self.remaining().chars().next()
+    }
 
-/// Parse the prefix part of PNAME_NS: `foo:` returns "foo", `:` returns "".
-fn pname_ns_prefix(input: &str) -> IResult<&str, String> {
-    let (input, prefix) = take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')(input)?;
-    let (input, _) = char(':')(input)?;
-    Ok((input, prefix.to_string()))
-}
+    /// Advance past one character.
+    fn advance(&mut self, n: usize) {
+        self.pos += n;
+    }
 
-// ---------------------------------------------------------------------------
-// SELECT clause
-// ---------------------------------------------------------------------------
-
-fn select_clause(input: &str) -> IResult<&str, (SelectClause, bool)> {
-    let (input, _) = tag_no_case("SELECT")(input)?;
-    let (input, _) = ws1(input)?;
-
-    // Optional DISTINCT / REDUCED
-    let (input, distinct) = opt(alt((
-        value(true, terminated(tag_no_case("DISTINCT"), ws1)),
-        value(false, terminated(tag_no_case("REDUCED"), ws1)),
-    )))(input)?;
-    let distinct = distinct.unwrap_or(false);
-
-    // Star or variable list
-    let (input, clause) = alt((
-        value(SelectClause::Star, char('*')),
-        map(separated_list1(ws1, variable), SelectClause::Variables),
-    ))(input)?;
-
-    Ok((input, (clause, distinct)))
-}
-
-// ---------------------------------------------------------------------------
-// WHERE clause
-// ---------------------------------------------------------------------------
-
-fn where_clause(input: &str) -> IResult<&str, GroupGraphPattern> {
-    let (input, _) = opt(pair(tag_no_case("WHERE"), ws))(input)?;
-    group_graph_pattern(input)
-}
-
-fn group_graph_pattern(input: &str) -> IResult<&str, GroupGraphPattern> {
-    let (input, _) = char('{')(input)?;
-    let (input, _) = ws(input)?;
-    let (input, patterns) = triples_block(input)?;
-    let (input, _) = ws(input)?;
-    let (input, _) = char('}')(input)?;
-    Ok((input, GroupGraphPattern { patterns }))
-}
-
-// ---------------------------------------------------------------------------
-// Triples block: TriplesSameSubject separated by '.'
-// ---------------------------------------------------------------------------
-
-fn triples_block(input: &str) -> IResult<&str, Vec<TriplePattern>> {
-    let mut all_patterns = Vec::new();
-    let mut input = input;
-
-    // Parse first triple group
-    if let Ok((rest, patterns)) = triples_same_subject(input) {
-        all_patterns.extend(patterns);
-        input = rest;
-
-        // Parse subsequent '. TriplesSameSubject' groups
-        loop {
-            let (rest, _) = ws(input)?;
-            if let Ok((rest2, _)) = char::<&str, nom::error::Error<&str>>('.')(rest) {
-                let (rest2, _) = ws(rest2)?;
-                // After a dot, there might be another triple group or the closing '}'
-                if let Ok((rest3, patterns)) = triples_same_subject(rest2) {
-                    all_patterns.extend(patterns);
-                    input = rest3;
-                } else {
-                    // Trailing dot is fine
-                    input = rest2;
-                    break;
-                }
+    /// Skip ASCII whitespace.
+    fn skip_ws(&mut self) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_whitespace() {
+                self.advance(c.len_utf8());
             } else {
                 break;
             }
         }
     }
 
-    Ok((input, all_patterns))
+    /// Expect and consume at least one whitespace character.
+    fn expect_ws(&mut self) -> Result<(), DarqError> {
+        if self.peek().map_or(false, |c| c.is_ascii_whitespace()) {
+            self.skip_ws();
+            Ok(())
+        } else {
+            Err(self.error("expected whitespace"))
+        }
+    }
+
+    /// Expect and consume a specific character.
+    fn expect_char(&mut self, expected: char) -> Result<(), DarqError> {
+        match self.peek() {
+            Some(c) if c == expected => {
+                self.advance(c.len_utf8());
+                Ok(())
+            }
+            _ => Err(self.error(&format!("expected '{}'", expected))),
+        }
+    }
+
+    /// Try to consume a specific character. Returns true if consumed.
+    fn try_char(&mut self, expected: char) -> bool {
+        if self.peek() == Some(expected) {
+            self.advance(expected.len_utf8());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to consume a case-insensitive keyword followed by a word boundary.
+    /// Returns true if consumed.
+    fn try_keyword(&mut self, keyword: &str) -> bool {
+        let rem = self.remaining();
+        if rem.len() < keyword.len() {
+            return false;
+        }
+        if !rem[..keyword.len()].eq_ignore_ascii_case(keyword) {
+            return false;
+        }
+        // Must be at a word boundary: end of input or followed by non-alphanumeric
+        let after = &rem[keyword.len()..];
+        if let Some(c) = after.chars().next() {
+            if c.is_alphanumeric() || c == '_' {
+                return false;
+            }
+        }
+        self.advance(keyword.len());
+        true
+    }
+
+    /// Expect a case-insensitive keyword (error if not found).
+    fn expect_keyword(&mut self, keyword: &str) -> Result<(), DarqError> {
+        if self.try_keyword(keyword) {
+            Ok(())
+        } else {
+            Err(self.error(&format!("expected '{}'", keyword)))
+        }
+    }
+
+    /// Consume characters while the predicate holds. Returns the consumed slice.
+    fn take_while(&mut self, pred: impl Fn(char) -> bool) -> &'a str {
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if pred(c) {
+                self.advance(c.len_utf8());
+            } else {
+                break;
+            }
+        }
+        &self.input[start..self.pos]
+    }
+
+    /// Save the current position for backtracking.
+    fn save(&self) -> usize {
+        self.pos
+    }
+
+    /// Restore a previously saved position.
+    fn restore(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
+    /// Create an error at the current position.
+    fn error(&self, msg: &str) -> DarqError {
+        let remaining = self.remaining();
+        let context = if remaining.len() > 40 {
+            &remaining[..40]
+        } else {
+            remaining
+        };
+        DarqError::ParseError(format!("{} at: {:?}", msg, context))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+pub fn parse(input: &str) -> Result<SelectQuery, DarqError> {
+    let mut p = Parser::new(input.trim());
+    let query = parse_select_query(&mut p)?;
+    p.skip_ws();
+    if !p.is_empty() {
+        return Err(p.error("unexpected trailing input"));
+    }
+    Ok(query)
+}
+
+// ---------------------------------------------------------------------------
+// Top-level: SELECT query
+// ---------------------------------------------------------------------------
+
+fn parse_select_query(p: &mut Parser) -> Result<SelectQuery, DarqError> {
+    let (base, prefixes) = parse_prologue(p)?;
+    p.skip_ws();
+    let (select, distinct) = parse_select_clause(p)?;
+    p.skip_ws();
+    let where_pattern = parse_where_clause(p)?;
+    p.skip_ws();
+    let mut modifier = parse_solution_modifier(p)?;
+    modifier.distinct = distinct;
+
+    Ok(SelectQuery {
+        prefixes,
+        base,
+        select,
+        where_pattern,
+        modifier,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Prologue: BASE and PREFIX declarations
+// ---------------------------------------------------------------------------
+
+fn parse_prologue(p: &mut Parser) -> Result<(Option<Iri>, Vec<PrefixDecl>), DarqError> {
+    let mut base = None;
+    let mut prefixes = Vec::new();
+
+    loop {
+        p.skip_ws();
+        let saved = p.save();
+        if p.try_keyword("BASE") {
+            p.expect_ws()?;
+            base = Some(parse_iri_ref(p)?);
+        } else if p.try_keyword("PREFIX") {
+            p.expect_ws()?;
+            let prefix = parse_pname_ns_prefix(p)?;
+            p.skip_ws();
+            let iri = parse_iri_ref(p)?;
+            prefixes.push(PrefixDecl { prefix, iri });
+        } else {
+            p.restore(saved);
+            break;
+        }
+    }
+
+    Ok((base, prefixes))
+}
+
+/// Parse the prefix part of PNAME_NS: `foo:` returns "foo", `:` returns "".
+fn parse_pname_ns_prefix(p: &mut Parser) -> Result<String, DarqError> {
+    let prefix = p.take_while(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
+    let prefix = prefix.to_string();
+    p.expect_char(':')?;
+    Ok(prefix)
+}
+
+// ---------------------------------------------------------------------------
+// SELECT clause
+// ---------------------------------------------------------------------------
+
+fn parse_select_clause(p: &mut Parser) -> Result<(SelectClause, bool), DarqError> {
+    p.expect_keyword("SELECT")?;
+    p.expect_ws()?;
+
+    // Optional DISTINCT / REDUCED
+    let distinct = if p.try_keyword("DISTINCT") {
+        p.expect_ws()?;
+        true
+    } else if p.try_keyword("REDUCED") {
+        p.expect_ws()?;
+        false
+    } else {
+        false
+    };
+
+    // Star or variable list
+    let clause = if p.try_char('*') {
+        SelectClause::Star
+    } else {
+        let mut vars = vec![parse_variable(p)?];
+        loop {
+            let saved = p.save();
+            p.skip_ws();
+            match parse_variable(p) {
+                Ok(v) => vars.push(v),
+                Err(_) => {
+                    p.restore(saved);
+                    break;
+                }
+            }
+        }
+        SelectClause::Variables(vars)
+    };
+
+    Ok((clause, distinct))
+}
+
+// ---------------------------------------------------------------------------
+// WHERE clause
+// ---------------------------------------------------------------------------
+
+fn parse_where_clause(p: &mut Parser) -> Result<GroupGraphPattern, DarqError> {
+    // WHERE keyword is optional
+    let saved = p.save();
+    if p.try_keyword("WHERE") {
+        p.skip_ws();
+    } else {
+        p.restore(saved);
+    }
+    parse_group_graph_pattern(p)
+}
+
+fn parse_group_graph_pattern(p: &mut Parser) -> Result<GroupGraphPattern, DarqError> {
+    p.expect_char('{')?;
+    p.skip_ws();
+    let patterns = parse_triples_block(p)?;
+    p.skip_ws();
+    p.expect_char('}')?;
+    Ok(GroupGraphPattern { patterns })
+}
+
+// ---------------------------------------------------------------------------
+// Triples block
+// ---------------------------------------------------------------------------
+
+fn parse_triples_block(p: &mut Parser) -> Result<Vec<TriplePattern>, DarqError> {
+    let mut all_patterns = Vec::new();
+
+    // Try to parse the first triple group
+    let saved = p.save();
+    match parse_triples_same_subject(p) {
+        Ok(patterns) => {
+            all_patterns.extend(patterns);
+        }
+        Err(_) => {
+            p.restore(saved);
+            return Ok(all_patterns);
+        }
+    }
+
+    // Parse subsequent '. TriplesSameSubject' groups
+    loop {
+        p.skip_ws();
+        if !p.try_char('.') {
+            break;
+        }
+        p.skip_ws();
+        // After a dot, there might be another triple group or the closing '}'
+        let saved = p.save();
+        match parse_triples_same_subject(p) {
+            Ok(patterns) => all_patterns.extend(patterns),
+            Err(_) => {
+                // Trailing dot is fine
+                p.restore(saved);
+                break;
+            }
+        }
+    }
+
+    Ok(all_patterns)
 }
 
 /// Parse subject + property-list, desugaring ';' and ',' into flat triple patterns.
-fn triples_same_subject(input: &str) -> IResult<&str, Vec<TriplePattern>> {
-    let (input, subject) = term_or_variable(input)?;
-    let (input, _) = ws1(input)?;
-    let (input, pred_obj_pairs) = property_list_not_empty(input)?;
+fn parse_triples_same_subject(p: &mut Parser) -> Result<Vec<TriplePattern>, DarqError> {
+    let subject = parse_term_or_variable(p)?;
+    p.expect_ws()?;
+    let pred_obj_pairs = parse_property_list_not_empty(p)?;
 
     let mut patterns = Vec::new();
     for (predicate, objects) in pred_obj_pairs {
@@ -211,430 +335,364 @@ fn triples_same_subject(input: &str) -> IResult<&str, Vec<TriplePattern>> {
         }
     }
 
-    Ok((input, patterns))
+    Ok(patterns)
 }
 
 /// Parse: Verb ObjectList (';' Verb ObjectList)*
-/// Returns list of (predicate, objects) pairs.
-fn property_list_not_empty(
-    input: &str,
-) -> IResult<&str, Vec<(TermOrVariable, Vec<TermOrVariable>)>> {
-    let (input, first_pred) = verb(input)?;
-    let (input, _) = ws1(input)?;
-    let (input, first_objs) = object_list(input)?;
+fn parse_property_list_not_empty(
+    p: &mut Parser,
+) -> Result<Vec<(TermOrVariable, Vec<TermOrVariable>)>, DarqError> {
+    let first_pred = parse_verb(p)?;
+    p.expect_ws()?;
+    let first_objs = parse_object_list(p)?;
 
     let mut pairs = vec![(first_pred, first_objs)];
-    let mut input = input;
 
-    // Optional ';' separated additional predicate-object groups
     loop {
-        let (rest, _) = ws(input)?;
-        if let Ok((rest2, _)) = char::<&str, nom::error::Error<&str>>(';')(rest) {
-            let (rest2, _) = ws(rest2)?;
-            // After ';', there might be another verb or just end (trailing ';' is valid)
-            if let Ok((rest3, pred)) = verb(rest2) {
-                let (rest3, _) = ws1(rest3)?;
-                let (rest3, objs) = object_list(rest3)?;
-                pairs.push((pred, objs));
-                input = rest3;
-            } else {
-                input = rest2;
-                break;
-            }
-        } else {
+        let saved = p.save();
+        p.skip_ws();
+        if !p.try_char(';') {
+            p.restore(saved);
             break;
+        }
+        p.skip_ws();
+        // After ';', there might be another verb or just end (trailing ';' is valid)
+        match parse_verb(p) {
+            Ok(pred) => {
+                p.expect_ws()?;
+                let objs = parse_object_list(p)?;
+                pairs.push((pred, objs));
+            }
+            Err(_) => break,
         }
     }
 
-    Ok((input, pairs))
+    Ok(pairs)
 }
 
 /// Parse: Object (',' Object)*
-fn object_list(input: &str) -> IResult<&str, Vec<TermOrVariable>> {
-    let (input, first) = term_or_variable(input)?;
-    let mut objects = vec![first];
-    let mut input = input;
+fn parse_object_list(p: &mut Parser) -> Result<Vec<TermOrVariable>, DarqError> {
+    let mut objects = vec![parse_term_or_variable(p)?];
 
     loop {
-        let (rest, _) = ws(input)?;
-        if let Ok((rest2, _)) = char::<&str, nom::error::Error<&str>>(',')(rest) {
-            let (rest2, _) = ws(rest2)?;
-            let (rest2, obj) = term_or_variable(rest2)?;
-            objects.push(obj);
-            input = rest2;
-        } else {
+        let saved = p.save();
+        p.skip_ws();
+        if !p.try_char(',') {
+            p.restore(saved);
             break;
         }
+        p.skip_ws();
+        objects.push(parse_term_or_variable(p)?);
     }
 
-    Ok((input, objects))
+    Ok(objects)
 }
 
 /// Verb: VarOrIRIref | 'a'
-fn verb(input: &str) -> IResult<&str, TermOrVariable> {
-    alt((
-        rdf_type_keyword,
-        map(variable, TermOrVariable::Variable),
-        map(iri_ref, TermOrVariable::Iri),
-        prefixed_name,
-    ))(input)
+fn parse_verb(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
+    // Try 'a' keyword first (must be followed by whitespace, not part of a prefixed name)
+    if let Some(tov) = try_rdf_type_keyword(p) {
+        return Ok(tov);
+    }
+    // Try variable
+    if let Some(c) = p.peek() {
+        if c == '?' || c == '$' {
+            return Ok(TermOrVariable::Variable(parse_variable(p)?));
+        }
+    }
+    // Try IRI ref
+    if p.peek() == Some('<') {
+        return Ok(TermOrVariable::Iri(parse_iri_ref(p)?));
+    }
+    // Try prefixed name
+    parse_prefixed_name(p)
 }
 
-/// The 'a' keyword (shorthand for rdf:type).
-/// Must be followed by whitespace or specific delimiters to avoid matching
-/// prefixed names that start with 'a'.
-fn rdf_type_keyword(input: &str) -> IResult<&str, TermOrVariable> {
-    let (input, _) = char('a')(input)?;
-    // 'a' must be followed by whitespace (not part of a longer token)
-    if input.is_empty() || input.starts_with(|c: char| c.is_ascii_whitespace()) {
-        Ok((input, TermOrVariable::RdfType))
-    } else {
-        Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )))
+/// Try to parse the 'a' keyword (rdf:type shorthand).
+fn try_rdf_type_keyword(p: &mut Parser) -> Option<TermOrVariable> {
+    let saved = p.save();
+    if p.peek() != Some('a') {
+        return None;
+    }
+    p.advance(1);
+    // 'a' must be followed by whitespace or end of input (not part of a longer token)
+    match p.peek() {
+        None => Some(TermOrVariable::RdfType),
+        Some(c) if c.is_ascii_whitespace() => Some(TermOrVariable::RdfType),
+        _ => {
+            p.restore(saved);
+            None
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Solution modifiers: ORDER BY, LIMIT, OFFSET
+// Solution modifiers
 // ---------------------------------------------------------------------------
 
-fn solution_modifier(input: &str) -> IResult<&str, SolutionModifier> {
+fn parse_solution_modifier(p: &mut Parser) -> Result<SolutionModifier, DarqError> {
     let mut modifier = SolutionModifier::default();
-    let mut input = input;
 
     // ORDER BY
-    let (rest, _) = ws(input)?;
-    if let Ok((rest2, conditions)) = order_clause(rest) {
-        modifier.order_by = conditions;
-        input = rest2;
+    p.skip_ws();
+    let saved = p.save();
+    if p.try_keyword("ORDER") {
+        p.expect_ws()?;
+        p.expect_keyword("BY")?;
+        p.expect_ws()?;
+        modifier.order_by = parse_order_conditions(p)?;
     } else {
-        input = rest;
+        p.restore(saved);
     }
 
     // LIMIT and OFFSET can appear in either order
-    loop {
-        let (rest, _) = ws(input)?;
-        if modifier.limit.is_none() {
-            if let Ok((rest2, n)) = limit_clause(rest) {
-                modifier.limit = Some(n);
-                input = rest2;
-                continue;
+    for _ in 0..2 {
+        p.skip_ws();
+        let saved = p.save();
+        if modifier.limit.is_none() && p.try_keyword("LIMIT") {
+            p.expect_ws()?;
+            modifier.limit = Some(parse_usize(p)?);
+        } else {
+            p.restore(saved);
+            let saved = p.save();
+            if modifier.offset.is_none() && p.try_keyword("OFFSET") {
+                p.expect_ws()?;
+                modifier.offset = Some(parse_usize(p)?);
+            } else {
+                p.restore(saved);
             }
         }
-        if modifier.offset.is_none() {
-            if let Ok((rest2, n)) = offset_clause(rest) {
-                modifier.offset = Some(n);
-                input = rest2;
-                continue;
-            }
-        }
-        input = rest;
-        break;
     }
 
-    Ok((input, modifier))
+    Ok(modifier)
 }
 
-fn order_clause(input: &str) -> IResult<&str, Vec<OrderCondition>> {
-    let (input, _) = tag_no_case("ORDER")(input)?;
-    let (input, _) = ws1(input)?;
-    let (input, _) = tag_no_case("BY")(input)?;
-    let (input, _) = ws1(input)?;
-    separated_list1(ws1, order_condition)(input)
+fn parse_order_conditions(p: &mut Parser) -> Result<Vec<OrderCondition>, DarqError> {
+    let mut conditions = vec![parse_order_condition(p)?];
+    loop {
+        let saved = p.save();
+        p.skip_ws();
+        match parse_order_condition(p) {
+            Ok(cond) => conditions.push(cond),
+            Err(_) => {
+                p.restore(saved);
+                break;
+            }
+        }
+    }
+    Ok(conditions)
 }
 
-fn order_condition(input: &str) -> IResult<&str, OrderCondition> {
-    alt((
-        // ASC(?var) or DESC(?var)
-        map(
-            pair(
-                alt((
-                    value(OrderDirection::Ascending, tag_no_case("ASC")),
-                    value(OrderDirection::Descending, tag_no_case("DESC")),
-                )),
-                delimited(
-                    tuple((ws, char('('), ws)),
-                    variable,
-                    tuple((ws, char(')'))),
-                ),
-            ),
-            |(direction, var)| OrderCondition {
-                variable: var,
-                direction,
-            },
-        ),
-        // Bare ?var (defaults to ascending)
-        map(variable, |var| OrderCondition {
+fn parse_order_condition(p: &mut Parser) -> Result<OrderCondition, DarqError> {
+    // ASC(?var) or DESC(?var)
+    let saved = p.save();
+    if p.try_keyword("ASC") {
+        p.skip_ws();
+        p.expect_char('(')?;
+        p.skip_ws();
+        let var = parse_variable(p)?;
+        p.skip_ws();
+        p.expect_char(')')?;
+        return Ok(OrderCondition {
             variable: var,
             direction: OrderDirection::Ascending,
-        }),
-    ))(input)
+        });
+    }
+    p.restore(saved);
+
+    let saved = p.save();
+    if p.try_keyword("DESC") {
+        p.skip_ws();
+        p.expect_char('(')?;
+        p.skip_ws();
+        let var = parse_variable(p)?;
+        p.skip_ws();
+        p.expect_char(')')?;
+        return Ok(OrderCondition {
+            variable: var,
+            direction: OrderDirection::Descending,
+        });
+    }
+    p.restore(saved);
+
+    // Bare ?var (defaults to ascending)
+    let var = parse_variable(p)?;
+    Ok(OrderCondition {
+        variable: var,
+        direction: OrderDirection::Ascending,
+    })
 }
 
-fn limit_clause(input: &str) -> IResult<&str, usize> {
-    let (input, _) = tag_no_case("LIMIT")(input)?;
-    let (input, _) = ws1(input)?;
-    map_res(digit1, |s: &str| s.parse::<usize>())(input)
-}
-
-fn offset_clause(input: &str) -> IResult<&str, usize> {
-    let (input, _) = tag_no_case("OFFSET")(input)?;
-    let (input, _) = ws1(input)?;
-    map_res(digit1, |s: &str| s.parse::<usize>())(input)
+fn parse_usize(p: &mut Parser) -> Result<usize, DarqError> {
+    let digits = p.take_while(|c| c.is_ascii_digit());
+    if digits.is_empty() {
+        return Err(p.error("expected integer"));
+    }
+    digits
+        .parse()
+        .map_err(|_| p.error("invalid integer"))
 }
 
 // ---------------------------------------------------------------------------
 // Terms and variables
 // ---------------------------------------------------------------------------
 
-fn term_or_variable(input: &str) -> IResult<&str, TermOrVariable> {
-    alt((
-        map(variable, TermOrVariable::Variable),
-        rdf_type_keyword,
-        map(iri_ref, TermOrVariable::Iri),
-        prefixed_name,
-        map(ast_literal, TermOrVariable::Literal),
-    ))(input)
+fn parse_term_or_variable(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
+    // Variable: ?x or $x
+    if let Some(c) = p.peek() {
+        if c == '?' || c == '$' {
+            return Ok(TermOrVariable::Variable(parse_variable(p)?));
+        }
+    }
+    // 'a' keyword
+    if let Some(tov) = try_rdf_type_keyword(p) {
+        return Ok(tov);
+    }
+    // IRI ref: <...>
+    if p.peek() == Some('<') {
+        return Ok(TermOrVariable::Iri(parse_iri_ref(p)?));
+    }
+    // String literal: "..." or '...'
+    if let Some(c) = p.peek() {
+        if c == '"' || c == '\'' {
+            return Ok(TermOrVariable::Literal(parse_string_literal(p)?));
+        }
+    }
+    // Boolean literal: true/false
+    let saved = p.save();
+    if p.try_keyword("true") {
+        return Ok(TermOrVariable::Literal(AstLiteral::Boolean(true)));
+    }
+    p.restore(saved);
+    if p.try_keyword("false") {
+        return Ok(TermOrVariable::Literal(AstLiteral::Boolean(false)));
+    }
+    p.restore(saved);
+    // Integer literal (possibly negative)
+    if let Some(c) = p.peek() {
+        if c.is_ascii_digit() || c == '-' {
+            return Ok(TermOrVariable::Literal(parse_integer_literal(p)?));
+        }
+    }
+    // Prefixed name: prefix:local
+    parse_prefixed_name(p)
 }
 
-fn variable(input: &str) -> IResult<&str, Variable> {
-    let (input, _) = alt((char('?'), char('$')))(input)?;
-    let (input, name) = take_while1(|c: char| c.is_alphanumeric() || c == '_')(input)?;
-    Ok((input, Variable(name.to_string())))
+fn parse_variable(p: &mut Parser) -> Result<Variable, DarqError> {
+    let c = p.peek().ok_or_else(|| p.error("expected variable"))?;
+    if c != '?' && c != '$' {
+        return Err(p.error("expected '?' or '$'"));
+    }
+    p.advance(1);
+    let name = p.take_while(|c| c.is_alphanumeric() || c == '_');
+    if name.is_empty() {
+        return Err(p.error("expected variable name"));
+    }
+    Ok(Variable(name.to_string()))
 }
 
 /// Parse `<...>` IRI reference.
-fn iri_ref(input: &str) -> IResult<&str, Iri> {
-    let (input, _) = char('<')(input)?;
-    let (input, iri_str) = take_while(|c: char| c != '>')(input)?;
-    let (input, _) = char('>')(input)?;
-    Ok((input, Iri::new(iri_str)))
+fn parse_iri_ref(p: &mut Parser) -> Result<Iri, DarqError> {
+    p.expect_char('<')?;
+    let iri_str = p.take_while(|c| c != '>');
+    p.expect_char('>')?;
+    Ok(Iri::new(iri_str))
 }
 
 /// Parse prefixed name like `foaf:name` or `ex:` or `:localName`.
-fn prefixed_name(input: &str) -> IResult<&str, TermOrVariable> {
-    let (input, prefix) = take_while(|c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')(input)?;
-    let (input, _) = char(':')(input)?;
-    let (input, local) = take_while(|c: char| {
-        c.is_alphanumeric() || c == '_' || c == '-' || c == '.'
-    })(input)?;
-
-    Ok((
-        input,
-        TermOrVariable::PrefixedName {
-            prefix: prefix.to_string(),
-            local: local.to_string(),
-        },
-    ))
+fn parse_prefixed_name(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
+    let prefix = p.take_while(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
+    let prefix = prefix.to_string();
+    p.expect_char(':')?;
+    let local = p.take_while(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
+    let local = local.to_string();
+    Ok(TermOrVariable::PrefixedName { prefix, local })
 }
 
 // ---------------------------------------------------------------------------
 // Literals
 // ---------------------------------------------------------------------------
 
-fn ast_literal(input: &str) -> IResult<&str, AstLiteral> {
-    alt((boolean_literal, string_literal, integer_literal))(input)
-}
+fn parse_string_literal(p: &mut Parser) -> Result<AstLiteral, DarqError> {
+    let quote = p.peek().ok_or_else(|| p.error("expected string literal"))?;
 
-fn boolean_literal(input: &str) -> IResult<&str, AstLiteral> {
-    alt((
-        value(AstLiteral::Boolean(true), tag("true")),
-        value(AstLiteral::Boolean(false), tag("false")),
-    ))(input)
-}
+    // Check for long strings (""" or ''')
+    let rem = p.remaining();
+    let long_delim = if quote == '"' { "\"\"\"" } else { "'''" };
+    if rem.starts_with(long_delim) {
+        let s = parse_long_string(p, quote)?;
+        return Ok(AstLiteral::String(s));
+    }
 
-fn string_literal(input: &str) -> IResult<&str, AstLiteral> {
-    let (input, s) = alt((
-        string_literal_long2,
-        string_literal2,
-        string_literal_long1,
-        string_literal1,
-    ))(input)?;
-    Ok((input, AstLiteral::String(s)))
-}
-
-/// Double-quoted string: "..."
-fn string_literal2(input: &str) -> IResult<&str, String> {
-    let (input, _) = char('"')(input)?;
+    // Short string
+    p.advance(1); // consume opening quote
     let mut result = String::new();
-    let mut chars = input.chars();
-    let mut consumed = 0;
-
     loop {
-        match chars.next() {
-            Some('"') => {
-                consumed += 1;
-                return Ok((&input[consumed..], result));
-            }
-            Some('\\') => {
-                consumed += 1;
-                match chars.next() {
-                    Some(c @ ('t' | 'n' | 'r' | '\\' | '"' | '\'')) => {
-                        consumed += c.len_utf8();
-                        result.push(match c {
-                            't' => '\t',
-                            'n' => '\n',
-                            'r' => '\r',
-                            _ => c,
-                        });
-                    }
-                    _ => {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::Char,
-                        )));
-                    }
-                }
-            }
-            Some(c) if c != '\n' && c != '\r' => {
-                consumed += c.len_utf8();
-                result.push(c);
-            }
-            _ => {
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::Char,
-                )));
-            }
+        let c = p.peek().ok_or_else(|| p.error("unterminated string"))?;
+        if c == quote {
+            p.advance(1);
+            return Ok(AstLiteral::String(result));
+        }
+        if c == '\\' {
+            p.advance(1);
+            let esc = p.peek().ok_or_else(|| p.error("unterminated escape"))?;
+            p.advance(esc.len_utf8());
+            result.push(match esc {
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                '\\' | '"' | '\'' => esc,
+                _ => return Err(p.error(&format!("invalid escape: \\{}", esc))),
+            });
+        } else if c == '\n' || c == '\r' {
+            return Err(p.error("newline in short string"));
+        } else {
+            p.advance(c.len_utf8());
+            result.push(c);
         }
     }
 }
 
-/// Single-quoted string: '...'
-fn string_literal1(input: &str) -> IResult<&str, String> {
-    let (input, _) = char('\'')(input)?;
-    let mut result = String::new();
-    let mut chars = input.chars();
-    let mut consumed = 0;
+fn parse_long_string(p: &mut Parser, quote: char) -> Result<String, DarqError> {
+    // Skip opening triple-quote
+    p.advance(3);
+    let close = if quote == '"' { "\"\"\"" } else { "'''" };
 
+    let mut result = String::new();
     loop {
-        match chars.next() {
-            Some('\'') => {
-                consumed += 1;
-                return Ok((&input[consumed..], result));
-            }
-            Some('\\') => {
-                consumed += 1;
-                match chars.next() {
-                    Some(c @ ('t' | 'n' | 'r' | '\\' | '"' | '\'')) => {
-                        consumed += c.len_utf8();
-                        result.push(match c {
-                            't' => '\t',
-                            'n' => '\n',
-                            'r' => '\r',
-                            _ => c,
-                        });
-                    }
-                    _ => {
-                        return Err(nom::Err::Error(nom::error::Error::new(
-                            input,
-                            nom::error::ErrorKind::Char,
-                        )));
-                    }
-                }
-            }
-            Some(c) if c != '\n' && c != '\r' => {
-                consumed += c.len_utf8();
-                result.push(c);
-            }
-            _ => {
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::Char,
-                )));
-            }
+        if p.remaining().starts_with(close) {
+            p.advance(3);
+            return Ok(result);
         }
-    }
-}
-
-/// Long double-quoted string: """..."""
-fn string_literal_long2(input: &str) -> IResult<&str, String> {
-    let (input, _) = tag("\"\"\"")(input)?;
-    let mut result = String::new();
-    let mut i = 0;
-    let bytes = input.as_bytes();
-
-    while i < bytes.len() {
-        if i + 2 < bytes.len() && bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"'
-        {
-            return Ok((&input[i + 3..], result));
-        }
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            let c = bytes[i + 1] as char;
-            match c {
-                't' => { result.push('\t'); i += 2; }
-                'n' => { result.push('\n'); i += 2; }
-                'r' => { result.push('\r'); i += 2; }
-                '\\' | '"' | '\'' => { result.push(c); i += 2; }
-                _ => {
-                    return Err(nom::Err::Error(nom::error::Error::new(
-                        input,
-                        nom::error::ErrorKind::Char,
-                    )));
-                }
-            }
+        let c = p.peek().ok_or_else(|| p.error("unterminated long string"))?;
+        if c == '\\' {
+            p.advance(1);
+            let esc = p.peek().ok_or_else(|| p.error("unterminated escape"))?;
+            p.advance(esc.len_utf8());
+            result.push(match esc {
+                't' => '\t',
+                'n' => '\n',
+                'r' => '\r',
+                '\\' | '"' | '\'' => esc,
+                _ => return Err(p.error(&format!("invalid escape: \\{}", esc))),
+            });
         } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            p.advance(c.len_utf8());
+            result.push(c);
         }
     }
-
-    Err(nom::Err::Error(nom::error::Error::new(
-        input,
-        nom::error::ErrorKind::Tag,
-    )))
 }
 
-/// Long single-quoted string: '''...'''
-fn string_literal_long1(input: &str) -> IResult<&str, String> {
-    let (input, _) = tag("'''")(input)?;
-    let mut result = String::new();
-    let mut i = 0;
-    let bytes = input.as_bytes();
-
-    while i < bytes.len() {
-        if i + 2 < bytes.len()
-            && bytes[i] == b'\''
-            && bytes[i + 1] == b'\''
-            && bytes[i + 2] == b'\''
-        {
-            return Ok((&input[i + 3..], result));
-        }
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            let c = bytes[i + 1] as char;
-            match c {
-                't' => { result.push('\t'); i += 2; }
-                'n' => { result.push('\n'); i += 2; }
-                'r' => { result.push('\r'); i += 2; }
-                '\\' | '"' | '\'' => { result.push(c); i += 2; }
-                _ => {
-                    return Err(nom::Err::Error(nom::error::Error::new(
-                        input,
-                        nom::error::ErrorKind::Char,
-                    )));
-                }
-            }
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
+fn parse_integer_literal(p: &mut Parser) -> Result<AstLiteral, DarqError> {
+    let neg = p.try_char('-');
+    let digits = p.take_while(|c| c.is_ascii_digit());
+    if digits.is_empty() {
+        return Err(p.error("expected digits"));
     }
-
-    Err(nom::Err::Error(nom::error::Error::new(
-        input,
-        nom::error::ErrorKind::Tag,
-    )))
-}
-
-fn integer_literal(input: &str) -> IResult<&str, AstLiteral> {
-    let (input, neg) = opt(char('-'))(input)?;
-    let (input, digits) = digit1(input)?;
-    let n: i64 = digits.parse().map_err(|_| {
-        nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Digit))
-    })?;
-    Ok((input, AstLiteral::Integer(if neg.is_some() { -n } else { n })))
+    let n: i64 = digits
+        .parse()
+        .map_err(|_| p.error("invalid integer"))?;
+    Ok(AstLiteral::Integer(if neg { -n } else { n }))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,13 +763,11 @@ mod tests {
 
     #[test]
     fn test_semicolon_shorthand() {
-        // Same subject, two predicates
         let q = parse(
             "SELECT * WHERE { ?s a ?type ; <http://example.org/name> ?name }",
         )
         .unwrap();
         assert_eq!(q.where_pattern.patterns.len(), 2);
-        // Both should have the same subject
         let s1 = &q.where_pattern.patterns[0].subject;
         let s2 = &q.where_pattern.patterns[1].subject;
         assert!(matches!(s1, TermOrVariable::Variable(Variable(v)) if v == "s"));
@@ -720,7 +776,6 @@ mod tests {
 
     #[test]
     fn test_comma_shorthand() {
-        // Same subject+predicate, two objects
         let q = parse(
             "SELECT * WHERE { ?s <http://example.org/knows> ?a , ?b }",
         )
@@ -782,7 +837,6 @@ mod tests {
 
     #[test]
     fn test_trailing_dot() {
-        // Trailing dot should be fine
         let q = parse("SELECT * WHERE { ?s ?p ?o . }").unwrap();
         assert_eq!(q.where_pattern.patterns.len(), 1);
     }
