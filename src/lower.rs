@@ -503,4 +503,362 @@ mod tests {
         let err = lower_bgp(&bgp, &schema).unwrap_err();
         assert!(matches!(err, DarqError::UnknownType(_)));
     }
+
+    // --- Group 1: Value/Subject variants ---
+
+    #[test]
+    fn test_lower_bound_literal_object() {
+        let schema = test_schema();
+
+        // ?p ex:name "Alice"
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Variable(Variable("p".into())),
+                predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
+                object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { constraints, .. } => {
+                assert_eq!(constraints.len(), 1);
+                assert_eq!(constraints[0].field_name, "name");
+                assert!(matches!(
+                    &constraints[0].value,
+                    Value::Bound(Term::Literal(Literal::String(s))) if s == "Alice"
+                ));
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    #[test]
+    fn test_lower_bound_iri_object() {
+        // Need a type with an IRI-valued field
+        struct Thing {
+            id: String,
+        }
+
+        impl Resource for Thing {
+            fn rdf_type() -> Iri {
+                Iri::new("http://example.org/Thing")
+            }
+            fn subject_iri(&self) -> Iri {
+                Iri::new(format!("http://example.org/thing/{}", self.id))
+            }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/owner"),
+                    name: "owner",
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> {
+                vec![Term::Iri(Iri::new("http://example.org/person/alice"))]
+            }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Thing>();
+
+        // ?t ex:owner <http://example.org/person/bob>
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Variable(Variable("t".into())),
+                predicate: TermOrVariable::Iri(Iri::new("http://example.org/owner")),
+                object: TermOrVariable::Iri(Iri::new("http://example.org/person/bob")),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { constraints, .. } => {
+                assert_eq!(constraints[0].field_name, "owner");
+                assert!(matches!(
+                    &constraints[0].value,
+                    Value::Bound(Term::Iri(iri)) if iri.0 == "http://example.org/person/bob"
+                ));
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    #[test]
+    fn test_lower_bound_subject() {
+        let schema = test_schema();
+
+        // <http://example.org/person/alice> ex:name ?name
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Iri(Iri::new("http://example.org/person/alice")),
+                predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
+                object: TermOrVariable::Variable(Variable("name".into())),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { subject, type_iri, constraints, .. } => {
+                assert!(matches!(
+                    subject,
+                    Subject::Bound(iri) if iri.0 == "http://example.org/person/alice"
+                ));
+                assert_eq!(type_iri.as_ref().unwrap().0, "http://example.org/Person");
+                assert_eq!(constraints.len(), 1);
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    // --- Group 2: Grouping and ordering ---
+
+    #[test]
+    fn test_lower_multiple_subject_groups() {
+        let schema = test_schema();
+
+        // ?p ex:name ?name . ?q ex:age ?age
+        let bgp = GroupGraphPattern {
+            patterns: vec![
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
+                    object: TermOrVariable::Variable(Variable("name".into())),
+                },
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("q".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
+                    object: TermOrVariable::Variable(Variable("age".into())),
+                },
+            ],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 2);
+
+        // First group is ?p (appeared first)
+        match &patterns[0] {
+            QueryPattern::Resource { subject, constraints, .. } => {
+                assert!(matches!(subject, Subject::Variable(v) if v == "p"));
+                assert_eq!(constraints[0].field_name, "name");
+            }
+            _ => panic!("expected Resource pattern for ?p"),
+        }
+
+        // Second group is ?q
+        match &patterns[1] {
+            QueryPattern::Resource { subject, constraints, .. } => {
+                assert!(matches!(subject, Subject::Variable(v) if v == "q"));
+                assert_eq!(constraints[0].field_name, "age");
+            }
+            _ => panic!("expected Resource pattern for ?q"),
+        }
+    }
+
+    #[test]
+    fn test_lower_non_adjacent_same_subject() {
+        let schema = test_schema();
+
+        // ?p ex:name ?name . ?q ex:age ?age . ?p ex:age ?a
+        let bgp = GroupGraphPattern {
+            patterns: vec![
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
+                    object: TermOrVariable::Variable(Variable("name".into())),
+                },
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("q".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
+                    object: TermOrVariable::Variable(Variable("age".into())),
+                },
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
+                    object: TermOrVariable::Variable(Variable("a".into())),
+                },
+            ],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 2);
+
+        // ?p group collects patterns 0 and 2
+        match &patterns[0] {
+            QueryPattern::Resource { subject, constraints, .. } => {
+                assert!(matches!(subject, Subject::Variable(v) if v == "p"));
+                assert_eq!(constraints.len(), 2);
+                assert_eq!(constraints[0].field_name, "name");
+                assert_eq!(constraints[1].field_name, "age");
+            }
+            _ => panic!("expected Resource pattern for ?p"),
+        }
+
+        // ?q group
+        match &patterns[1] {
+            QueryPattern::Resource { subject, constraints, .. } => {
+                assert!(matches!(subject, Subject::Variable(v) if v == "q"));
+                assert_eq!(constraints.len(), 1);
+            }
+            _ => panic!("expected Resource pattern for ?q"),
+        }
+    }
+
+    // --- Group 3: Type handling edge cases ---
+
+    #[test]
+    fn test_lower_type_only_no_fields() {
+        let schema = test_schema();
+
+        // ?p a ex:Person
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Variable(Variable("p".into())),
+                predicate: TermOrVariable::RdfType,
+                object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { type_iri, constraints, type_variable, .. } => {
+                assert_eq!(type_iri.as_ref().unwrap().0, "http://example.org/Person");
+                assert!(constraints.is_empty());
+                assert!(type_variable.is_none());
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    #[test]
+    fn test_lower_type_variable_alone() {
+        let schema = test_schema();
+
+        // ?s a ?type (no concrete predicates to infer type)
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Variable(Variable("s".into())),
+                predicate: TermOrVariable::RdfType,
+                object: TermOrVariable::Variable(Variable("type".into())),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { type_iri, type_variable, constraints, .. } => {
+                assert!(type_iri.is_none());
+                assert_eq!(type_variable.as_ref().unwrap(), "type");
+                assert!(constraints.is_empty());
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    #[test]
+    fn test_lower_rdf_type_as_full_iri() {
+        let schema = test_schema();
+
+        // ?s <rdf:type full IRI> ex:Person — same semantics as `?s a ex:Person`
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Variable(Variable("s".into())),
+                predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
+                object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { type_iri, constraints, .. } => {
+                assert_eq!(type_iri.as_ref().unwrap().0, "http://example.org/Person");
+                assert!(constraints.is_empty());
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    // --- Group 4: FieldScan variants ---
+
+    #[test]
+    fn test_lower_field_scan_bound_object() {
+        let schema = test_schema();
+
+        // ?s ?p "Alice"
+        let bgp = GroupGraphPattern {
+            patterns: vec![TriplePattern {
+                subject: TermOrVariable::Variable(Variable("s".into())),
+                predicate: TermOrVariable::Variable(Variable("p".into())),
+                object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
+            }],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::FieldScan { predicate_var, object, type_iri, .. } => {
+                assert_eq!(predicate_var, "p");
+                assert!(matches!(
+                    object,
+                    Value::Bound(Term::Literal(Literal::String(s))) if s == "Alice"
+                ));
+                assert!(type_iri.is_none());
+            }
+            _ => panic!("expected FieldScan pattern"),
+        }
+    }
+
+    // --- Group 5: Multiple constraints on same field ---
+
+    #[test]
+    fn test_lower_duplicate_field_constraints() {
+        let schema = test_schema();
+
+        // ?p ex:name "Alice" . ?p ex:name ?name
+        let bgp = GroupGraphPattern {
+            patterns: vec![
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
+                    object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
+                },
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
+                    object: TermOrVariable::Variable(Variable("name".into())),
+                },
+            ],
+        };
+
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 1);
+        match &patterns[0] {
+            QueryPattern::Resource { constraints, .. } => {
+                assert_eq!(constraints.len(), 2);
+                assert_eq!(constraints[0].field_name, "name");
+                assert_eq!(constraints[1].field_name, "name");
+                assert!(matches!(
+                    &constraints[0].value,
+                    Value::Bound(Term::Literal(Literal::String(s))) if s == "Alice"
+                ));
+                assert!(matches!(&constraints[1].value, Value::Variable(v) if v == "name"));
+            }
+            _ => panic!("expected Resource pattern"),
+        }
+    }
+
+    // --- Group 7: Empty input ---
+
+    #[test]
+    fn test_lower_empty_bgp() {
+        let schema = test_schema();
+
+        let bgp = GroupGraphPattern { patterns: vec![] };
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert!(patterns.is_empty());
+    }
 }

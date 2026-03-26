@@ -125,3 +125,128 @@ impl QueryPlan {
         vars
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdf::{Iri, Literal};
+    use crate::sparql::ast::{SelectClause, SolutionModifier};
+
+    fn empty_modifier() -> SolutionModifier {
+        SolutionModifier::default()
+    }
+
+    #[test]
+    fn test_collect_variables_resource() {
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![
+                    FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    },
+                    FieldConstraint {
+                        field_name: "age".into(),
+                        value: Value::Variable("age".into()),
+                    },
+                ],
+                type_variable: Some("type".into()),
+            }],
+            select: SelectClause::Star,
+            modifier: empty_modifier(),
+        };
+
+        assert_eq!(
+            plan.collect_variables(),
+            vec!["p", "type", "name", "age"]
+        );
+    }
+
+    #[test]
+    fn test_collect_variables_field_scan() {
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::FieldScan {
+                subject: Subject::Variable("s".into()),
+                predicate_var: "p".into(),
+                object: Value::Variable("o".into()),
+                type_iri: None,
+            }],
+            select: SelectClause::Star,
+            modifier: empty_modifier(),
+        };
+
+        assert_eq!(plan.collect_variables(), vec!["s", "p", "o"]);
+    }
+
+    #[test]
+    fn test_collect_variables_deduplication() {
+        // Resource binds ?p and ?name, FieldScan reuses ?p and adds ?pred, ?o
+        let plan = QueryPlan {
+            patterns: vec![
+                QueryPattern::Resource {
+                    subject: Subject::Variable("p".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    }],
+                    type_variable: None,
+                },
+                QueryPattern::FieldScan {
+                    subject: Subject::Variable("p".into()),
+                    predicate_var: "pred".into(),
+                    object: Value::Variable("o".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                },
+            ],
+            select: SelectClause::Star,
+            modifier: empty_modifier(),
+        };
+
+        // "p" appears in both patterns but should only appear once
+        assert_eq!(
+            plan.collect_variables(),
+            vec!["p", "name", "pred", "o"]
+        );
+    }
+
+    #[test]
+    fn test_collect_variables_skips_bound() {
+        // Bound subject and bound object should not appear in variables
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Bound(Iri::new("http://example.org/person/alice")),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![
+                    FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    },
+                    FieldConstraint {
+                        field_name: "age".into(),
+                        value: Value::Bound(Term::Literal(Literal::Integer(30))),
+                    },
+                ],
+                type_variable: None,
+            }],
+            select: SelectClause::Star,
+            modifier: empty_modifier(),
+        };
+
+        // Only "name" — bound subject and bound age value are excluded
+        assert_eq!(plan.collect_variables(), vec!["name"]);
+    }
+
+    #[test]
+    fn test_collect_variables_empty_plan() {
+        let plan = QueryPlan {
+            patterns: vec![],
+            select: SelectClause::Star,
+            modifier: empty_modifier(),
+        };
+
+        assert!(plan.collect_variables().is_empty());
+    }
+}
