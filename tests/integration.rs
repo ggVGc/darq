@@ -226,3 +226,50 @@ fn test_empty_result() {
 
     assert_eq!(result.rows.len(), 0);
 }
+
+#[test]
+fn test_variable_predicate_expansion() {
+    let (schema, store) = setup();
+    // ?s ?p ?o should expand over all known predicates and return all triples
+    let result = engine::execute(
+        "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
+        &schema,
+        &store,
+    )
+    .unwrap();
+
+    // 3 people x 3 predicates (rdf:type, name, age) = 9 triples
+    assert_eq!(result.rows.len(), 9);
+    // ?p should be bound to actual predicate IRIs
+    assert!(result.variables.contains(&"p".to_string()));
+    let pred_col = result.variables.iter().position(|v| v == "p").unwrap();
+    for row in &result.rows {
+        match &row[pred_col] {
+            Some(Term::Iri(_)) => {} // good — predicate is always an IRI
+            other => panic!("expected predicate to be an IRI, got {:?}", other),
+        }
+    }
+}
+
+#[test]
+fn test_variable_predicate_constrained_by_prior_pattern() {
+    let (schema, store) = setup();
+    // First pattern binds ?p to ex:name, second pattern reuses ?p (already bound)
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name ?p ?o
+        WHERE {
+            ?person ex:name ?name .
+            ?person ?p ?o .
+        }
+        ORDER BY ?name ?p
+        "#,
+        &schema,
+        &store,
+    )
+    .unwrap();
+
+    // Each of 3 people has 3 triples matched by ?person ?p ?o = 9 rows
+    assert_eq!(result.rows.len(), 9);
+}

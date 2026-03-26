@@ -30,7 +30,7 @@ pub fn execute(
     validate_predicates(&query, schema)?;
 
     // 4. Evaluate basic graph pattern
-    let bindings = evaluate_bgp(&query.where_pattern, store);
+    let bindings = evaluate_bgp(&query.where_pattern, store, schema);
 
     // 5. Apply solution modifiers
     let bindings = apply_modifiers(bindings, &query.modifier);
@@ -90,24 +90,58 @@ fn ast_lit_to_term(lit: &AstLiteral) -> Term {
     }
 }
 
+/// If the predicate is an unbound variable, return its name.
+fn unbound_predicate_var(tov: &TermOrVariable, binding: &Binding) -> Option<String> {
+    if let TermOrVariable::Variable(Variable(name)) = tov {
+        if !binding.contains_key(name) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 /// Evaluate a basic graph pattern using nested-loop join.
-fn evaluate_bgp(pattern: &GroupGraphPattern, store: &TripleStore) -> Vec<Binding> {
+/// Variable predicates are expanded over all known predicates in the schema.
+fn evaluate_bgp(
+    pattern: &GroupGraphPattern,
+    store: &TripleStore,
+    schema: &Schema,
+) -> Vec<Binding> {
     let mut solutions: Vec<Binding> = vec![HashMap::new()];
 
     for triple_pattern in &pattern.patterns {
         let mut next_solutions = Vec::new();
 
         for existing in &solutions {
-            let store_pattern = store::TriplePattern {
-                subject: to_pattern_term(&triple_pattern.subject, existing),
-                predicate: to_pattern_term(&triple_pattern.predicate, existing),
-                object: to_pattern_term(&triple_pattern.object, existing),
-            };
+            if let Some(var_name) = unbound_predicate_var(&triple_pattern.predicate, existing) {
+                // Variable predicate: expand over all known predicates, union results
+                for pred_iri in schema.known_predicates() {
+                    let store_pattern = store::TriplePattern {
+                        subject: to_pattern_term(&triple_pattern.subject, existing),
+                        predicate: PatternTerm::Bound(Term::Iri(pred_iri.clone())),
+                        object: to_pattern_term(&triple_pattern.object, existing),
+                    };
 
-            for new_binding in store.match_pattern(&store_pattern) {
-                let mut merged = existing.clone();
-                merged.extend(new_binding);
-                next_solutions.push(merged);
+                    for mut new_binding in store.match_pattern(&store_pattern) {
+                        new_binding.insert(var_name.clone(), Term::Iri(pred_iri.clone()));
+                        let mut merged = existing.clone();
+                        merged.extend(new_binding);
+                        next_solutions.push(merged);
+                    }
+                }
+            } else {
+                // Concrete or already-bound predicate: normal path
+                let store_pattern = store::TriplePattern {
+                    subject: to_pattern_term(&triple_pattern.subject, existing),
+                    predicate: to_pattern_term(&triple_pattern.predicate, existing),
+                    object: to_pattern_term(&triple_pattern.object, existing),
+                };
+
+                for new_binding in store.match_pattern(&store_pattern) {
+                    let mut merged = existing.clone();
+                    merged.extend(new_binding);
+                    next_solutions.push(merged);
+                }
             }
         }
 

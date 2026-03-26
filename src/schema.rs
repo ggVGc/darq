@@ -77,6 +77,11 @@ impl Schema {
     pub fn is_known_predicate(&self, pred: &Iri) -> bool {
         self.known_predicates.contains(pred)
     }
+
+    /// Return all known predicate IRIs.
+    pub fn known_predicates(&self) -> &HashSet<Iri> {
+        &self.known_predicates
+    }
 }
 
 // Convenience constructors for Term from common Rust types.
