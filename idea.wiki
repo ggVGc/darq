@@ -1,0 +1,15 @@
+= Core goal =
+We want a SPARQL endpoint which can answer queries efficiently based on a known data model. The data
+model is defined as data types in the implementation, so that maximum information is available for
+query planning and execution.
+The fields in data types will be mapped to predicates.
+If a SPARQL query contains a predicate which is not known, the query should error.
+
+
+
+= Implementation =
+- We will use Rust, but always prioritize simplicity over performance. It is okay to use clone()
+  wherever needed.
+- Reference material is available in the directory ./support.
+- We should start with a minimal implementation, which only handles SELECT query without any
+  filtering or named graphs.
