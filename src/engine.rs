@@ -5,7 +5,7 @@ use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::Schema;
 use crate::sparql::ast::*;
 use crate::sparql::{self, parser};
-use crate::store::{self, Binding, PatternTerm, TripleStore};
+use crate::store::{self, Binding, IriPattern, TermPattern, TripleStore};
 
 /// The result of a SELECT query.
 #[derive(Debug)]
@@ -60,23 +60,44 @@ fn as_concrete_iri(tov: &TermOrVariable) -> Option<&Iri> {
     }
 }
 
-/// Convert an AST TermOrVariable to a store PatternTerm.
-fn to_pattern_term(tov: &TermOrVariable, binding: &Binding) -> PatternTerm {
+/// Convert an AST node in subject/predicate position to an IriPattern.
+fn to_iri_pattern(tov: &TermOrVariable, binding: &Binding) -> IriPattern {
     match tov {
         TermOrVariable::Variable(Variable(name)) => {
             if let Some(term) = binding.get(name) {
-                PatternTerm::Bound(term.clone())
+                match term {
+                    Term::Iri(iri) => IriPattern::Bound(iri.clone()),
+                    _ => IriPattern::Variable(name.clone()), // shouldn't happen
+                }
             } else {
-                PatternTerm::Variable(name.clone())
+                IriPattern::Variable(name.clone())
             }
         }
-        TermOrVariable::Iri(iri) => PatternTerm::Bound(Term::Iri(iri.clone())),
-        TermOrVariable::RdfType => {
-            PatternTerm::Bound(Term::Iri(Iri::new(RDF_TYPE)))
+        TermOrVariable::Iri(iri) => IriPattern::Bound(iri.clone()),
+        TermOrVariable::RdfType => IriPattern::Bound(Iri::new(RDF_TYPE)),
+        TermOrVariable::Literal(_) => {
+            unreachable!("literal cannot appear in subject/predicate position")
         }
-        TermOrVariable::Literal(lit) => PatternTerm::Bound(ast_lit_to_term(lit)),
         TermOrVariable::PrefixedName { .. } => {
-            // Should have been expanded already
+            unreachable!("prefixed names should be expanded before evaluation")
+        }
+    }
+}
+
+/// Convert an AST node in object position to a TermPattern.
+fn to_term_pattern(tov: &TermOrVariable, binding: &Binding) -> TermPattern {
+    match tov {
+        TermOrVariable::Variable(Variable(name)) => {
+            if let Some(term) = binding.get(name) {
+                TermPattern::Bound(term.clone())
+            } else {
+                TermPattern::Variable(name.clone())
+            }
+        }
+        TermOrVariable::Iri(iri) => TermPattern::Bound(Term::Iri(iri.clone())),
+        TermOrVariable::RdfType => TermPattern::Bound(Term::Iri(Iri::new(RDF_TYPE))),
+        TermOrVariable::Literal(lit) => TermPattern::Bound(ast_lit_to_term(lit)),
+        TermOrVariable::PrefixedName { .. } => {
             unreachable!("prefixed names should be expanded before evaluation")
         }
     }
@@ -117,9 +138,9 @@ fn evaluate_bgp(
                 // Variable predicate: expand over all known predicates, union results
                 for pred_iri in schema.known_predicates() {
                     let store_pattern = store::TriplePattern {
-                        subject: to_pattern_term(&triple_pattern.subject, existing),
-                        predicate: PatternTerm::Bound(Term::Iri(pred_iri.clone())),
-                        object: to_pattern_term(&triple_pattern.object, existing),
+                        subject: to_iri_pattern(&triple_pattern.subject, existing),
+                        predicate: IriPattern::Bound(pred_iri.clone()),
+                        object: to_term_pattern(&triple_pattern.object, existing),
                     };
 
                     for mut new_binding in store.match_pattern(&store_pattern) {
@@ -132,9 +153,9 @@ fn evaluate_bgp(
             } else {
                 // Concrete or already-bound predicate: normal path
                 let store_pattern = store::TriplePattern {
-                    subject: to_pattern_term(&triple_pattern.subject, existing),
-                    predicate: to_pattern_term(&triple_pattern.predicate, existing),
-                    object: to_pattern_term(&triple_pattern.object, existing),
+                    subject: to_iri_pattern(&triple_pattern.subject, existing),
+                    predicate: to_iri_pattern(&triple_pattern.predicate, existing),
+                    object: to_term_pattern(&triple_pattern.object, existing),
                 };
 
                 for new_binding in store.match_pattern(&store_pattern) {

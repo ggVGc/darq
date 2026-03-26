@@ -48,10 +48,10 @@ impl std::fmt::Display for Term {
     }
 }
 
-/// A single RDF triple. Predicate is always an IRI.
+/// A single RDF triple. Subject and predicate are always IRIs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Triple {
-    pub subject: Term,
+    pub subject: Iri,
     pub predicate: Iri,
     pub object: Term,
 }

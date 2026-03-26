@@ -26,7 +26,7 @@ pub trait Resource {
 
     /// Convert this instance into a set of triples.
     fn to_triples(&self) -> Vec<Triple> {
-        let subject = Term::Iri(self.subject_iri());
+        let subject = self.subject_iri();
         let mut triples = Vec::new();
 
         // rdf:type triple
