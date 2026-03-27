@@ -2,12 +2,13 @@ use std::process;
 
 use darq::lower;
 use darq::sparql;
+use darq::sql;
 use darq::test_schema;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: print_ir <query-file>");
+        eprintln!("Usage: print_sql <query-file>");
         process::exit(1);
     }
 
@@ -34,10 +35,18 @@ fn main() {
 
     let schema = test_schema::test_schema();
 
-    match lower::lower(&query, &schema) {
-        Ok(plan) => println!("{:#?}", plan),
+    let plan = match lower::lower(&query, &schema) {
+        Ok(plan) => plan,
         Err(e) => {
             eprintln!("Lowering error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    match sql::to_sql(&plan, &schema) {
+        Ok(sql) => println!("{}", sql),
+        Err(e) => {
+            eprintln!("SQL translation error: {}", e);
             process::exit(1);
         }
     }

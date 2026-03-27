@@ -6,3 +6,5 @@ pub mod rdf;
 pub mod resource_store;
 pub mod schema;
 pub mod sparql;
+pub mod sql;
+pub mod test_schema;
