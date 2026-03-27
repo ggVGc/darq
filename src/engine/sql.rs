@@ -5,8 +5,11 @@ use super::Engine;
 use crate::error::DarqError;
 use crate::ir::{QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
-use crate::schema::{FieldType, Schema};
+use crate::schema::{FieldDescriptor, FieldType, Schema};
 use crate::sql::sql_literal;
+
+/// Maximum number of values in a single SQL IN clause.
+const MAX_IN_CLAUSE_SIZE: usize = 500;
 
 /// Result set returned by a SQL executor.
 pub struct SqlResultSet {
@@ -22,8 +25,8 @@ pub trait SqlExecutor {
 /// SQL-backed engine that evaluates query plans by pipelining simple SQL queries.
 ///
 /// Each pattern in the plan is evaluated sequentially. Results from earlier
-/// patterns constrain later ones via WHERE filters, making subsequent queries
-/// cheaper.
+/// patterns constrain later ones via batched IN clauses, making subsequent
+/// queries cheaper.
 pub struct SqlEngine<'a, E> {
     executor: &'a E,
 }
@@ -43,34 +46,34 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
         let mut solutions: Vec<Binding> = vec![HashMap::new()];
 
         for pattern in &plan.patterns {
-            let mut next_solutions = Vec::new();
-
-            for existing in &solutions {
-                match pattern {
-                    QueryPattern::Resource {
-                        subject,
-                        type_iri,
-                        constraints,
-                        type_variable,
-                    } => {
-                        let bindings =
-                            self.eval_resource(subject, type_iri, constraints, type_variable, existing, schema)?;
-                        next_solutions.extend(bindings);
-                    }
-                    QueryPattern::FieldScan {
-                        subject,
-                        predicate_var,
-                        object,
-                        type_iri,
-                    } => {
-                        let bindings =
-                            self.eval_field_scan(subject, predicate_var, object, type_iri, existing, schema)?;
-                        next_solutions.extend(bindings);
-                    }
-                }
-            }
-
-            solutions = next_solutions;
+            solutions = match pattern {
+                QueryPattern::Resource {
+                    subject,
+                    type_iri,
+                    constraints,
+                    type_variable,
+                } => self.eval_resource(
+                    subject,
+                    type_iri,
+                    constraints,
+                    type_variable,
+                    &solutions,
+                    schema,
+                )?,
+                QueryPattern::FieldScan {
+                    subject,
+                    predicate_var,
+                    object,
+                    type_iri,
+                } => self.eval_field_scan(
+                    subject,
+                    predicate_var,
+                    object,
+                    type_iri,
+                    &solutions,
+                    schema,
+                )?,
+            };
         }
 
         Ok(solutions)
@@ -78,19 +81,29 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
 }
 
 impl<E: SqlExecutor> SqlEngine<'_, E> {
-    /// Evaluate a Resource pattern by generating and executing a single SQL query.
+    /// Evaluate a Resource pattern against all existing solutions using batched IN clauses.
     fn eval_resource(
         &self,
         subject: &Subject,
         type_iri: &Option<Iri>,
         constraints: &[crate::ir::FieldConstraint],
         type_variable: &Option<String>,
-        existing: &Binding,
+        solutions: &[Binding],
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
+        if solutions.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let type_iris: Vec<&Iri> = match type_iri {
             Some(ti) => vec![ti],
             None => schema.known_types().collect(),
+        };
+
+        // Collect bound subject values from solutions for batching
+        let subject_var = match subject {
+            Subject::Variable(v) => Some(v.as_str()),
+            Subject::Bound(_) => None,
         };
 
         let mut all_bindings = Vec::new();
@@ -99,113 +112,155 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
             let table = table_name(ti);
 
-            // Build SELECT columns: always _subject, plus constraint fields
+            // Build SELECT columns
             let mut select_cols = vec!["\"_subject\"".to_string()];
             for c in constraints {
                 select_cols.push(format!("\"{}\"", c.field_name));
             }
+            let select_str = select_cols.join(", ");
 
-            let mut where_parts = Vec::new();
-
-            // Subject constraint from existing bindings
-            if let Subject::Variable(v) = subject {
-                if let Some(term) = existing.get(v) {
-                    where_parts.push(format!("\"_subject\" = {}", sql_literal(term)));
-                }
-            } else if let Subject::Bound(iri) = subject {
-                where_parts.push(format!("\"_subject\" = '{}'", iri.0.replace('\'', "''")));
+            // Static WHERE parts (bound subject, bound constraint values)
+            let mut static_where = Vec::new();
+            if let Subject::Bound(iri) = subject {
+                static_where.push(format!(
+                    "\"_subject\" = '{}'",
+                    iri.0.replace('\'', "''")
+                ));
             }
-
-            // Field constraints from existing bindings or bound values
             for c in constraints {
-                match &c.value {
-                    Value::Bound(term) => {
-                        where_parts.push(format!("\"{}\" = {}", c.field_name, sql_literal(term)));
-                    }
-                    Value::Variable(v) => {
-                        if let Some(term) = existing.get(v) {
-                            where_parts
-                                .push(format!("\"{}\" = {}", c.field_name, sql_literal(term)));
-                        }
-                    }
+                if let Value::Bound(term) = &c.value {
+                    static_where.push(format!("\"{}\" = {}", c.field_name, sql_literal(term)));
                 }
             }
 
-            let sql = if where_parts.is_empty() {
-                format!(
-                    "SELECT {} FROM \"{}\"",
-                    select_cols.join(", "),
-                    table
-                )
-            } else {
-                format!(
-                    "SELECT {} FROM \"{}\" WHERE {}",
-                    select_cols.join(", "),
-                    table,
-                    where_parts.join(" AND ")
-                )
-            };
+            // Group solutions by their bound subject value (if any) for batching
+            let subject_groups = group_by_subject(solutions, subject_var);
 
-            let result = self.executor.execute_sql(&sql)?;
+            for group in &subject_groups {
+                // Build per-group WHERE parts: static + subject IN + constraint variable IN
+                let mut where_parts = static_where.clone();
 
-            // Convert rows to bindings
-            for row in &result.rows {
-                let col_map: HashMap<&str, &Option<String>> = result
-                    .columns
-                    .iter()
-                    .zip(row.iter())
-                    .map(|(c, v)| (c.as_str(), v))
-                    .collect();
+                if let Some(subject_values) = &group.subject_values {
+                    where_parts.push(in_clause("\"_subject\"", subject_values));
+                }
 
-                let mut binding = existing.clone();
-                let mut ok = true;
-
-                // Bind subject
-                if let Some(Some(subj_str)) = col_map.get("_subject") {
-                    let term = Term::Iri(Iri::new(subj_str.as_str()));
-                    if let Subject::Variable(v) = subject {
-                        if !try_bind(v, &term, &mut binding) {
-                            ok = false;
+                // Add constraint variable filters from the group's common bindings
+                // For batched queries, we use the first solution's bindings for
+                // constraint variables (they're the same across the group since
+                // grouping is by subject only). If they differ, we filter in Rust.
+                for c in constraints {
+                    if let Value::Variable(v) = &c.value {
+                        // Collect distinct bound values for this variable across the group
+                        let bound_values: Vec<String> = group
+                            .solutions
+                            .iter()
+                            .filter_map(|s| s.get(v.as_str()))
+                            .map(sql_literal)
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        if bound_values.len() == 1 {
+                            where_parts.push(format!(
+                                "\"{}\" = {}",
+                                c.field_name, bound_values[0]
+                            ));
+                        } else if !bound_values.is_empty() {
+                            where_parts.push(format!(
+                                "\"{}\" IN ({})",
+                                c.field_name,
+                                bound_values.join(", ")
+                            ));
                         }
                     }
+                }
+
+                let sql = if where_parts.is_empty() {
+                    format!("SELECT {} FROM \"{}\"", select_str, table)
                 } else {
-                    ok = false;
-                }
+                    format!(
+                        "SELECT {} FROM \"{}\" WHERE {}",
+                        select_str,
+                        table,
+                        where_parts.join(" AND ")
+                    )
+                };
 
-                // Bind type variable
-                if ok {
-                    if let Some(tv) = type_variable {
-                        let term = Term::Iri((*ti).clone());
-                        if !try_bind(tv, &term, &mut binding) {
-                            ok = false;
-                        }
-                    }
-                }
+                let result = self.executor.execute_sql(&sql)?;
 
-                // Bind constraint variables
-                if ok {
-                    for c in constraints {
-                        if let Value::Variable(v) = &c.value {
-                            if let Some(Some(raw)) = col_map.get(c.field_name.as_str()) {
-                                let fd = fields.iter().find(|f| f.name == c.field_name);
-                                let term = match fd {
-                                    Some(fd) => parse_sql_value(raw, &fd.field_type),
-                                    None => Term::Literal(Literal::String(raw.clone())),
-                                };
-                                if !try_bind(v, &term, &mut binding) {
-                                    ok = false;
-                                    break;
-                                }
-                            } else {
+                // Build a lookup from subject IRI to matching solutions
+                let solutions_by_subject = index_by_subject(group.solutions, subject_var);
+
+                for row in &result.rows {
+                    let col_map: HashMap<&str, &Option<String>> = result
+                        .columns
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(c, v)| (c.as_str(), v))
+                        .collect();
+
+                    let subj_str = match col_map.get("_subject") {
+                        Some(Some(s)) => s.as_str(),
+                        _ => continue,
+                    };
+                    let subj_term = Term::Iri(Iri::new(subj_str));
+
+                    // Find which existing solutions this row matches
+                    let default_refs: Vec<&Binding> =
+                        group.solutions.iter().collect();
+                    let matching: &[&Binding] = match &solutions_by_subject {
+                        Some(map) => map
+                            .get(subj_str)
+                            .map(|v| v.as_slice())
+                            .unwrap_or(&[]),
+                        None => &default_refs,
+                    };
+
+                    for &existing in matching {
+                        let mut binding: Binding = existing.clone();
+                        let mut ok = true;
+
+                        if let Subject::Variable(v) = subject {
+                            if !try_bind(v, &subj_term, &mut binding) {
                                 ok = false;
-                                break;
                             }
                         }
-                    }
-                }
 
-                if ok {
-                    all_bindings.push(binding);
+                        if ok {
+                            if let Some(tv) = type_variable {
+                                let term = Term::Iri((*ti).clone());
+                                if !try_bind(tv, &term, &mut binding) {
+                                    ok = false;
+                                }
+                            }
+                        }
+
+                        if ok {
+                            for c in constraints {
+                                if let Value::Variable(v) = &c.value {
+                                    if let Some(Some(raw)) = col_map.get(c.field_name.as_str()) {
+                                        let fd = fields.iter().find(|f| f.name == c.field_name);
+                                        let term = match fd {
+                                            Some(fd) => parse_sql_value(raw, &fd.field_type),
+                                            None => {
+                                                Term::Literal(Literal::String(raw.clone()))
+                                            }
+                                        };
+                                        if !try_bind(v, &term, &mut binding) {
+                                            ok = false;
+                                            break;
+                                        }
+                                    } else {
+                                        ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if ok {
+                            all_bindings.push(binding);
+                        }
+                    }
                 }
             }
         }
@@ -213,19 +268,28 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         Ok(all_bindings)
     }
 
-    /// Evaluate a FieldScan pattern by generating one query per (type, field).
+    /// Evaluate a FieldScan pattern using batched IN clauses and indexed field pipelining.
     fn eval_field_scan(
         &self,
         subject: &Subject,
         predicate_var: &str,
         object: &Value,
         type_iri: &Option<Iri>,
-        existing: &Binding,
+        solutions: &[Binding],
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
+        if solutions.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let type_iris: Vec<&Iri> = match type_iri {
             Some(ti) => vec![ti],
             None => schema.known_types().collect(),
+        };
+
+        let subject_var = match subject {
+            Subject::Variable(v) => Some(v.as_str()),
+            Subject::Bound(_) => None,
         };
 
         let mut all_bindings = Vec::new();
@@ -234,140 +298,199 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
             let table = table_name(ti);
 
-            // Build subject WHERE clause (shared across all field queries for this type)
-            let subject_filter = subject_where_clause(subject, existing);
+            let subject_groups = group_by_subject(solutions, subject_var);
 
-            // Synthetic rdf:type field
-            {
-                let pred_term = Term::Iri(Iri::new(RDF_TYPE));
-                let obj_term = Term::Iri((*ti).clone());
+            for group in &subject_groups {
+                let subject_in = group
+                    .subject_values
+                    .as_ref()
+                    .map(|vals| in_clause("\"_subject\"", vals));
 
-                // Check if predicate var is already bound and conflicts
-                if let Some(existing_pred) = existing.get(predicate_var) {
-                    if *existing_pred != pred_term {
-                        // Skip this synthetic field — predicate doesn't match
-                    } else {
-                        self.exec_field_scan_query(
-                            &table,
-                            &subject_filter,
-                            subject,
-                            predicate_var,
-                            &pred_term,
-                            object,
-                            &obj_term,
-                            None, // rdf:type object is an IRI, not a field value
-                            existing,
-                            &mut all_bindings,
-                        )?;
-                    }
-                } else {
-                    self.exec_field_scan_query(
-                        &table,
-                        &subject_filter,
+                // Determine if the object is constrained (bound or variable already bound)
+                let object_is_bound = match object {
+                    Value::Bound(_) => true,
+                    Value::Variable(v) => group.solutions.iter().any(|s| s.contains_key(v.as_str())),
+                };
+
+                // Partition fields into probe fields (indexed + object bound) and rest
+                let (probe_fields, rest_fields): (Vec<&FieldDescriptor>, Vec<&FieldDescriptor>) =
+                    fields.iter().partition(|fd| fd.indexed && object_is_bound);
+
+                // Phase 1: Query probe fields to narrow subjects
+                let mut narrowed_subjects: Option<Vec<String>> = None;
+
+                for fd in &probe_fields {
+                    let pred_term = Term::Iri(fd.predicate.clone());
+
+                    let field_bindings = self.exec_field_query(
+                        table,
+                        fd,
+                        &pred_term,
                         subject,
                         predicate_var,
-                        &pred_term,
                         object,
-                        &obj_term,
-                        None,
-                        existing,
-                        &mut all_bindings,
+                        &subject_in,
+                        &narrowed_subjects,
+                        group.solutions,
+                        subject_var,
                     )?;
+
+                    // Collect subjects from probe results and intersect
+                    let result_subjects: Vec<String> = field_bindings
+                        .iter()
+                        .filter_map(|b| match subject {
+                            Subject::Variable(v) => b.get(v.as_str()),
+                            Subject::Bound(_) => None,
+                        })
+                        .filter_map(|t| match t {
+                            Term::Iri(iri) => Some(iri.0.clone()),
+                            _ => None,
+                        })
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+
+                    if !result_subjects.is_empty() {
+                        narrowed_subjects = Some(match narrowed_subjects {
+                            Some(existing) => existing
+                                .into_iter()
+                                .filter(|s| result_subjects.contains(s))
+                                .collect(),
+                            None => result_subjects,
+                        });
+                    } else if !probe_fields.is_empty() {
+                        // Probe returned nothing — no results possible
+                        narrowed_subjects = Some(Vec::new());
+                    }
+
+                    all_bindings.extend(field_bindings);
                 }
-            }
 
-            // Real fields
-            for fd in fields {
-                let pred_term = Term::Iri(fd.predicate.clone());
-
-                // Check if predicate var is already bound and conflicts
-                if let Some(existing_pred) = existing.get(predicate_var) {
-                    if *existing_pred != pred_term {
+                // If probe narrowed to empty set, skip remaining fields
+                if let Some(ref ns) = narrowed_subjects {
+                    if ns.is_empty() {
+                        // Still need to process synthetic rdf:type — but no subjects match
                         continue;
                     }
                 }
 
-                // Build object filter
-                let mut where_parts = Vec::new();
-                if let Some(f) = &subject_filter {
-                    where_parts.push(f.clone());
-                }
-
-                // If object is bound or variable is already bound, add WHERE filter
-                match object {
-                    Value::Bound(term) => {
-                        where_parts
-                            .push(format!("\"{}\" = {}", fd.name, sql_literal(term)));
-                    }
-                    Value::Variable(v) => {
-                        if let Some(term) = existing.get(v) {
-                            where_parts
-                                .push(format!("\"{}\" = {}", fd.name, sql_literal(term)));
+                // Build effective subject filter: combine group's subject IN with narrowed subjects
+                let effective_subject_in = match (&subject_in, &narrowed_subjects) {
+                    (_, Some(narrowed)) => {
+                        let quoted: Vec<String> =
+                            narrowed.iter().map(|s| format!("'{}'", s.replace('\'', "''"))).collect();
+                        if quoted.is_empty() {
+                            continue;
                         }
+                        Some(format!("\"_subject\" IN ({})", quoted.join(", ")))
                     }
-                }
-
-                let sql = if where_parts.is_empty() {
-                    format!(
-                        "SELECT \"_subject\", \"{}\" FROM \"{}\"",
-                        fd.name, table
-                    )
-                } else {
-                    format!(
-                        "SELECT \"_subject\", \"{}\" FROM \"{}\" WHERE {}",
-                        fd.name, table, where_parts.join(" AND ")
-                    )
+                    (Some(existing), None) => Some(existing.clone()),
+                    (None, None) => None,
                 };
 
-                let result = self.executor.execute_sql(&sql)?;
+                // Synthetic rdf:type field
+                {
+                    let pred_term = Term::Iri(Iri::new(RDF_TYPE));
+                    let obj_term = Term::Iri((*ti).clone());
 
-                for row in &result.rows {
-                    let subj_str = match &row[0] {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let obj_str = match &row[1] {
-                        Some(s) => s,
-                        None => continue,
-                    };
-
-                    let subj_term = Term::Iri(Iri::new(subj_str.as_str()));
-                    let obj_term = parse_sql_value(obj_str, &fd.field_type);
-
-                    let mut binding = existing.clone();
-                    let mut ok = true;
-
-                    // Bind subject
-                    if let Subject::Variable(v) = subject {
-                        if !try_bind(v, &subj_term, &mut binding) {
-                            ok = false;
+                    // Check predicate compatibility across solutions
+                    let pred_compatible = group.solutions.iter().all(|s| {
+                        match s.get(predicate_var) {
+                            Some(existing_pred) => *existing_pred == pred_term,
+                            None => true,
                         }
-                    }
+                    });
+                    let any_pred_bound = group.solutions.iter().any(|s| s.contains_key(predicate_var));
+                    let skip_rdf_type = any_pred_bound && !pred_compatible;
 
-                    // Bind predicate
-                    if ok && !try_bind(predicate_var, &pred_term, &mut binding) {
-                        ok = false;
-                    }
+                    if !skip_rdf_type {
+                        // Check object compatibility
+                        let obj_ok = match object {
+                            Value::Bound(expected) => *expected == obj_term,
+                            Value::Variable(v) => group.solutions.iter().all(|s| {
+                                match s.get(v.as_str()) {
+                                    Some(val) => *val == obj_term,
+                                    None => true,
+                                }
+                            }),
+                        };
 
-                    // Bind object
-                    if ok {
-                        match object {
-                            Value::Variable(v) => {
-                                if !try_bind(v, &obj_term, &mut binding) {
-                                    ok = false;
+                        if obj_ok {
+                            let sql = match &effective_subject_in {
+                                Some(f) => format!(
+                                    "SELECT \"_subject\" FROM \"{}\" WHERE {}",
+                                    table, f
+                                ),
+                                None => format!("SELECT \"_subject\" FROM \"{}\"", table),
+                            };
+
+                            let result = self.executor.execute_sql(&sql)?;
+                            let solutions_by_subject =
+                                index_by_subject(group.solutions, subject_var);
+
+                            for row in &result.rows {
+                                let subj_str = match &row[0] {
+                                    Some(s) => s.as_str(),
+                                    None => continue,
+                                };
+                                let subj_term = Term::Iri(Iri::new(subj_str));
+
+                                let default_refs: Vec<&Binding> =
+                                    group.solutions.iter().collect();
+                                let matching: &[&Binding] = match &solutions_by_subject {
+                                    Some(map) => map
+                                        .get(subj_str)
+                                        .map(|v| v.as_slice())
+                                        .unwrap_or(&[]),
+                                    None => &default_refs,
+                                };
+
+                                for &existing in matching {
+                                    let mut binding: Binding = existing.clone();
+                                    let mut ok = true;
+
+                                    if let Subject::Variable(v) = subject {
+                                        if !try_bind(v, &subj_term, &mut binding) {
+                                            ok = false;
+                                        }
+                                    }
+                                    if ok && !try_bind(predicate_var, &pred_term, &mut binding) {
+                                        ok = false;
+                                    }
+                                    if ok {
+                                        if let Value::Variable(v) = object {
+                                            if !try_bind(v, &obj_term, &mut binding) {
+                                                ok = false;
+                                            }
+                                        }
+                                    }
+                                    if ok {
+                                        all_bindings.push(binding);
+                                    }
                                 }
                             }
-                            Value::Bound(expected) => {
-                                if *expected != obj_term {
-                                    ok = false;
-                                }
-                            }
                         }
                     }
+                }
 
-                    if ok {
-                        all_bindings.push(binding);
-                    }
+                // Phase 2: Query remaining (non-probe) fields
+                for fd in &rest_fields {
+                    let pred_term = Term::Iri(fd.predicate.clone());
+
+                    let field_bindings = self.exec_field_query(
+                        table,
+                        fd,
+                        &pred_term,
+                        subject,
+                        predicate_var,
+                        object,
+                        &effective_subject_in,
+                        &None, // narrowed subjects already folded into effective_subject_in
+                        group.solutions,
+                        subject_var,
+                    )?;
+
+                    all_bindings.extend(field_bindings);
                 }
             }
         }
@@ -375,80 +498,242 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         Ok(all_bindings)
     }
 
-    /// Execute a FieldScan query for the synthetic rdf:type field.
-    fn exec_field_scan_query(
+    /// Execute a single field query within a FieldScan and produce bindings.
+    fn exec_field_query(
         &self,
         table: &str,
-        subject_filter: &Option<String>,
+        fd: &FieldDescriptor,
+        pred_term: &Term,
         subject: &Subject,
         predicate_var: &str,
-        pred_term: &Term,
         object: &Value,
-        obj_term: &Term,
-        _field_type: Option<&FieldType>,
-        existing: &Binding,
-        out: &mut Vec<Binding>,
-    ) -> Result<(), DarqError> {
-        // Check if object is bound and conflicts with the synthetic value
-        match object {
-            Value::Bound(expected) => {
-                if expected != obj_term {
-                    return Ok(());
+        subject_in: &Option<String>,
+        narrowed_subjects: &Option<Vec<String>>,
+        solutions: &[Binding],
+        subject_var: Option<&str>,
+    ) -> Result<Vec<Binding>, DarqError> {
+        // Check predicate compatibility
+        let any_pred_bound = solutions.iter().any(|s| s.contains_key(predicate_var));
+        if any_pred_bound {
+            let all_match = solutions.iter().all(|s| {
+                match s.get(predicate_var) {
+                    Some(p) => *p == *pred_term,
+                    None => true,
                 }
+            });
+            if !all_match {
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut where_parts = Vec::new();
+
+        // Subject filter
+        if let Some(narrowed) = narrowed_subjects {
+            let quoted: Vec<String> =
+                narrowed.iter().map(|s| format!("'{}'", s.replace('\'', "''"))).collect();
+            if quoted.is_empty() {
+                return Ok(Vec::new());
+            }
+            where_parts.push(format!("\"_subject\" IN ({})", quoted.join(", ")));
+        } else if let Some(subj_in) = subject_in {
+            where_parts.push(subj_in.clone());
+        }
+        if let Subject::Bound(iri) = subject {
+            where_parts.push(format!(
+                "\"_subject\" = '{}'",
+                iri.0.replace('\'', "''")
+            ));
+        }
+
+        // Object filter
+        match object {
+            Value::Bound(term) => {
+                where_parts.push(format!("\"{}\" = {}", fd.name, sql_literal(term)));
             }
             Value::Variable(v) => {
-                if let Some(existing_val) = existing.get(v) {
-                    if *existing_val != *obj_term {
-                        return Ok(());
-                    }
+                let bound_values: Vec<String> = solutions
+                    .iter()
+                    .filter_map(|s| s.get(v.as_str()))
+                    .map(sql_literal)
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                if bound_values.len() == 1 {
+                    where_parts.push(format!("\"{}\" = {}", fd.name, bound_values[0]));
+                } else if !bound_values.is_empty() {
+                    where_parts.push(format!(
+                        "\"{}\" IN ({})",
+                        fd.name,
+                        bound_values.join(", ")
+                    ));
                 }
             }
         }
 
-        let sql = if let Some(f) = subject_filter {
-            format!("SELECT \"_subject\" FROM \"{}\" WHERE {}", table, f)
+        let sql = if where_parts.is_empty() {
+            format!("SELECT \"_subject\", \"{}\" FROM \"{}\"", fd.name, table)
         } else {
-            format!("SELECT \"_subject\" FROM \"{}\"", table)
+            format!(
+                "SELECT \"_subject\", \"{}\" FROM \"{}\" WHERE {}",
+                fd.name, table, where_parts.join(" AND ")
+            )
         };
 
         let result = self.executor.execute_sql(&sql)?;
+        let solutions_by_subject = index_by_subject(solutions, subject_var);
+
+        let mut bindings = Vec::new();
 
         for row in &result.rows {
             let subj_str = match &row[0] {
+                Some(s) => s.as_str(),
+                None => continue,
+            };
+            let obj_str = match &row[1] {
                 Some(s) => s,
                 None => continue,
             };
 
-            let subj_term = Term::Iri(Iri::new(subj_str.as_str()));
+            let subj_term = Term::Iri(Iri::new(subj_str));
+            let obj_term = parse_sql_value(obj_str, &fd.field_type);
 
-            let mut binding = existing.clone();
-            let mut ok = true;
+            let default_refs: Vec<&Binding> = solutions.iter().collect();
+            let matching: &[&Binding] = match &solutions_by_subject {
+                Some(map) => map.get(subj_str).map(|v| v.as_slice()).unwrap_or(&[]),
+                None => &default_refs,
+            };
 
-            if let Subject::Variable(v) = subject {
-                if !try_bind(v, &subj_term, &mut binding) {
-                    ok = false;
-                }
-            }
+            for &existing in matching {
+                let mut binding: Binding = existing.clone();
+                let mut ok = true;
 
-            if ok && !try_bind(predicate_var, pred_term, &mut binding) {
-                ok = false;
-            }
-
-            if ok {
-                if let Value::Variable(v) = object {
-                    if !try_bind(v, obj_term, &mut binding) {
+                if let Subject::Variable(v) = subject {
+                    if !try_bind(v, &subj_term, &mut binding) {
                         ok = false;
                     }
                 }
-            }
-
-            if ok {
-                out.push(binding);
+                if ok && !try_bind(predicate_var, pred_term, &mut binding) {
+                    ok = false;
+                }
+                if ok {
+                    match object {
+                        Value::Variable(v) => {
+                            if !try_bind(v, &obj_term, &mut binding) {
+                                ok = false;
+                            }
+                        }
+                        Value::Bound(expected) => {
+                            if *expected != obj_term {
+                                ok = false;
+                            }
+                        }
+                    }
+                }
+                if ok {
+                    bindings.push(binding);
+                }
             }
         }
 
-        Ok(())
+        Ok(bindings)
     }
+}
+
+/// A group of solutions that share the same subject values (or all have unbound subjects).
+struct SubjectGroup<'a> {
+    solutions: &'a [Binding],
+    /// The subject IRI strings for the IN clause, or None if subject is not bound.
+    subject_values: Option<Vec<String>>,
+}
+
+/// Group solutions by their bound subject value, chunking into MAX_IN_CLAUSE_SIZE groups.
+fn group_by_subject<'a>(
+    solutions: &'a [Binding],
+    subject_var: Option<&str>,
+) -> Vec<SubjectGroup<'a>> {
+    let subject_var = match subject_var {
+        Some(v) => v,
+        None => {
+            // Bound subject or no subject variable — one group, no IN clause
+            return vec![SubjectGroup {
+                solutions,
+                subject_values: None,
+            }];
+        }
+    };
+
+    // Check if any solution has the subject bound
+    let any_bound = solutions.iter().any(|s| s.contains_key(subject_var));
+    if !any_bound {
+        return vec![SubjectGroup {
+            solutions,
+            subject_values: None,
+        }];
+    }
+
+    // Collect distinct subject values
+    let subject_iris: Vec<String> = solutions
+        .iter()
+        .filter_map(|s| match s.get(subject_var) {
+            Some(Term::Iri(iri)) => Some(iri.0.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Chunk into groups of MAX_IN_CLAUSE_SIZE
+    if subject_iris.len() <= MAX_IN_CLAUSE_SIZE {
+        vec![SubjectGroup {
+            solutions,
+            subject_values: Some(subject_iris),
+        }]
+    } else {
+        subject_iris
+            .chunks(MAX_IN_CLAUSE_SIZE)
+            .map(|chunk| {
+                SubjectGroup {
+                    solutions,
+                    subject_values: Some(chunk.to_vec()),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Build a SQL IN clause from a list of IRI strings.
+fn in_clause(column: &str, values: &[String]) -> String {
+    let quoted: Vec<String> = values
+        .iter()
+        .map(|v| format!("'{}'", v.replace('\'', "''")))
+        .collect();
+    if quoted.len() == 1 {
+        format!("{} = {}", column, quoted[0])
+    } else {
+        format!("{} IN ({})", column, quoted.join(", "))
+    }
+}
+
+/// Build a HashMap from subject IRI string to matching solutions.
+/// Returns None if no subject variable is bound (all solutions match any subject).
+fn index_by_subject<'a>(
+    solutions: &'a [Binding],
+    subject_var: Option<&str>,
+) -> Option<HashMap<&'a str, Vec<&'a Binding>>> {
+    let var = subject_var?;
+    let any_bound = solutions.iter().any(|s| s.contains_key(var));
+    if !any_bound {
+        return None;
+    }
+
+    let mut map: HashMap<&str, Vec<&Binding>> = HashMap::new();
+    for s in solutions {
+        if let Some(Term::Iri(iri)) = s.get(var) {
+            map.entry(iri.0.as_str()).or_default().push(s);
+        }
+    }
+    Some(map)
 }
 
 /// Try to bind a variable to a term, checking for conflicts with existing bindings.
@@ -459,23 +744,6 @@ fn try_bind(var: &str, term: &Term, binding: &mut Binding) -> bool {
     } else {
         binding.insert(var.to_string(), term.clone());
         true
-    }
-}
-
-/// Build a WHERE clause for the subject, if it can be constrained.
-fn subject_where_clause(subject: &Subject, existing: &Binding) -> Option<String> {
-    match subject {
-        Subject::Variable(v) => {
-            if let Some(term) = existing.get(v) {
-                Some(format!("\"_subject\" = {}", sql_literal(term)))
-            } else {
-                None
-            }
-        }
-        Subject::Bound(iri) => Some(format!(
-            "\"_subject\" = '{}'",
-            iri.0.replace('\'', "''")
-        )),
     }
 }
 
@@ -529,7 +797,7 @@ mod tests {
 
     /// Mock SQL executor that records queries and returns canned results.
     struct MockExecutor {
-        /// Canned responses keyed by SQL prefix match.
+        /// Canned responses keyed by SQL substring match.
         responses: Vec<(String, SqlResultSet)>,
         /// Queries that were executed, for assertions.
         queries: RefCell<Vec<String>>,
@@ -589,11 +857,48 @@ mod tests {
                         predicate: Iri::new("http://example.org/name"),
                         name: "name",
                         field_type: FieldType::String,
+                        indexed: false,
                     },
                     FieldDescriptor {
                         predicate: Iri::new("http://example.org/age"),
                         name: "age",
                         field_type: FieldType::Integer,
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> {
+                vec![]
+            }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Person>();
+        schema
+    }
+
+    fn test_schema_with_indexed_name() -> Schema {
+        struct Person;
+        impl Resource for Person {
+            fn rdf_type() -> Iri {
+                Iri::new("http://example.org/Person")
+            }
+            fn subject_iri(&self) -> Iri {
+                Iri::new("http://example.org/person/test")
+            }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/name"),
+                        name: "name",
+                        field_type: FieldType::String,
+                        indexed: true,
+                    },
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/age"),
+                        name: "age",
+                        field_type: FieldType::Integer,
+                        indexed: false,
                     },
                 ]
             }
@@ -749,8 +1054,7 @@ mod tests {
             ],
         });
 
-        // Second pattern: FieldScan with subject constraint from first result
-        // These will have WHERE "_subject" = ... from pipelining
+        // Second pattern: FieldScan queries should contain alice constraint
         executor.add_response("SELECT \"_subject\" FROM \"Person\"", SqlResultSet {
             columns: vec!["_subject".into()],
             rows: vec![
@@ -807,11 +1111,154 @@ mod tests {
 
         // FieldScan queries should have subject filter from pipelining
         let queries = executor.executed_queries();
-        // The second+ queries (FieldScan) should contain the alice IRI as a filter
         for q in &queries[1..] {
             assert!(
                 q.contains("alice"),
                 "FieldScan query should contain subject constraint from pipelining: {}",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_in_clause_for_multiple_subjects() {
+        let mut executor = MockExecutor::new();
+
+        // First pattern returns two subjects
+        executor.add_response("FROM \"Person\"", SqlResultSet {
+            columns: vec!["_subject".into(), "name".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into()), Some("Alice".into())],
+                vec![Some("http://example.org/person/bob".into()), Some("Bob".into())],
+            ],
+        });
+
+        // Second pattern: FieldScan — should use IN clause
+        executor.add_response("SELECT \"_subject\" FROM", SqlResultSet {
+            columns: vec!["_subject".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into())],
+                vec![Some("http://example.org/person/bob".into())],
+            ],
+        });
+        executor.add_response("\"age\" FROM", SqlResultSet {
+            columns: vec!["_subject".into(), "age".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into()), Some("30".into())],
+                vec![Some("http://example.org/person/bob".into()), Some("25".into())],
+            ],
+        });
+        executor.add_response("\"name\" FROM", SqlResultSet {
+            columns: vec!["_subject".into(), "name".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into()), Some("Alice".into())],
+                vec![Some("http://example.org/person/bob".into()), Some("Bob".into())],
+            ],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema();
+
+        let plan = QueryPlan {
+            patterns: vec![
+                QueryPattern::Resource {
+                    subject: Subject::Variable("s".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    }],
+                    type_variable: None,
+                },
+                QueryPattern::FieldScan {
+                    subject: Subject::Variable("s".into()),
+                    predicate_var: "p".into(),
+                    object: Value::Variable("o".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                },
+            ],
+            select: SelectClause::Star,
+            modifier: SolutionModifier::default(),
+        };
+
+        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+
+        // 2 subjects x 3 fields (rdf:type + name + age) = 6 bindings
+        assert_eq!(bindings.len(), 6);
+
+        // FieldScan should use IN clause, not individual queries
+        let queries = executor.executed_queries();
+        // Should be: 1 Resource query + 3 FieldScan queries (not 2*3=6)
+        assert_eq!(queries.len(), 4, "Expected 4 queries (1 Resource + 3 FieldScan), got {}: {:?}", queries.len(), queries);
+
+        // The FieldScan queries should contain IN clause with both subjects
+        for q in &queries[1..] {
+            assert!(
+                q.contains("IN") || (q.contains("alice") && q.contains("bob")),
+                "FieldScan query should batch subjects: {}",
+                q
+            );
+        }
+    }
+
+    #[test]
+    fn test_indexed_field_probed_first_in_field_scan() {
+        let mut executor = MockExecutor::new();
+
+        // Indexed name field query (probed first because object is bound)
+        executor.add_response("\"name\" FROM \"Person\"", SqlResultSet {
+            columns: vec!["_subject".into(), "name".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into()), Some("Alice".into())],
+            ],
+        });
+
+        // Non-indexed age field query (should be constrained by probe results)
+        executor.add_response("\"age\" FROM \"Person\"", SqlResultSet {
+            columns: vec!["_subject".into(), "age".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into()), Some("30".into())],
+            ],
+        });
+
+        // rdf:type query
+        executor.add_response("SELECT \"_subject\" FROM \"Person\"", SqlResultSet {
+            columns: vec!["_subject".into()],
+            rows: vec![
+                vec![Some("http://example.org/person/alice".into())],
+            ],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema_with_indexed_name();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::FieldScan {
+                subject: Subject::Variable("s".into()),
+                predicate_var: "p".into(),
+                object: Value::Bound(Term::Literal(Literal::String("Alice".into()))),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+            }],
+            select: SelectClause::Star,
+            modifier: SolutionModifier::default(),
+        };
+
+        let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+
+        let queries = executor.executed_queries();
+
+        // First query should be the indexed name field (probe)
+        assert!(
+            queries[0].contains("\"name\""),
+            "First query should probe indexed name field: {}",
+            queries[0]
+        );
+
+        // Subsequent queries should have subject constraint from probe
+        for q in &queries[1..] {
+            assert!(
+                q.contains("alice"),
+                "Non-probe query should be constrained by probe results: {}",
                 q
             );
         }

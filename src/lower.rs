@@ -304,11 +304,13 @@ mod tests {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
                     field_type: FieldType::String,
+                    indexed: false,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
                     field_type: FieldType::Integer,
+                    indexed: false,
                 },
             ]
         }
@@ -555,6 +557,7 @@ mod tests {
                     predicate: Iri::new("http://example.org/owner"),
                     name: "owner",
                     field_type: FieldType::String,
+                    indexed: false,
                 }]
             }
             fn field_values(&self) -> Vec<Term> {

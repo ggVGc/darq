@@ -23,6 +23,7 @@ pub struct FieldDescriptor {
     pub predicate: Iri,
     pub name: &'static str,
     pub field_type: FieldType,
+    pub indexed: bool,
 }
 
 /// Implemented by any Rust type that can be stored and queried as a resource.
@@ -208,11 +209,13 @@ mod tests {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
                     field_type: FieldType::String,
+                    indexed: false,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
                     field_type: FieldType::Integer,
+                    indexed: false,
                 },
             ]
         }
