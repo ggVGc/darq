@@ -2,11 +2,11 @@
 //!
 //! Generated from `cpmeta_tables.sql`.
 //!
-//! The SQL tables use `rdf_subject` as the subject IRI column, but darq's
-//! SQL engine expects `_subject`. Create views or add a generated column:
+//! The SQL tables use `rdf_subject` as the subject IRI column. Configure
+//! the SQL engine accordingly:
 //!
-//! ```sql
-//! ALTER TABLE ct_quantity_kinds ADD COLUMN _subject TEXT GENERATED ALWAYS AS (rdf_subject) STORED;
+//! ```rust,ignore
+//! let engine = SqlEngine::new(&executor).with_subject_column("rdf_subject");
 //! ```
 
 use crate::rdf::{Iri, Term};

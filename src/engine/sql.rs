@@ -32,11 +32,24 @@ pub trait SqlExecutor {
 /// queries cheaper.
 pub struct SqlEngine<'a, E> {
     executor: &'a E,
+    subject_column: String,
 }
 
 impl<'a, E: SqlExecutor> SqlEngine<'a, E> {
     pub fn new(executor: &'a E) -> Self {
-        Self { executor }
+        Self {
+            executor,
+            subject_column: "_subject".to_string(),
+        }
+    }
+
+    pub fn with_subject_column(mut self, col: impl Into<String>) -> Self {
+        self.subject_column = col.into();
+        self
+    }
+
+    fn quoted_subject_col(&self) -> String {
+        format!("\"{}\"", self.subject_column)
     }
 }
 
@@ -160,7 +173,8 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             let table = table_name(ti);
 
             // Build SELECT columns
-            let mut select_cols = vec!["\"_subject\"".to_string()];
+            let subj_col = self.quoted_subject_col();
+            let mut select_cols = vec![subj_col.clone()];
             for c in constraints {
                 select_cols.push(format!("\"{}\"", c.field_name));
             }
@@ -170,7 +184,8 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             let mut static_where = Vec::new();
             if let Subject::Bound(iri) = subject {
                 static_where.push(format!(
-                    "\"_subject\" = '{}'",
+                    "{} = '{}'",
+                    subj_col,
                     iri.0.replace('\'', "''")
                 ));
             }
@@ -188,7 +203,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                 let mut where_parts = static_where.clone();
 
                 if let Some(subject_values) = &group.subject_values {
-                    where_parts.push(in_clause("\"_subject\"", subject_values));
+                    where_parts.push(in_clause(&subj_col, subject_values));
                 }
 
                 // Add constraint variable filters from the group's common bindings
@@ -245,7 +260,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                         .map(|(c, v)| (c.as_str(), v))
                         .collect();
 
-                    let subj_str = match col_map.get("_subject") {
+                    let subj_str = match col_map.get(self.subject_column.as_str()) {
                         Some(Some(s)) => s.as_str(),
                         _ => continue,
                     };
@@ -345,13 +360,14 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
             let table = table_name(ti);
 
+            let subj_col = self.quoted_subject_col();
             let subject_groups = group_by_subject(solutions, subject_var);
 
             for group in &subject_groups {
                 let subject_in = group
                     .subject_values
                     .as_ref()
-                    .map(|vals| in_clause("\"_subject\"", vals));
+                    .map(|vals| in_clause(&subj_col, vals));
 
                 // Determine if the object is constrained (bound or variable already bound)
                 let object_is_bound = match object {
@@ -429,7 +445,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                         if quoted.is_empty() {
                             continue;
                         }
-                        Some(format!("\"_subject\" IN ({})", quoted.join(", ")))
+                        Some(format!("{} IN ({})", subj_col, quoted.join(", ")))
                     }
                     (Some(existing), None) => Some(existing.clone()),
                     (None, None) => None,
@@ -465,10 +481,10 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                         if obj_ok {
                             let sql = match &effective_subject_in {
                                 Some(f) => format!(
-                                    "SELECT \"_subject\" FROM \"{}\" WHERE {}",
-                                    table, f
+                                    "SELECT {} FROM \"{}\" WHERE {}",
+                                    subj_col, table, f
                                 ),
-                                None => format!("SELECT \"_subject\" FROM \"{}\"", table),
+                                None => format!("SELECT {} FROM \"{}\"", subj_col, table),
                             };
 
                             let result = self.executor.execute_sql(&sql)?;
@@ -573,6 +589,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             }
         }
 
+        let subj_col = self.quoted_subject_col();
         let mut where_parts = Vec::new();
 
         // Subject filter
@@ -582,13 +599,14 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             if quoted.is_empty() {
                 return Ok(Vec::new());
             }
-            where_parts.push(format!("\"_subject\" IN ({})", quoted.join(", ")));
+            where_parts.push(format!("{} IN ({})", subj_col, quoted.join(", ")));
         } else if let Some(subj_in) = subject_in {
             where_parts.push(subj_in.clone());
         }
         if let Subject::Bound(iri) = subject {
             where_parts.push(format!(
-                "\"_subject\" = '{}'",
+                "{} = '{}'",
+                subj_col,
                 iri.0.replace('\'', "''")
             ));
         }
@@ -619,11 +637,11 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         }
 
         let sql = if where_parts.is_empty() {
-            format!("SELECT \"_subject\", \"{}\" FROM \"{}\"", fd.name, table)
+            format!("SELECT {}, \"{}\" FROM \"{}\"", subj_col, fd.name, table)
         } else {
             format!(
-                "SELECT \"_subject\", \"{}\" FROM \"{}\" WHERE {}",
-                fd.name, table, where_parts.join(" AND ")
+                "SELECT {}, \"{}\" FROM \"{}\" WHERE {}",
+                subj_col, fd.name, table, where_parts.join(" AND ")
             )
         };
 
