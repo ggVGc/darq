@@ -23,12 +23,12 @@ pub struct QueryResult {
 }
 
 /// Trait for query plan evaluation backends.
+///
+/// Implementations must apply `plan.modifier` (DISTINCT, ORDER BY, LIMIT,
+/// OFFSET) before returning.  The [`apply_modifiers`] helper provides a
+/// ready-made in-memory implementation.
 pub trait Engine {
-    fn evaluate_plan(
-        &self,
-        plan: &QueryPlan,
-        schema: &Schema,
-    ) -> Result<Vec<Binding>, DarqError>;
+    fn evaluate_plan(&self, plan: &QueryPlan, schema: &Schema) -> Result<Vec<Binding>, DarqError>;
 }
 
 /// Execute a SPARQL SELECT query using the given engine and schema.
@@ -55,10 +55,7 @@ pub fn execute(
     // 6. Evaluate plan
     let bindings = engine.evaluate_plan(&plan, schema)?;
 
-    // 7. Apply solution modifiers
-    let bindings = apply_modifiers(bindings, &plan.modifier);
-
-    // 8. Project to selected variables
+    // 7. Project to selected variables
     project(bindings, &plan)
 }
 
@@ -75,10 +72,7 @@ fn validate_predicates(query: &SelectQuery, schema: &Schema) -> Result<(), DarqE
 }
 
 /// Project bindings to the requested variables.
-fn project(
-    bindings: Vec<Binding>,
-    plan: &QueryPlan,
-) -> Result<QueryResult, DarqError> {
+fn project(bindings: Vec<Binding>, plan: &QueryPlan) -> Result<QueryResult, DarqError> {
     let variables = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect(),
         SelectClause::Star => plan.collect_variables(),
@@ -95,48 +89,4 @@ fn project(
         .collect();
 
     Ok(QueryResult { variables, rows })
-}
-
-/// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
-fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
-    if modifier.distinct {
-        let mut seen = HashSet::new();
-        bindings.retain(|b| {
-            let mut sorted: Vec<_> = b.iter().collect();
-            sorted.sort_by_key(|(k, _)| *k);
-            seen.insert(format!("{:?}", sorted))
-        });
-    }
-
-    if !modifier.order_by.is_empty() {
-        bindings.sort_by(|a, b| {
-            for cond in &modifier.order_by {
-                let va = a.get(&cond.variable.0);
-                let vb = b.get(&cond.variable.0);
-                let ord = va.cmp(&vb);
-                let ord = match cond.direction {
-                    OrderDirection::Ascending => ord,
-                    OrderDirection::Descending => ord.reverse(),
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
-
-    if let Some(offset) = modifier.offset {
-        if offset < bindings.len() {
-            bindings = bindings.into_iter().skip(offset).collect();
-        } else {
-            bindings.clear();
-        }
-    }
-
-    if let Some(limit) = modifier.limit {
-        bindings.truncate(limit);
-    }
-
-    bindings
 }

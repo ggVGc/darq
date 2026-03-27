@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use super::Binding;
 use super::Engine;
@@ -6,6 +7,8 @@ use crate::error::DarqError;
 use crate::ir::{QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::{FieldDescriptor, FieldType, Schema};
+use crate::sparql::ast::OrderDirection;
+use crate::sparql::ast::SolutionModifier;
 use crate::sql::sql_literal;
 
 /// Maximum number of values in a single SQL IN clause.
@@ -35,6 +38,50 @@ impl<'a, E: SqlExecutor> SqlEngine<'a, E> {
     pub fn new(executor: &'a E) -> Self {
         Self { executor }
     }
+}
+
+/// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
+fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
+    if modifier.distinct {
+        let mut seen = HashSet::new();
+        bindings.retain(|b| {
+            let mut sorted: Vec<_> = b.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            seen.insert(format!("{:?}", sorted))
+        });
+    }
+
+    if !modifier.order_by.is_empty() {
+        bindings.sort_by(|a, b| {
+            for cond in &modifier.order_by {
+                let va = a.get(&cond.variable.0);
+                let vb = b.get(&cond.variable.0);
+                let ord = va.cmp(&vb);
+                let ord = match cond.direction {
+                    OrderDirection::Ascending => ord,
+                    OrderDirection::Descending => ord.reverse(),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if let Some(offset) = modifier.offset {
+        if offset < bindings.len() {
+            bindings = bindings.into_iter().skip(offset).collect();
+        } else {
+            bindings.clear();
+        }
+    }
+
+    if let Some(limit) = modifier.limit {
+        bindings.truncate(limit);
+    }
+
+    bindings
 }
 
 impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
@@ -76,7 +123,7 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
             };
         }
 
-        Ok(solutions)
+        Ok(apply_modifiers(solutions, &plan.modifier))
     }
 }
 

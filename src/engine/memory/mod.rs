@@ -2,13 +2,14 @@ pub mod store;
 
 pub use store::{ResourceInstance, ResourceStore};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{Binding, Engine};
 use crate::error::DarqError;
 use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
-use crate::rdf::{Iri, Term, RDF_TYPE};
+use crate::rdf::{Iri, RDF_TYPE, Term};
 use crate::schema::Schema;
+use crate::sparql::ast::{OrderDirection, SolutionModifier};
 
 /// In-memory engine that evaluates plans against a ResourceStore.
 pub struct InMemoryEngine<'a> {
@@ -22,21 +23,58 @@ impl<'a> InMemoryEngine<'a> {
 }
 
 impl Engine for InMemoryEngine<'_> {
-    fn evaluate_plan(
-        &self,
-        plan: &QueryPlan,
-        schema: &Schema,
-    ) -> Result<Vec<Binding>, DarqError> {
-        Ok(evaluate_plan(plan, self.store, schema))
+    fn evaluate_plan(&self, plan: &QueryPlan, schema: &Schema) -> Result<Vec<Binding>, DarqError> {
+        let bindings = evaluate_plan(plan, self.store, schema);
+        Ok(apply_modifiers(bindings, &plan.modifier))
     }
 }
 
+/// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
+fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
+    if modifier.distinct {
+        let mut seen = HashSet::new();
+        bindings.retain(|b| {
+            let mut sorted: Vec<_> = b.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            seen.insert(format!("{:?}", sorted))
+        });
+    }
+
+    if !modifier.order_by.is_empty() {
+        bindings.sort_by(|a, b| {
+            for cond in &modifier.order_by {
+                let va = a.get(&cond.variable.0);
+                let vb = b.get(&cond.variable.0);
+                let ord = va.cmp(&vb);
+                let ord = match cond.direction {
+                    OrderDirection::Ascending => ord,
+                    OrderDirection::Descending => ord.reverse(),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if let Some(offset) = modifier.offset {
+        if offset < bindings.len() {
+            bindings = bindings.into_iter().skip(offset).collect();
+        } else {
+            bindings.clear();
+        }
+    }
+
+    if let Some(limit) = modifier.limit {
+        bindings.truncate(limit);
+    }
+
+    bindings
+}
+
 /// Evaluate a resource-level query plan using nested-loop join.
-fn evaluate_plan(
-    plan: &QueryPlan,
-    store: &ResourceStore,
-    schema: &Schema,
-) -> Vec<Binding> {
+fn evaluate_plan(plan: &QueryPlan, store: &ResourceStore, schema: &Schema) -> Vec<Binding> {
     let mut solutions: Vec<Binding> = vec![HashMap::new()];
 
     for pattern in &plan.patterns {
@@ -222,11 +260,7 @@ fn match_resource(
 }
 
 /// Check if a subject pattern matches an instance subject.
-fn check_subject(
-    subject: &Subject,
-    actual: &Iri,
-    existing: &Binding,
-) -> Option<Binding> {
+fn check_subject(subject: &Subject, actual: &Iri, existing: &Binding) -> Option<Binding> {
     let mut binding = Binding::new();
     match subject {
         Subject::Variable(name) => {
@@ -349,8 +383,16 @@ mod tests {
         schema.register::<Person>();
 
         let mut store = ResourceStore::new();
-        store.load(&Person { id: "alice".into(), name: "Alice".into(), age: 30 });
-        store.load(&Person { id: "bob".into(), name: "Bob".into(), age: 25 });
+        store.load(&Person {
+            id: "alice".into(),
+            name: "Alice".into(),
+            age: 30,
+        });
+        store.load(&Person {
+            id: "bob".into(),
+            name: "Bob".into(),
+            age: 25,
+        });
 
         (schema, store)
     }
@@ -363,7 +405,8 @@ mod tests {
             "PREFIX ex: <http://example.org/> SELECT * WHERE { ?p a ex:Person . ?p ex:name ?name }",
             &schema,
             &engine,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(result.rows.len(), 2);
         assert!(result.variables.contains(&"name".to_string()));
@@ -393,8 +436,14 @@ mod tests {
             &engine,
         ).unwrap();
 
-        assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
-        assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
+        assert_eq!(
+            result.rows[0][0],
+            Some(Term::Literal(Literal::String("Alice".into())))
+        );
+        assert_eq!(
+            result.rows[1][0],
+            Some(Term::Literal(Literal::String("Bob".into())))
+        );
     }
 
     #[test]
@@ -407,8 +456,14 @@ mod tests {
             &engine,
         ).unwrap();
 
-        assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Bob".into()))));
-        assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Alice".into()))));
+        assert_eq!(
+            result.rows[0][0],
+            Some(Term::Literal(Literal::String("Bob".into())))
+        );
+        assert_eq!(
+            result.rows[1][0],
+            Some(Term::Literal(Literal::String("Alice".into())))
+        );
     }
 
     #[test]
@@ -422,7 +477,10 @@ mod tests {
         ).unwrap();
 
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+        assert_eq!(
+            result.rows[0][0],
+            Some(Term::Literal(Literal::String("Alice".into())))
+        );
     }
 
     #[test]
@@ -436,7 +494,10 @@ mod tests {
         ).unwrap();
 
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Bob".into()))));
+        assert_eq!(
+            result.rows[0][0],
+            Some(Term::Literal(Literal::String("Bob".into())))
+        );
     }
 
     #[test]
@@ -449,7 +510,10 @@ mod tests {
             &engine,
         );
 
-        assert!(matches!(result, Err(crate::error::DarqError::UnknownPredicate(_))));
+        assert!(matches!(
+            result,
+            Err(crate::error::DarqError::UnknownPredicate(_))
+        ));
     }
 
     #[test]
@@ -463,9 +527,15 @@ mod tests {
         ).unwrap();
 
         assert_eq!(result.rows.len(), 2);
-        assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+        assert_eq!(
+            result.rows[0][0],
+            Some(Term::Literal(Literal::String("Alice".into())))
+        );
         assert_eq!(result.rows[0][1], Some(Term::Literal(Literal::Integer(30))));
-        assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
+        assert_eq!(
+            result.rows[1][0],
+            Some(Term::Literal(Literal::String("Bob".into())))
+        );
         assert_eq!(result.rows[1][1], Some(Term::Literal(Literal::Integer(25))));
     }
 }
