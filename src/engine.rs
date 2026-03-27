@@ -424,12 +424,12 @@ mod tests {
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
-                    field_type: FieldType::Literal,
+                    field_type: FieldType::String,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
-                    field_type: FieldType::Literal,
+                    field_type: FieldType::Integer,
                 },
             ]
         }

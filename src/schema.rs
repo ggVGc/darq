@@ -1,12 +1,18 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
+use crate::rdf::{Float64, Iri, Literal, Term, RDF_TYPE};
 
-/// What kind of value a field holds.
+/// What kind of value a field holds, following XSD type vocabulary.
 #[derive(Debug, Clone)]
 pub enum FieldType {
-    /// Literal value (string, integer, boolean).
-    Literal,
+    String,
+    Integer,
+    Boolean,
+    Float,
+    Double,
+    Decimal,
+    Date,
+    DateTime,
     /// IRI reference to one of the listed resource types.
     Reference(Vec<Iri>),
 }
@@ -171,6 +177,12 @@ impl From<bool> for Term {
     }
 }
 
+impl From<f64> for Term {
+    fn from(v: f64) -> Self {
+        Term::Literal(Literal::Double(Float64(v)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,12 +207,12 @@ mod tests {
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
-                    field_type: FieldType::Literal,
+                    field_type: FieldType::String,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
-                    field_type: FieldType::Literal,
+                    field_type: FieldType::Integer,
                 },
             ]
         }

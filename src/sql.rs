@@ -258,6 +258,10 @@ fn sql_literal(term: &Term) -> String {
             Literal::String(s) => format!("'{}'", s.replace('\'', "''")),
             Literal::Integer(n) => n.to_string(),
             Literal::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Literal::Float(v) | Literal::Double(v) => format!("{}", v.0),
+            Literal::Decimal(s) => format!("'{}'", s.replace('\'', "''")),
+            Literal::Date(s) => format!("'{}'", s.replace('\'', "''")),
+            Literal::DateTime(s) => format!("'{}'", s.replace('\'', "''")),
         },
     }
 }
