@@ -15,6 +15,8 @@ pub enum DarqError {
         subject: String,
         candidates: Vec<Iri>,
     },
+    /// SELECT references variables not bound by any WHERE pattern.
+    UnboundVariables(Vec<String>),
 }
 
 impl std::fmt::Display for DarqError {
@@ -26,6 +28,10 @@ impl std::fmt::Display for DarqError {
             DarqError::UnknownType(iri) => write!(f, "unknown type: {}", iri),
             DarqError::AmbiguousType { subject, candidates } => {
                 write!(f, "ambiguous type for ?{}: candidates {:?}", subject, candidates)
+            }
+            DarqError::UnboundVariables(vars) => {
+                let names: Vec<String> = vars.iter().map(|v| format!("?{}", v)).collect();
+                write!(f, "unbound variables in SELECT: {}", names.join(", "))
             }
         }
     }

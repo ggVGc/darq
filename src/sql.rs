@@ -185,9 +185,10 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
 
     let select_cols: Vec<String> = vars
         .iter()
-        .map(|v| match bindings.get(v) {
-            Some(expr) => format!("{} AS \"{}\"", expr.to_sql(), v),
-            None => format!("NULL AS \"{}\"", v),
+        .filter_map(|v| {
+            bindings
+                .get(v)
+                .map(|expr| format!("{} AS \"{}\"", expr.to_sql(), v))
         })
         .collect();
 
@@ -619,6 +620,36 @@ mod tests {
             "SELECT \"p0\".\"name\" AS \"x\"\n\
              FROM \"Person\" AS \"p0\"\n\
              WHERE \"p0\".\"label\" = \"p0\".\"name\""
+        );
+    }
+
+    #[test]
+    fn test_unbound_variable_skipped() {
+        // If an unbound variable somehow reaches SQL generation (e.g. built
+        // by hand), it is silently omitted from the SELECT list.
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Bound(Term::Literal(Literal::String("Alice".into()))),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![
+                Variable("name".into()),
+                Variable("p".into()),
+            ]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"_subject\" AS \"p\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" = 'Alice'"
         );
     }
 

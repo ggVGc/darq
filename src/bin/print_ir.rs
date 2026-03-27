@@ -32,6 +32,11 @@ fn main() {
         process::exit(1);
     }
 
+    if let Err(e) = sparql::validate_select_variables(&query) {
+        eprintln!("Validation error: {}", e);
+        process::exit(1);
+    }
+
     let schema = test_schema::test_schema();
 
     match lower::lower(&query, &schema) {

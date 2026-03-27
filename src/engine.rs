@@ -30,7 +30,10 @@ pub fn execute(
     // 2. Expand prefixes
     sparql::expand_prefixes(&mut query)?;
 
-    // 3. Validate predicates against schema
+    // 3. Validate SELECT variables are bound
+    sparql::validate_select_variables(&query)?;
+
+    // 4. Validate predicates against schema
     validate_predicates(&query, schema)?;
 
     // 4. Lower to resource-level IR
