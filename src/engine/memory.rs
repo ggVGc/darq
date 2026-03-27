@@ -1,64 +1,31 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use super::{Binding, Engine};
 use crate::error::DarqError;
 use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Term, RDF_TYPE};
 use crate::resource_store::ResourceStore;
 use crate::schema::Schema;
-use crate::sparql::ast::*;
-use crate::sparql::{self, parser};
 
-/// One solution row: a mapping from variable names to bound terms.
-pub type Binding = HashMap<String, Term>;
-
-/// The result of a SELECT query.
-#[derive(Debug)]
-pub struct QueryResult {
-    pub variables: Vec<String>,
-    pub rows: Vec<Vec<Option<Term>>>,
+/// In-memory engine that evaluates plans against a ResourceStore.
+pub struct InMemoryEngine<'a> {
+    store: &'a ResourceStore,
 }
 
-/// Execute a SPARQL SELECT query against a resource store with a known schema.
-pub fn execute(
-    query_str: &str,
-    schema: &Schema,
-    store: &ResourceStore,
-) -> Result<QueryResult, DarqError> {
-    // 1. Parse
-    let mut query = parser::parse(query_str)?;
-
-    // 2. Expand prefixes
-    sparql::expand_prefixes(&mut query)?;
-
-    // 3. Validate SELECT variables are bound
-    sparql::validate_select_variables(&query)?;
-
-    // 4. Validate predicates against schema
-    validate_predicates(&query, schema)?;
-
-    // 4. Lower to resource-level IR
-    let plan = crate::lower::lower(&query, schema)?;
-
-    // 5. Evaluate plan
-    let bindings = evaluate_plan(&plan, store, schema);
-
-    // 6. Apply solution modifiers
-    let bindings = apply_modifiers(bindings, &plan.modifier);
-
-    // 7. Project to selected variables
-    project(bindings, &plan)
-}
-
-/// Validate that all concrete predicates in the query are known to the schema.
-fn validate_predicates(query: &SelectQuery, schema: &Schema) -> Result<(), DarqError> {
-    for pattern in &query.where_pattern.patterns {
-        if let TermOrVariable::Iri(iri) = &pattern.predicate {
-            if !schema.is_known_predicate(iri) {
-                return Err(DarqError::UnknownPredicate(iri.clone()));
-            }
-        }
+impl<'a> InMemoryEngine<'a> {
+    pub fn new(store: &'a ResourceStore) -> Self {
+        Self { store }
     }
-    Ok(())
+}
+
+impl Engine for InMemoryEngine<'_> {
+    fn evaluate_plan(
+        &self,
+        plan: &QueryPlan,
+        schema: &Schema,
+    ) -> Result<Vec<Binding>, DarqError> {
+        Ok(evaluate_plan(plan, self.store, schema))
+    }
 }
 
 /// Evaluate a resource-level query plan using nested-loop join.
@@ -330,76 +297,10 @@ fn check_value(
     Some(binding)
 }
 
-/// Project bindings to the requested variables.
-fn project(
-    bindings: Vec<Binding>,
-    plan: &QueryPlan,
-) -> Result<QueryResult, DarqError> {
-    let variables = match &plan.select {
-        SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect(),
-        SelectClause::Star => plan.collect_variables(),
-    };
-
-    let rows = bindings
-        .into_iter()
-        .map(|binding| {
-            variables
-                .iter()
-                .map(|var| binding.get(var).cloned())
-                .collect()
-        })
-        .collect();
-
-    Ok(QueryResult { variables, rows })
-}
-
-/// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
-fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
-    if modifier.distinct {
-        let mut seen = HashSet::new();
-        bindings.retain(|b| {
-            let mut sorted: Vec<_> = b.iter().collect();
-            sorted.sort_by_key(|(k, _)| *k);
-            seen.insert(format!("{:?}", sorted))
-        });
-    }
-
-    if !modifier.order_by.is_empty() {
-        bindings.sort_by(|a, b| {
-            for cond in &modifier.order_by {
-                let va = a.get(&cond.variable.0);
-                let vb = b.get(&cond.variable.0);
-                let ord = va.cmp(&vb);
-                let ord = match cond.direction {
-                    OrderDirection::Ascending => ord,
-                    OrderDirection::Descending => ord.reverse(),
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
-
-    if let Some(offset) = modifier.offset {
-        if offset < bindings.len() {
-            bindings = bindings.into_iter().skip(offset).collect();
-        } else {
-            bindings.clear();
-        }
-    }
-
-    if let Some(limit) = modifier.limit {
-        bindings.truncate(limit);
-    }
-
-    bindings
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::execute;
     use crate::rdf::{Iri, Literal, Term};
     use crate::resource_store::ResourceStore;
     use crate::schema::{FieldDescriptor, FieldType, Resource, Schema};
@@ -453,10 +354,11 @@ mod tests {
     #[test]
     fn test_basic_select_star() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT * WHERE { ?p a ex:Person . ?p ex:name ?name }",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.rows.len(), 2);
@@ -466,10 +368,11 @@ mod tests {
     #[test]
     fn test_select_specific_vars() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?name ?age WHERE { ?p a ex:Person . ?p ex:name ?name . ?p ex:age ?age }",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.variables, vec!["name", "age"]);
@@ -479,10 +382,11 @@ mod tests {
     #[test]
     fn test_order_by() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name } ORDER BY ?name",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
@@ -492,10 +396,11 @@ mod tests {
     #[test]
     fn test_order_by_desc() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name } ORDER BY DESC(?name)",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Bob".into()))));
@@ -505,10 +410,11 @@ mod tests {
     #[test]
     fn test_limit() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name } ORDER BY ?name LIMIT 1",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.rows.len(), 1);
@@ -518,10 +424,11 @@ mod tests {
     #[test]
     fn test_offset() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name } ORDER BY ?name OFFSET 1",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.rows.len(), 1);
@@ -531,22 +438,24 @@ mod tests {
     #[test]
     fn test_unknown_predicate_errors() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?x WHERE { ?p ex:email ?x }",
             &schema,
-            &store,
+            &engine,
         );
 
-        assert!(matches!(result, Err(DarqError::UnknownPredicate(_))));
+        assert!(matches!(result, Err(crate::error::DarqError::UnknownPredicate(_))));
     }
 
     #[test]
     fn test_join_across_patterns() {
         let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
         let result = execute(
             "PREFIX ex: <http://example.org/> SELECT ?name ?age WHERE { ?p ex:name ?name . ?p ex:age ?age } ORDER BY ?name",
             &schema,
-            &store,
+            &engine,
         ).unwrap();
 
         assert_eq!(result.rows.len(), 2);

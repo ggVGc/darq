@@ -17,6 +17,8 @@ pub enum DarqError {
     },
     /// SELECT references variables not bound by any WHERE pattern.
     UnboundVariables(Vec<String>),
+    /// An error occurred while executing a SQL query.
+    SqlError(String),
 }
 
 impl std::fmt::Display for DarqError {
@@ -33,6 +35,7 @@ impl std::fmt::Display for DarqError {
                 let names: Vec<String> = vars.iter().map(|v| format!("?{}", v)).collect();
                 write!(f, "unbound variables in SELECT: {}", names.join(", "))
             }
+            DarqError::SqlError(msg) => write!(f, "SQL error: {}", msg),
         }
     }
 }

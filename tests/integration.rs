@@ -1,4 +1,4 @@
-use darq::engine;
+use darq::engine::{self, InMemoryEngine};
 use darq::error::DarqError;
 use darq::rdf::{Iri, Literal, Term};
 use darq::resource_store::ResourceStore;
@@ -62,6 +62,7 @@ fn setup() -> (Schema, ResourceStore) {
 #[test]
 fn test_select_star_with_type() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -71,7 +72,7 @@ fn test_select_star_with_type() {
         }
         "#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -83,6 +84,7 @@ fn test_select_star_with_type() {
 #[test]
 fn test_select_with_all_fields() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -95,7 +97,7 @@ fn test_select_with_all_fields() {
         ORDER BY ?name
         "#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -116,6 +118,7 @@ fn test_select_with_all_fields() {
 #[test]
 fn test_limit_and_offset() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -126,7 +129,7 @@ fn test_limit_and_offset() {
         OFFSET 1
         "#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -139,6 +142,7 @@ fn test_limit_and_offset() {
 #[test]
 fn test_unknown_predicate_errors() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -146,7 +150,7 @@ fn test_unknown_predicate_errors() {
         WHERE { ?p ex:email ?email }
         "#,
         &schema,
-        &store,
+        &eng,
     );
 
     match result {
@@ -160,10 +164,11 @@ fn test_unknown_predicate_errors() {
 #[test]
 fn test_unknown_prefix_errors() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         "SELECT ?x WHERE { ?s foaf:name ?x }",
         &schema,
-        &store,
+        &eng,
     );
 
     assert!(matches!(result, Err(DarqError::UnknownPrefix(_))));
@@ -172,6 +177,7 @@ fn test_unknown_prefix_errors() {
 #[test]
 fn test_semicolon_shorthand_integration() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -185,7 +191,7 @@ fn test_semicolon_shorthand_integration() {
         LIMIT 1
         "#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -198,10 +204,11 @@ fn test_semicolon_shorthand_integration() {
 #[test]
 fn test_full_iri_without_prefix() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"SELECT ?name WHERE { ?p <http://example.org/name> ?name } ORDER BY ?name LIMIT 1"#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -212,6 +219,7 @@ fn test_full_iri_without_prefix() {
 #[test]
 fn test_empty_result() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     let result = engine::execute(
         r#"
         PREFIX ex: <http://example.org/>
@@ -222,7 +230,7 @@ fn test_empty_result() {
         }
         "#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -232,11 +240,12 @@ fn test_empty_result() {
 #[test]
 fn test_variable_predicate_expansion() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     // ?s ?p ?o should expand over all fields and return all data
     let result = engine::execute(
         "SELECT ?s ?p ?o WHERE { ?s ?p ?o }",
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 
@@ -256,6 +265,7 @@ fn test_variable_predicate_expansion() {
 #[test]
 fn test_variable_predicate_constrained_by_prior_pattern() {
     let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
     // First pattern binds ?person via ex:name, second pattern scans fields
     let result = engine::execute(
         r#"
@@ -268,7 +278,7 @@ fn test_variable_predicate_constrained_by_prior_pattern() {
         ORDER BY ?name ?p
         "#,
         &schema,
-        &store,
+        &eng,
     )
     .unwrap();
 

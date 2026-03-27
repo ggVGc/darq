@@ -251,7 +251,7 @@ fn table_name(iri: &Iri) -> &str {
 }
 
 /// Convert a Term to a SQL literal string.
-fn sql_literal(term: &Term) -> String {
+pub(crate) fn sql_literal(term: &Term) -> String {
     match term {
         Term::Iri(iri) => format!("'{}'", iri.0.replace('\'', "''")),
         Term::Literal(lit) => match lit {

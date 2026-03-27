@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use darq::engine;
+use darq::engine::{self, InMemoryEngine};
 use darq::rdf::{Iri, Term};
 use darq::resource_store::ResourceStore;
 use darq::schema::{FieldDescriptor, FieldType, Resource, Schema};
@@ -74,7 +74,8 @@ fn main() {
 
     println!("\nRunning query (ORDER BY ?age ?name, LIMIT 10)...");
     let t = Instant::now();
-    let result = engine::execute(query, &schema, &store).unwrap();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(query, &schema, &eng).unwrap();
     println!("Query completed in {:.2?}", t.elapsed());
 
     println!("\n?name\t\t?age");

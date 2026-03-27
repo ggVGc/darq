@@ -1,4 +1,4 @@
-use darq::engine;
+use darq::engine::{self, InMemoryEngine};
 use darq::rdf::{Iri, Term};
 use darq::resource_store::ResourceStore;
 use darq::schema::{FieldDescriptor, FieldType, Resource, Schema};
@@ -97,7 +97,8 @@ fn main() {
 }
 
 fn run_query(query: &str, schema: &Schema, store: &ResourceStore) {
-    match engine::execute(query, schema, store) {
+    let eng = InMemoryEngine::new(store);
+    match engine::execute(query, schema, &eng) {
         Ok(result) => {
             // Header
             let header: Vec<_> = result.variables.iter().map(|v| format!("?{}", v)).collect();
