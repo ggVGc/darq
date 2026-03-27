@@ -399,7 +399,7 @@ mod tests {
     use super::*;
     use crate::rdf::{Iri, Literal, Term};
     use crate::resource_store::ResourceStore;
-    use crate::schema::{FieldDescriptor, Resource, Schema};
+    use crate::schema::{FieldDescriptor, FieldType, Resource, Schema};
 
     struct Person {
         id: String,
@@ -421,10 +421,12 @@ mod tests {
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
+                    field_type: FieldType::Literal,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
+                    field_type: FieldType::Literal,
                 },
             ]
         }

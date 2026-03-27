@@ -1,7 +1,7 @@
 use darq::engine;
 use darq::rdf::{Iri, Term};
 use darq::resource_store::ResourceStore;
-use darq::schema::{FieldDescriptor, Resource, Schema};
+use darq::schema::{FieldDescriptor, FieldType, Resource, Schema};
 
 // ---------------------------------------------------------------------------
 // Data model: each struct maps to an RDF type, fields map to predicates.
@@ -27,10 +27,12 @@ impl Resource for Person {
             FieldDescriptor {
                 predicate: Iri::new("http://example.org/name"),
                 name: "name",
+                field_type: FieldType::Literal,
             },
             FieldDescriptor {
                 predicate: Iri::new("http://example.org/age"),
                 name: "age",
+                field_type: FieldType::Literal,
             },
         ]
     }

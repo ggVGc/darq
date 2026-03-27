@@ -78,7 +78,7 @@ impl ResourceStore {
 mod tests {
     use super::*;
     use crate::rdf::{Iri, Literal, Term};
-    use crate::schema::FieldDescriptor;
+    use crate::schema::{FieldDescriptor, FieldType};
 
     struct Person {
         id: String,
@@ -100,10 +100,12 @@ mod tests {
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
+                    field_type: FieldType::Literal,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
+                    field_type: FieldType::Literal,
                 },
             ]
         }

@@ -2,11 +2,21 @@ use std::collections::{HashMap, HashSet};
 
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 
-/// Describes one field on a Resource: its predicate IRI and Rust field name.
-#[derive(Clone)]
+/// What kind of value a field holds.
+#[derive(Debug, Clone)]
+pub enum FieldType {
+    /// Literal value (string, integer, boolean).
+    Literal,
+    /// IRI reference to one of the listed resource types.
+    Reference(Vec<Iri>),
+}
+
+/// Describes one field on a Resource: its predicate IRI, Rust field name, and value type.
+#[derive(Debug, Clone)]
 pub struct FieldDescriptor {
     pub predicate: Iri,
     pub name: &'static str,
+    pub field_type: FieldType,
 }
 
 /// Implemented by any Rust type that can be stored and queried as a resource.
@@ -117,6 +127,23 @@ impl Schema {
     pub fn known_types(&self) -> impl Iterator<Item = &Iri> {
         self.types.keys()
     }
+
+    /// Return the resource types that a reference-typed predicate can point to.
+    /// Collects targets from all types that declare this predicate as a Reference.
+    /// Returns an empty vec for literal fields or unknown predicates.
+    pub fn range_types(&self, predicate: &Iri) -> Vec<Iri> {
+        let mut targets = Vec::new();
+        for info in self.types.values() {
+            for fd in &info.fields {
+                if fd.predicate == *predicate {
+                    if let FieldType::Reference(ref iris) = fd.field_type {
+                        targets.extend(iris.iter().cloned());
+                    }
+                }
+            }
+        }
+        targets
+    }
 }
 
 // Convenience constructors for Term from common Rust types.
@@ -168,10 +195,12 @@ mod tests {
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/name"),
                     name: "name",
+                    field_type: FieldType::Literal,
                 },
                 FieldDescriptor {
                     predicate: Iri::new("http://example.org/age"),
                     name: "age",
+                    field_type: FieldType::Literal,
                 },
             ]
         }
