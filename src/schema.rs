@@ -6,6 +6,7 @@ use crate::rdf::{Float64, Iri, Literal, Term, RDF_TYPE};
 #[derive(Debug, Clone)]
 pub enum FieldType {
     String,
+    StringArray,
     Integer,
     Boolean,
     Float,

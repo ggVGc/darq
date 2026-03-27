@@ -11,6 +11,8 @@ use crate::sparql::ast::{OrderDirection, SelectClause};
 enum SqlExpr {
     /// A column reference: `"p<idx>"."<column>"`.
     Column { pattern_idx: usize, column: String },
+    /// An unnested array column: `unnest("p<idx>"."<column>")`.
+    Unnest { pattern_idx: usize, column: String },
     /// A constant SQL literal (e.g., a type IRI string).
     Constant(String),
 }
@@ -20,6 +22,9 @@ impl SqlExpr {
         match self {
             SqlExpr::Column { pattern_idx, column } => {
                 format!("\"p{}\".\"{}\"", pattern_idx, column)
+            }
+            SqlExpr::Unnest { pattern_idx, column } => {
+                format!("unnest(\"p{}\".\"{}\")", pattern_idx, column)
             }
             SqlExpr::Constant(s) => s.clone(),
         }
@@ -124,16 +129,45 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
                 }
 
                 // Field constraint bindings.
+                let fields = type_iri
+                    .as_ref()
+                    .and_then(|ti| schema.fields_for_type(ti));
                 for c in constraints {
+                    let is_array = fields
+                        .map(|fs| {
+                            fs.iter().any(|f| {
+                                f.name == c.field_name
+                                    && matches!(f.field_type, crate::schema::FieldType::StringArray)
+                            })
+                        })
+                        .unwrap_or(false);
+
                     match &c.value {
                         Value::Variable(v) => {
                             if let Some(existing) = bindings.get(v) {
-                                join_conds.push(format!(
-                                    "\"{}\".\"{}\" = {}",
-                                    alias,
-                                    c.field_name,
-                                    existing.to_sql()
-                                ));
+                                if is_array {
+                                    join_conds.push(format!(
+                                        "{} = ANY(\"{}\".\"{}\")",
+                                        existing.to_sql(),
+                                        alias,
+                                        c.field_name,
+                                    ));
+                                } else {
+                                    join_conds.push(format!(
+                                        "\"{}\".\"{}\" = {}",
+                                        alias,
+                                        c.field_name,
+                                        existing.to_sql()
+                                    ));
+                                }
+                            } else if is_array {
+                                bindings.insert(
+                                    v.clone(),
+                                    SqlExpr::Unnest {
+                                        pattern_idx: i,
+                                        column: c.field_name.clone(),
+                                    },
+                                );
                             } else {
                                 bindings.insert(
                                     v.clone(),
@@ -145,10 +179,17 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
                             }
                         }
                         Value::Bound(term) => {
-                            where_parts.push(format!(
-                                "\"{}\".\"{}\" = {}",
-                                alias, c.field_name, sql_literal(term)
-                            ));
+                            if is_array {
+                                where_parts.push(format!(
+                                    "{} = ANY(\"{}\".\"{}\")",
+                                    sql_literal(term), alias, c.field_name
+                                ));
+                            } else {
+                                where_parts.push(format!(
+                                    "\"{}\".\"{}\" = {}",
+                                    alias, c.field_name, sql_literal(term)
+                                ));
+                            }
                         }
                     }
                 }
@@ -654,6 +695,93 @@ mod tests {
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
              FROM \"Person\" AS \"p0\"\n\
              WHERE \"p0\".\"name\" = 'Alice'"
+        );
+    }
+
+    fn schema_with_array() -> Schema {
+        use crate::schema::{FieldDescriptor, Resource};
+
+        struct Instrument;
+        impl Resource for Instrument {
+            fn rdf_type() -> Iri {
+                Iri::new("http://example.org/Instrument")
+            }
+            fn subject_iri(&self) -> Iri {
+                Iri::new("http://example.org/instrument/test")
+            }
+            fn field_descriptors() -> Vec<crate::schema::FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/model"),
+                        name: "model",
+                        field_type: crate::schema::FieldType::String,
+                        indexed: false,
+                    },
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/tags"),
+                        name: "tags",
+                        field_type: crate::schema::FieldType::StringArray,
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> {
+                vec![]
+            }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Instrument>();
+        schema
+    }
+
+    #[test]
+    fn test_array_variable_uses_unnest_in_select() {
+        let schema = schema_with_array();
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("s".into()),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+                constraints: vec![FieldConstraint {
+                    field_name: "tags".into(),
+                    value: Value::Variable("tag".into()),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("tag".into())]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &schema).unwrap();
+        assert!(
+            sql.contains("unnest(\"p0\".\"tags\")"),
+            "Should use unnest for array variable column: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_array_bound_uses_any_in_where() {
+        let schema = schema_with_array();
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("s".into()),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+                constraints: vec![FieldConstraint {
+                    field_name: "tags".into(),
+                    value: Value::Bound(Term::Literal(Literal::String("red".into()))),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("s".into())]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &schema).unwrap();
+        assert!(
+            sql.contains("= ANY(\"p0\".\"tags\")"),
+            "Should use = ANY() for bound array constraint: {}",
+            sql
         );
     }
 

@@ -264,13 +264,13 @@ define_resource!(
         ("has_model",                cpmeta!("hasModel"),              FieldType::String),
         ("has_serial_number",        cpmeta!("hasSerialNumber"),       FieldType::String),
         ("has_vendor",               cpmeta!("hasVendor"),             ref_to!("ct_organizations")),
-        ("has_deployment",           cpmeta!("hasDeployment"),         FieldType::String), // TEXT[]
+        ("has_deployment",           cpmeta!("hasDeployment"),         FieldType::StringArray),
         ("has_etc_id",               cpmeta!("hasEtcId"),              FieldType::String),
         ("comment",                  rdfs!("comment"),                 FieldType::String),
         ("has_name",                 cpmeta!("hasName"),               FieldType::String),
         ("has_atc_id",               cpmeta!("hasAtcId"),              FieldType::String),
         ("has_instrument_owner",     cpmeta!("hasInstrumentOwner"),    ref_to!("ct_organizations")),
-        ("has_instrument_component", cpmeta!("hasInstrumentComponent"), FieldType::String), // TEXT[]
+        ("has_instrument_component", cpmeta!("hasInstrumentComponent"), FieldType::StringArray),
         ("has_otc_id",               cpmeta!("hasOtcId"),              FieldType::String),
     ]
 );
@@ -292,7 +292,7 @@ define_resource!(
 define_resource!(
     /// cpmeta:WebpageElements (28 instances)
     WebpageElements, tbl!("ct_webpage_elements"), [
-        ("has_linkbox",     cpmeta!("hasLinkbox"),    FieldType::String), // TEXT[]
+        ("has_linkbox",     cpmeta!("hasLinkbox"),    FieldType::StringArray),
         ("has_cover_image", cpmeta!("hasCoverImage"), FieldType::String),
         ("label",           rdfs!("label"),           FieldType::String),
         ("comment",         rdfs!("comment"),         FieldType::String),
@@ -302,7 +302,7 @@ define_resource!(
 define_resource!(
     /// cpmeta:Membership (1,870 instances)
     Membership, tbl!("ct_memberships"), [
-        ("label",                  rdfs!("label"),                    FieldType::String), // TEXT[]
+        ("label",                  rdfs!("label"),                    FieldType::StringArray),
         ("has_role",               cpmeta!("hasRole"),                ref_to!("ct_roles")),
         ("at_organization",        cpmeta!("atOrganization"),         ref_to!("ct_organizations")),
         ("has_start_time",         cpmeta!("hasStartTime"),           FieldType::DateTime),
@@ -325,7 +325,7 @@ define_resource!(
     /// cpmeta:ObjectFormat (22 instances)
     ObjectFormat, tbl!("ct_object_formats"), [
         ("label",              rdfs!("label"),             FieldType::String),
-        ("has_good_flag_value", cpmeta!("hasGoodFlagValue"), FieldType::String), // TEXT[]
+        ("has_good_flag_value", cpmeta!("hasGoodFlagValue"), FieldType::StringArray),
         ("comment",            rdfs!("comment"),           FieldType::String),
         ("see_also",           rdfs!("seeAlso"),           ref_to!("ct_value_formats")),
     ]
@@ -341,7 +341,7 @@ define_resource!(
         ("is_optional_column",  cpmeta!("isOptionalColumn"), FieldType::Boolean),
         ("comment",             rdfs!("comment"),            FieldType::String),
         ("is_regex_column",     cpmeta!("isRegexColumn"),    FieldType::Boolean),
-        ("is_quality_flag_for", cpmeta!("isQualityFlagFor"), FieldType::String), // TEXT[]
+        ("is_quality_flag_for", cpmeta!("isQualityFlagFor"), FieldType::StringArray),
         ("see_also",            rdfs!("seeAlso"),            FieldType::String),
     ]
 );
@@ -370,21 +370,21 @@ define_resource!(
         ("has_responsible_organization", cpmeta!("hasResponsibleOrganization"), ref_to!("ct_organizations")),
         ("has_time_zone_offset",        cpmeta!("hasTimeZoneOffset"),          FieldType::Integer),
         ("label",                       rdfs!("label"),                        FieldType::String),
-        ("comment",                     rdfs!("comment"),                      FieldType::String), // TEXT[]
+        ("comment",                     rdfs!("comment"),                      FieldType::StringArray),
         ("has_climate_zone",            cpmeta!("hasClimateZone"),             ref_to!("ct_climate_zones")),
         ("has_documentation_uri",       cpmeta!("hasDocumentationUri"),        FieldType::String),
         ("has_spatial_coverage",        cpmeta!("hasSpatialCoverage"),         ref_to!("ct_spatial_coverages")),
-        ("theme",                       cpmeta!("theme"),                      FieldType::String), // TEXT[]
+        ("theme",                       cpmeta!("theme"),                      FieldType::StringArray),
         ("has_atc_id",                  cpmeta!("hasAtcId"),                   FieldType::String),
         ("has_wigos_id",                cpmeta!("hasWigosId"),                 FieldType::String),
         ("has_station_class",           cpmeta!("hasStationClass"),            FieldType::String),
-        ("has_documentation_object",    cpmeta!("hasDocumentationObject"),     FieldType::String), // TEXT[]
-        ("has_depiction",               cpmeta!("hasDepiction"),               FieldType::String), // TEXT[]
+        ("has_documentation_object",    cpmeta!("hasDocumentationObject"),     FieldType::StringArray),
+        ("has_depiction",               cpmeta!("hasDepiction"),               FieldType::StringArray),
         ("has_labeling_date",           cpmeta!("hasLabelingDate"),            FieldType::Date),
-        ("contact_point",               cpmeta!("contactPoint"),               FieldType::String), // TEXT[]
+        ("contact_point",               cpmeta!("contactPoint"),               FieldType::StringArray),
         ("identifier",                  dcterms!("identifier"),                FieldType::String),
         ("is_part_of",                  dcterms!("isPartOf"),                  FieldType::String),
-        ("spatial",                     dcterms!("spatial"),                   FieldType::String), // TEXT[]
+        ("spatial",                     dcterms!("spatial"),                   FieldType::StringArray),
         ("subject",                     dcterms!("subject"),                   FieldType::String),
         ("title",                       dcterms!("title"),                     FieldType::String),
         ("has_webpage_elements",        cpmeta!("hasWebpageElements"),         ref_to!("ct_webpage_elements")),
@@ -392,10 +392,10 @@ define_resource!(
         ("has_ecosystem_type",          cpmeta!("hasEcosystemType"),           ref_to!("ct_ecosystem_types")),
         ("has_mean_annual_precip",      cpmeta!("hasMeanAnnualPrecip"),        FieldType::Double),
         ("has_mean_annual_temp",        cpmeta!("hasMeanAnnualTemp"),          FieldType::Double),
-        ("has_funding",                 cpmeta!("hasFunding"),                 FieldType::String), // TEXT[]
-        ("description",                 dcterms!("description"),               FieldType::String), // TEXT[]
+        ("has_funding",                 cpmeta!("hasFunding"),                 FieldType::StringArray),
+        ("description",                 dcterms!("description"),               FieldType::StringArray),
         ("has_mean_annual_radiation",   cpmeta!("hasMeanAnnualRadiation"),     FieldType::Double),
-        ("has_associated_publication",  cpmeta!("hasAssociatedPublication"),   FieldType::String), // TEXT[]
+        ("has_associated_publication",  cpmeta!("hasAssociatedPublication"),   FieldType::StringArray),
         ("is_discontinued",             cpmeta!("isDiscontinued"),             FieldType::Boolean),
         ("has_otc_id",                  cpmeta!("hasOtcId"),                   FieldType::String),
         ("see_also",                    rdfs!("seeAlso"),                      FieldType::String),
@@ -405,7 +405,7 @@ define_resource!(
 define_resource!(
     /// cpmeta:Person (1,146 instances)
     Person, tbl!("ct_persons"), [
-        ("has_membership", cpmeta!("hasMembership"), FieldType::String), // TEXT[]
+        ("has_membership", cpmeta!("hasMembership"), FieldType::StringArray),
         ("has_first_name", cpmeta!("hasFirstName"),  FieldType::String),
         ("has_last_name",  cpmeta!("hasLastName"),   FieldType::String),
         ("has_email",      cpmeta!("hasEmail"),      FieldType::String),
@@ -433,7 +433,7 @@ define_resource!(
         ("has_end_time",           cpmeta!("hasEndTime"),          FieldType::DateTime),
         ("was_performed_by",       cpmeta!("wasPerformedBy"),      ref_to!("ct_thematic_centers")),
         ("was_hosted_by",          cpmeta!("wasHostedBy"),         ref_to!("ct_thematic_centers")),
-        ("was_participated_in_by", cpmeta!("wasParticipatedInBy"), FieldType::String), // TEXT[]
+        ("was_participated_in_by", cpmeta!("wasParticipatedInBy"), FieldType::StringArray),
         ("comment",                rdfs!("comment"),               FieldType::String),
         ("see_also",               rdfs!("seeAlso"),               FieldType::String),
     ]
@@ -443,10 +443,10 @@ define_resource!(
     /// UNION: cpmeta:DatasetSpec, TabularDatasetSpec (45 instances)
     /// Discriminator column `dataset_type` IN ('dataset', 'tabular')
     DatasetSpec, tbl!("ct_dataset_specs"), [
-        ("has_variable",            cpmeta!("hasVariable"),           FieldType::String), // TEXT[]
+        ("has_variable",            cpmeta!("hasVariable"),           FieldType::StringArray),
         ("label",                   rdfs!("label"),                   FieldType::String),
         ("has_temporal_resolution", cpmeta!("hasTemporalResolution"), FieldType::String),
-        ("has_column",              cpmeta!("hasColumn"),             FieldType::String), // TEXT[]
+        ("has_column",              cpmeta!("hasColumn"),             FieldType::StringArray),
         ("comment",                 rdfs!("comment"),                 FieldType::String),
     ]
 );
@@ -454,7 +454,7 @@ define_resource!(
 define_resource!(
     /// cpmeta:DataAcquisition (2,341,317 instances)
     DataAcquisition, tbl!("ct_data_acquisitions"), [
-        ("was_performed_with",  cpmeta!("wasPerformedWith"),  FieldType::String), // TEXT[]
+        ("was_performed_with",  cpmeta!("wasPerformedWith"),  FieldType::StringArray),
         ("ended_at_time",       prov!("endedAtTime"),         FieldType::DateTime),
         ("started_at_time",     prov!("startedAtTime"),       FieldType::DateTime),
         ("was_associated_with", prov!("wasAssociatedWith"),    ref_to!("ct_stations")),
@@ -475,8 +475,8 @@ define_resource!(
         ("has_specific_dataset_type", cpmeta!("hasSpecificDatasetType"), ref_to!("ct_specific_dataset_types")),
         ("label",                   rdfs!("label"),                   FieldType::String),
         ("has_keywords",            cpmeta!("hasKeywords"),           FieldType::String),
-        ("comment",                 rdfs!("comment"),                 FieldType::String), // TEXT[]
-        ("has_documentation_object", cpmeta!("hasDocumentationObject"), FieldType::String), // TEXT[]
+        ("comment",                 rdfs!("comment"),                 FieldType::StringArray),
+        ("has_documentation_object", cpmeta!("hasDocumentationObject"), FieldType::StringArray),
         ("implies_default_licence", cpmeta!("impliesDefaultLicence"), FieldType::String),
         ("see_also",                rdfs!("seeAlso"),                 FieldType::String),
     ]
@@ -494,11 +494,11 @@ define_resource!(
         ("was_acquired_by",       cpmeta!("wasAcquiredBy"),       ref_to!("ct_data_acquisitions")),
         ("has_number_of_rows",    cpmeta!("hasNumberOfRows"),     FieldType::Integer),
         ("was_produced_by",       cpmeta!("wasProducedBy"),       ref_to!("ct_data_productions")),
-        ("is_next_version_of",    cpmeta!("isNextVersionOf"),     FieldType::String), // TEXT[]
+        ("is_next_version_of",    cpmeta!("isNextVersionOf"),     FieldType::StringArray),
         ("has_actual_column_names", cpmeta!("hasActualColumnNames"), FieldType::String),
-        ("had_primary_source",    prov!("hadPrimarySource"),      FieldType::String), // TEXT[]
+        ("had_primary_source",    prov!("hadPrimarySource"),      FieldType::StringArray),
         ("has_spatial_coverage",  cpmeta!("hasSpatialCoverage"),  ref_to!("ct_spatial_coverages")),
-        ("has_actual_variable",   cpmeta!("hasActualVariable"),   FieldType::String), // TEXT[]
+        ("has_actual_variable",   cpmeta!("hasActualVariable"),   FieldType::StringArray),
         ("has_doi",               cpmeta!("hasDoi"),              FieldType::String),
         ("has_keywords",          cpmeta!("hasKeywords"),         FieldType::String),
         ("contact_20_point",      cpmeta!("contactPoint"),        FieldType::String),
@@ -517,18 +517,18 @@ define_resource!(
         ("title",                 dcterms!("title"),              FieldType::String),
         ("license",               dcterms!("license"),            FieldType::String),
         ("see_also",              rdfs!("seeAlso"),               FieldType::String),
-        ("creator",               dcterms!("creator"),            FieldType::String), // TEXT[]
+        ("creator",               dcterms!("creator"),            FieldType::StringArray),
     ]
 );
 
 define_resource!(
     /// cpmeta:Collection (778 instances)
     Collection, tbl!("ct_collections"), [
-        ("has_part",             dcterms!("hasPart"),            FieldType::String), // TEXT[]
+        ("has_part",             dcterms!("hasPart"),            FieldType::StringArray),
         ("creator",              dcterms!("creator"),            FieldType::String),
         ("title",                dcterms!("title"),              FieldType::String),
         ("description",          dcterms!("description"),        FieldType::String),
-        ("is_next_version_of",   cpmeta!("isNextVersionOf"),    FieldType::String), // TEXT[]
+        ("is_next_version_of",   cpmeta!("isNextVersionOf"),    FieldType::StringArray),
         ("has_doi",              cpmeta!("hasDoi"),              FieldType::String),
         ("has_spatial_coverage", cpmeta!("hasSpatialCoverage"),  ref_to!("ct_spatial_coverages")),
         ("see_also",             rdfs!("seeAlso"),               FieldType::String),
@@ -538,7 +538,7 @@ define_resource!(
 define_resource!(
     /// cpmeta:PlainCollection (50 instances)
     PlainCollection, tbl!("ct_plain_collections"), [
-        ("has_part",           dcterms!("hasPart"),          FieldType::String), // TEXT[]
+        ("has_part",           dcterms!("hasPart"),          FieldType::StringArray),
         ("is_next_version_of", cpmeta!("isNextVersionOf"), ref_to!("ct_static_objects")),
     ]
 );

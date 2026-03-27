@@ -172,26 +172,59 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
             let table = table_name(ti);
 
-            // Build SELECT columns
+            // Check if any constraint targets a StringArray field with a variable
             let subj_col = self.quoted_subject_col();
-            let mut select_cols = vec![subj_col.clone()];
+            let has_array_var = constraints.iter().any(|c| {
+                matches!(c.value, Value::Variable(_))
+                    && is_array_field(fields, &c.field_name)
+            });
+            let col_prefix = if has_array_var { "\"_t\"." } else { "" };
+
+            // Build SELECT columns (with LATERAL unnest for array variable constraints)
+            let mut select_cols = vec![format!("{}{}", col_prefix, subj_col)];
+            let mut lateral_joins = Vec::new();
+            let mut unnest_idx = 0;
+
             for c in constraints {
-                select_cols.push(format!("\"{}\"", c.field_name));
+                let is_array = is_array_field(fields, &c.field_name);
+                if is_array && matches!(c.value, Value::Variable(_)) {
+                    let alias = format!("_u{}", unnest_idx);
+                    lateral_joins.push(format!(
+                        ", LATERAL unnest(\"_t\".\"{}\") AS \"{}\"(elem)",
+                        c.field_name, alias
+                    ));
+                    select_cols.push(format!("\"{}\".elem AS \"{}\"", alias, c.field_name));
+                    unnest_idx += 1;
+                } else {
+                    select_cols.push(format!("{}\"{}\"", col_prefix, c.field_name));
+                }
             }
             let select_str = select_cols.join(", ");
 
+            let from_clause = if has_array_var {
+                format!("\"{}\" AS \"_t\"{}", table, lateral_joins.join(""))
+            } else {
+                format!("\"{}\"", table)
+            };
+
             // Static WHERE parts (bound subject, bound constraint values)
+            let qualified_subj = format!("{}{}", col_prefix, subj_col);
             let mut static_where = Vec::new();
             if let Subject::Bound(iri) = subject {
                 static_where.push(format!(
                     "{} = '{}'",
-                    subj_col,
+                    qualified_subj,
                     iri.0.replace('\'', "''")
                 ));
             }
             for c in constraints {
                 if let Value::Bound(term) = &c.value {
-                    static_where.push(format!("\"{}\" = {}", c.field_name, sql_literal(term)));
+                    let col = format!("{}\"{}\"", col_prefix, c.field_name);
+                    if is_array_field(fields, &c.field_name) {
+                        static_where.push(format!("{} = ANY({})", sql_literal(term), col));
+                    } else {
+                        static_where.push(format!("{} = {}", col, sql_literal(term)));
+                    }
                 }
             }
 
@@ -203,16 +236,12 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                 let mut where_parts = static_where.clone();
 
                 if let Some(subject_values) = &group.subject_values {
-                    where_parts.push(in_clause(&subj_col, subject_values));
+                    where_parts.push(in_clause(&qualified_subj, subject_values));
                 }
 
                 // Add constraint variable filters from the group's common bindings
-                // For batched queries, we use the first solution's bindings for
-                // constraint variables (they're the same across the group since
-                // grouping is by subject only). If they differ, we filter in Rust.
                 for c in constraints {
                     if let Value::Variable(v) = &c.value {
-                        // Collect distinct bound values for this variable across the group
                         let bound_values: Vec<String> = group
                             .solutions
                             .iter()
@@ -221,28 +250,45 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                             .collect::<std::collections::HashSet<_>>()
                             .into_iter()
                             .collect();
-                        if bound_values.len() == 1 {
-                            where_parts.push(format!(
-                                "\"{}\" = {}",
-                                c.field_name, bound_values[0]
-                            ));
-                        } else if !bound_values.is_empty() {
-                            where_parts.push(format!(
-                                "\"{}\" IN ({})",
-                                c.field_name,
-                                bound_values.join(", ")
-                            ));
+                        let col = format!("{}\"{}\"", col_prefix, c.field_name);
+                        if is_array_field(fields, &c.field_name) {
+                            // Array: use = ANY() for containment check
+                            if !bound_values.is_empty() {
+                                let any_parts: Vec<String> = bound_values
+                                    .iter()
+                                    .map(|v| format!("{} = ANY({})", v, col))
+                                    .collect();
+                                if any_parts.len() == 1 {
+                                    where_parts.push(any_parts.into_iter().next().unwrap());
+                                } else {
+                                    where_parts
+                                        .push(format!("({})", any_parts.join(" OR ")));
+                                }
+                            }
+                        } else {
+                            if bound_values.len() == 1 {
+                                where_parts.push(format!(
+                                    "{} = {}",
+                                    col, bound_values[0]
+                                ));
+                            } else if !bound_values.is_empty() {
+                                where_parts.push(format!(
+                                    "{} IN ({})",
+                                    col,
+                                    bound_values.join(", ")
+                                ));
+                            }
                         }
                     }
                 }
 
                 let sql = if where_parts.is_empty() {
-                    format!("SELECT {} FROM \"{}\"", select_str, table)
+                    format!("SELECT {} FROM {}", select_str, from_clause)
                 } else {
                     format!(
-                        "SELECT {} FROM \"{}\" WHERE {}",
+                        "SELECT {} FROM {} WHERE {}",
                         select_str,
-                        table,
+                        from_clause,
                         where_parts.join(" AND ")
                     )
                 };
@@ -612,9 +658,14 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         }
 
         // Object filter
+        let is_array = matches!(fd.field_type, FieldType::StringArray);
         match object {
             Value::Bound(term) => {
-                where_parts.push(format!("\"{}\" = {}", fd.name, sql_literal(term)));
+                if is_array {
+                    where_parts.push(format!("{} = ANY(\"{}\")", sql_literal(term), fd.name));
+                } else {
+                    where_parts.push(format!("\"{}\" = {}", fd.name, sql_literal(term)));
+                }
             }
             Value::Variable(v) => {
                 let bound_values: Vec<String> = solutions
@@ -624,24 +675,45 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
-                if bound_values.len() == 1 {
-                    where_parts.push(format!("\"{}\" = {}", fd.name, bound_values[0]));
-                } else if !bound_values.is_empty() {
-                    where_parts.push(format!(
-                        "\"{}\" IN ({})",
-                        fd.name,
-                        bound_values.join(", ")
-                    ));
+                if is_array {
+                    if !bound_values.is_empty() {
+                        let any_parts: Vec<String> = bound_values
+                            .iter()
+                            .map(|v| format!("{} = ANY(\"{}\")", v, fd.name))
+                            .collect();
+                        if any_parts.len() == 1 {
+                            where_parts.push(any_parts.into_iter().next().unwrap());
+                        } else {
+                            where_parts.push(format!("({})", any_parts.join(" OR ")));
+                        }
+                    }
+                } else {
+                    if bound_values.len() == 1 {
+                        where_parts.push(format!("\"{}\" = {}", fd.name, bound_values[0]));
+                    } else if !bound_values.is_empty() {
+                        where_parts.push(format!(
+                            "\"{}\" IN ({})",
+                            fd.name,
+                            bound_values.join(", ")
+                        ));
+                    }
                 }
             }
         }
 
+        // For StringArray fields, use unnest() so the DB returns scalar values
+        let field_select = if is_array {
+            format!("unnest(\"{}\") AS \"{}\"", fd.name, fd.name)
+        } else {
+            format!("\"{}\"", fd.name)
+        };
+
         let sql = if where_parts.is_empty() {
-            format!("SELECT {}, \"{}\" FROM \"{}\"", subj_col, fd.name, table)
+            format!("SELECT {}, {} FROM \"{}\"", subj_col, field_select, table)
         } else {
             format!(
-                "SELECT {}, \"{}\" FROM \"{}\" WHERE {}",
-                subj_col, fd.name, table, where_parts.join(" AND ")
+                "SELECT {}, {} FROM \"{}\" WHERE {}",
+                subj_col, field_select, table, where_parts.join(" AND ")
             )
         };
 
@@ -824,6 +896,13 @@ fn table_name(iri: &Iri) -> &str {
     }
 }
 
+/// Check if a field is an array type.
+fn is_array_field(fields: &[FieldDescriptor], name: &str) -> bool {
+    fields
+        .iter()
+        .any(|f| f.name == name && matches!(f.field_type, FieldType::StringArray))
+}
+
 /// Convert a SQL string value to a typed Term based on schema field type info.
 fn parse_sql_value(raw: &str, field_type: &FieldType) -> Term {
     match field_type {
@@ -848,6 +927,8 @@ fn parse_sql_value(raw: &str, field_type: &FieldType) -> Term {
         FieldType::Date => Term::Literal(Literal::Date(raw.to_string())),
         FieldType::DateTime => Term::Literal(Literal::DateTime(raw.to_string())),
         FieldType::Reference(_) => Term::Iri(Iri::new(raw)),
+        // Values arrive already unnested from SQL, so treat as plain string.
+        FieldType::StringArray => Term::Literal(Literal::String(raw.to_string())),
     }
 }
 
@@ -1327,6 +1408,235 @@ mod tests {
                 q
             );
         }
+    }
+
+    fn test_schema_with_array() -> Schema {
+        struct Instrument;
+        impl Resource for Instrument {
+            fn rdf_type() -> Iri {
+                Iri::new("http://example.org/Instrument")
+            }
+            fn subject_iri(&self) -> Iri {
+                Iri::new("http://example.org/instrument/test")
+            }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/model"),
+                        name: "model",
+                        field_type: FieldType::String,
+                        indexed: false,
+                    },
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/tags"),
+                        name: "tags",
+                        field_type: FieldType::StringArray,
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> {
+                vec![]
+            }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Instrument>();
+        schema
+    }
+
+    #[test]
+    fn test_resource_pattern_array_variable_uses_lateral_unnest() {
+        let mut executor = MockExecutor::new();
+        executor.add_response("FROM", SqlResultSet {
+            columns: vec!["_subject".into(), "tags".into()],
+            rows: vec![
+                vec![Some("http://example.org/instrument/i1".into()), Some("red".into())],
+                vec![Some("http://example.org/instrument/i1".into()), Some("blue".into())],
+            ],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema_with_array();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("s".into()),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+                constraints: vec![FieldConstraint {
+                    field_name: "tags".into(),
+                    value: Value::Variable("tag".into()),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("tag".into())]),
+            modifier: SolutionModifier::default(),
+        };
+
+        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        assert_eq!(bindings.len(), 2);
+
+        // Verify SQL uses LATERAL unnest
+        let queries = executor.executed_queries();
+        assert_eq!(queries.len(), 1);
+        assert!(
+            queries[0].contains("LATERAL unnest"),
+            "Should use LATERAL unnest for array variable: {}",
+            queries[0]
+        );
+        assert!(
+            queries[0].contains("AS \"_t\""),
+            "Should alias table when using LATERAL: {}",
+            queries[0]
+        );
+    }
+
+    #[test]
+    fn test_resource_pattern_array_bound_uses_any() {
+        let mut executor = MockExecutor::new();
+        executor.add_response("FROM", SqlResultSet {
+            columns: vec!["_subject".into(), "tags".into()],
+            rows: vec![
+                vec![Some("http://example.org/instrument/i1".into()), Some("{red,blue}".into())],
+            ],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema_with_array();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("s".into()),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+                constraints: vec![FieldConstraint {
+                    field_name: "tags".into(),
+                    value: Value::Bound(Term::Literal(Literal::String("red".into()))),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("s".into())]),
+            modifier: SolutionModifier::default(),
+        };
+
+        let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+
+        let queries = executor.executed_queries();
+        assert_eq!(queries.len(), 1);
+        assert!(
+            queries[0].contains("= ANY("),
+            "Should use = ANY() for bound array constraint: {}",
+            queries[0]
+        );
+        assert!(
+            !queries[0].contains("LATERAL"),
+            "Should NOT use LATERAL for bound-only array constraint: {}",
+            queries[0]
+        );
+    }
+
+    #[test]
+    fn test_field_scan_array_uses_unnest() {
+        let mut executor = MockExecutor::new();
+
+        // rdf:type query
+        executor.add_response("SELECT \"_subject\" FROM \"Instrument\"", SqlResultSet {
+            columns: vec!["_subject".into()],
+            rows: vec![
+                vec![Some("http://example.org/instrument/i1".into())],
+            ],
+        });
+
+        // model field (scalar)
+        executor.add_response("\"model\" FROM \"Instrument\"", SqlResultSet {
+            columns: vec!["_subject".into(), "model".into()],
+            rows: vec![
+                vec![Some("http://example.org/instrument/i1".into()), Some("X100".into())],
+            ],
+        });
+
+        // tags field (array) — unnested values come back as individual rows
+        executor.add_response("unnest(\"tags\")", SqlResultSet {
+            columns: vec!["_subject".into(), "tags".into()],
+            rows: vec![
+                vec![Some("http://example.org/instrument/i1".into()), Some("red".into())],
+                vec![Some("http://example.org/instrument/i1".into()), Some("blue".into())],
+            ],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema_with_array();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::FieldScan {
+                subject: Subject::Variable("s".into()),
+                predicate_var: "p".into(),
+                object: Value::Variable("o".into()),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+            }],
+            select: SelectClause::Star,
+            modifier: SolutionModifier::default(),
+        };
+
+        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+
+        // rdf:type(1) + model(1) + tags(2 unnested) = 4
+        assert_eq!(bindings.len(), 4);
+
+        // Verify the tags query uses unnest
+        let queries = executor.executed_queries();
+        let tags_query = queries.iter().find(|q| q.contains("tags")).unwrap();
+        assert!(
+            tags_query.contains("unnest("),
+            "Tags field query should use unnest: {}",
+            tags_query
+        );
+    }
+
+    #[test]
+    fn test_field_scan_array_bound_object_uses_any() {
+        let mut executor = MockExecutor::new();
+
+        // rdf:type query
+        executor.add_response("SELECT \"_subject\" FROM \"Instrument\"", SqlResultSet {
+            columns: vec!["_subject".into()],
+            rows: vec![],
+        });
+
+        // model field
+        executor.add_response("\"model\" FROM", SqlResultSet {
+            columns: vec!["_subject".into(), "model".into()],
+            rows: vec![],
+        });
+
+        // tags field
+        executor.add_response("tags", SqlResultSet {
+            columns: vec!["_subject".into(), "tags".into()],
+            rows: vec![],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema_with_array();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::FieldScan {
+                subject: Subject::Variable("s".into()),
+                predicate_var: "p".into(),
+                object: Value::Bound(Term::Literal(Literal::String("red".into()))),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+            }],
+            select: SelectClause::Star,
+            modifier: SolutionModifier::default(),
+        };
+
+        let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+
+        let queries = executor.executed_queries();
+        let tags_query = queries.iter().find(|q| q.contains("tags")).unwrap();
+        assert!(
+            tags_query.contains("= ANY("),
+            "Bound object on array field should use = ANY(): {}",
+            tags_query
+        );
     }
 
     #[test]
