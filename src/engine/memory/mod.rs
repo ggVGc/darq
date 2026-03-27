@@ -1,10 +1,13 @@
+pub mod store;
+
+pub use store::{ResourceInstance, ResourceStore};
+
 use std::collections::HashMap;
 
 use super::{Binding, Engine};
 use crate::error::DarqError;
 use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Term, RDF_TYPE};
-use crate::resource_store::ResourceStore;
 use crate::schema::Schema;
 
 /// In-memory engine that evaluates plans against a ResourceStore.
@@ -145,7 +148,7 @@ fn match_resource(
     subject: &Subject,
     constraints: &[FieldConstraint],
     type_variable: Option<&str>,
-    instance: &crate::resource_store::ResourceInstance,
+    instance: &store::ResourceInstance,
     existing: &Binding,
 ) -> Option<Binding> {
     let mut new_bindings = Binding::new();
@@ -302,7 +305,6 @@ mod tests {
     use super::*;
     use crate::engine::execute;
     use crate::rdf::{Iri, Literal, Term};
-    use crate::resource_store::ResourceStore;
     use crate::schema::{FieldDescriptor, FieldType, Resource, Schema};
 
     struct Person {

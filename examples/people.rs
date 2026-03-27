@@ -1,6 +1,6 @@
 use darq::engine::{self, InMemoryEngine};
 use darq::rdf::{Iri, Term};
-use darq::resource_store::ResourceStore;
+use darq::engine::memory::ResourceStore;
 use darq::schema::{FieldDescriptor, FieldType, Resource, Schema};
 
 // ---------------------------------------------------------------------------

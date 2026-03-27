@@ -1,7 +1,7 @@
 use darq::engine::{self, InMemoryEngine};
 use darq::error::DarqError;
 use darq::rdf::{Iri, Literal, Term};
-use darq::resource_store::ResourceStore;
+use darq::engine::memory::ResourceStore;
 use darq::schema::{FieldDescriptor, FieldType, Resource, Schema};
 
 // ---------------------------------------------------------------------------
