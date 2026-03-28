@@ -3,6 +3,8 @@ use std::env;
 
 use postgres::types::Type;
 use postgres::Client;
+use rand::seq::SliceRandom;
+use rand::Rng;
 
 use darq::engine;
 use darq::engine::sql::{SqlEngine, SqlExecutor, SqlResultSet};
@@ -138,30 +140,57 @@ impl SqlExecutor for PostgresExecutor {
 // Example queries
 // ---------------------------------------------------------------------------
 
+const FIRST_NAMES: &[&str] = &[
+    "Alice", "Bob", "Carol", "Dave", "Eve", "Frank", "Grace", "Heidi", "Ivan", "Judy",
+    "Karl", "Lena", "Mallory", "Nora", "Oscar", "Peggy", "Quinn", "Rupert", "Sybil", "Trent",
+];
+
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    let count: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
     let conn_str = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "host=localhost user=postgres dbname=darq_example".to_string());
+        .unwrap_or_else(|_| "host=localhost user=postgres dbname=rdfsql".to_string());
 
     let mut client = Client::connect(&conn_str, postgres::NoTls)
         .expect("failed to connect to PostgreSQL");
 
-    // Set up the table
+    // Set up the table and insert random people
+    let mut rng = rand::thread_rng();
+    let values: Vec<String> = (0..count)
+        .map(|i| {
+            let name = FIRST_NAMES.choose(&mut rng).unwrap();
+            let age: i64 = rng.gen_range(18..=80);
+            let id = format!("{}_{}", name.to_lowercase(), i);
+            format!(
+                "('http://example.org/person/{}', '{}', {})",
+                id, name, age
+            )
+        })
+        .collect();
+
+    let setup_sql = format!(
+        r#"
+        DROP TABLE IF EXISTS "Person";
+        CREATE TABLE "Person" (
+            "_subject" TEXT NOT NULL,
+            "name"     TEXT NOT NULL,
+            "age"      BIGINT NOT NULL
+        );
+        INSERT INTO "Person" ("_subject", "name", "age") VALUES
+            {};
+        "#,
+        values.join(",\n            ")
+    );
+
     client
-        .batch_execute(
-            r#"
-            DROP TABLE IF EXISTS "Person";
-            CREATE TABLE "Person" (
-                "_subject" TEXT NOT NULL,
-                "name"     TEXT NOT NULL,
-                "age"      BIGINT NOT NULL
-            );
-            INSERT INTO "Person" ("_subject", "name", "age") VALUES
-                ('http://example.org/person/alice', 'Alice', 30),
-                ('http://example.org/person/bob',   'Bob',   25),
-                ('http://example.org/person/carol', 'Carol', 35);
-            "#,
-        )
+        .batch_execute(&setup_sql)
         .expect("failed to set up table");
+
+    println!("Inserted {} people with random names and ages.\n", count);
 
     let executor = PostgresExecutor::new(client);
 
@@ -196,15 +225,6 @@ fn main() {
     "#;
 
     println!("\n=== Oldest person ===");
-    run_query(query, &schema, &executor);
-
-    // Query 3: unknown predicate should error
-    let query = r#"
-        PREFIX ex: <http://example.org/>
-        SELECT ?email WHERE { ?p ex:email ?email }
-    "#;
-
-    println!("\n=== Query with unknown predicate ===");
     run_query(query, &schema, &executor);
 
     // Clean up
