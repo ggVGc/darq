@@ -203,6 +203,11 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                                 };
                                 select_bindings.insert(v.clone(), expr.clone());
                                 join_bindings.insert(v.clone(), expr);
+                                // SPARQL basic graph pattern: the triple must exist.
+                                join_conds.push(format!(
+                                    "\"{}\".\"{}\" IS NOT NULL",
+                                    alias, c.field_name
+                                ));
                             }
                         }
                         Value::Bound(term) => {
@@ -375,7 +380,8 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
-             FROM \"Person\" AS \"p0\""
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"age\" IS NOT NULL"
         );
     }
 
@@ -406,7 +412,7 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             WHERE \"p0\".\"age\" = 30"
+             WHERE \"p0\".\"age\" = 30 AND \"p0\".\"name\" IS NOT NULL"
         );
     }
 
@@ -451,7 +457,8 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"pname\", \"p1\".\"name\" AS \"dname\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"_subject\" = \"p0\".\"pet\""
+             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"_subject\" = \"p0\".\"pet\" AND \"p1\".\"name\" IS NOT NULL\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"pet\" IS NOT NULL"
         );
     }
 
@@ -476,7 +483,7 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             WHERE \"p0\".\"_subject\" = 'http://example.org/person/alice'"
+             WHERE \"p0\".\"_subject\" = 'http://example.org/person/alice' AND \"p0\".\"name\" IS NOT NULL"
         );
     }
 
@@ -506,7 +513,8 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\", \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
-             FROM \"Person\" AS \"p0\""
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"age\" IS NOT NULL"
         );
     }
 
@@ -539,6 +547,7 @@ mod tests {
             sql,
             "SELECT DISTINCT \"p0\".\"name\" AS \"name\"\n\
              FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL\n\
              ORDER BY \"p0\".\"name\" ASC\n\
              LIMIT 10\n\
              OFFSET 5"
@@ -607,6 +616,7 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
              FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"age\" IS NOT NULL\n\
              ORDER BY \"p0\".\"age\" DESC\n\
              LIMIT 1"
         );
@@ -692,7 +702,7 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"x\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             WHERE \"p0\".\"label\" = \"p0\".\"name\""
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"label\" = \"p0\".\"name\""
         );
     }
 
@@ -856,7 +866,8 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"pname\", \"p1\".\"name\" AS \"dname\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\""
+             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\" AND \"p1\".\"name\" IS NOT NULL\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"pet\" IS NOT NULL"
         );
     }
 
@@ -900,7 +911,8 @@ mod tests {
             sql,
             "SELECT \"p1\".\"rdf_subject\" AS \"pet\", \"p1\".\"name\" AS \"dname\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\""
+             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\" AND \"p1\".\"name\" IS NOT NULL\n\
+             WHERE \"p0\".\"pet\" IS NOT NULL"
         );
     }
 
@@ -926,7 +938,7 @@ mod tests {
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
              FROM \"Person\" AS \"p0\"\n\
-             WHERE \"p0\".\"rdf_subject\" = 'http://example.org/person/alice'"
+             WHERE \"p0\".\"rdf_subject\" = 'http://example.org/person/alice' AND \"p0\".\"name\" IS NOT NULL"
         );
     }
 
@@ -958,7 +970,8 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT \"p0\".\"rdf_subject\" AS \"p\", \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
-             FROM \"Person\" AS \"p0\""
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"age\" IS NOT NULL"
         );
     }
 
