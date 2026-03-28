@@ -248,10 +248,13 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             });
             let col_prefix = if has_array_var { "\"_t\"." } else { "" };
 
-            // Build SELECT columns (with LATERAL unnest for array variable constraints)
+            // Build SELECT columns (with LATERAL unnest for array variable constraints,
+            // LEFT JOINs for reference field IRI resolution)
             let mut select_cols = vec![format!("{}{}", col_prefix, subj_col)];
             let mut lateral_joins = Vec::new();
+            let mut ref_joins = Vec::new();
             let mut unnest_idx = 0;
+            let mut ref_idx = 0;
 
             for c in constraints {
                 let is_array = is_array_field(fields, &c.field_name);
@@ -263,16 +266,63 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                     ));
                     select_cols.push(format!("\"{}\".elem AS \"{}\"", alias, c.field_name));
                     unnest_idx += 1;
+                } else if matches!(c.value, Value::Variable(_))
+                    && is_ref_field(fields, &c.field_name)
+                {
+                    let fd = fields.iter().find(|f| f.name == c.field_name).unwrap();
+                    if let FieldType::Reference(ref targets) = fd.field_type {
+                        let fk_expr = format!("{}\"{}\"", col_prefix, c.field_name);
+                        if targets.len() == 1 {
+                            let target_table = schema
+                                .table_name(&targets[0])
+                                .unwrap_or_else(|| iri_local_name(&targets[0]));
+                            let alias = format!("_ref{}", ref_idx);
+                            ref_idx += 1;
+                            ref_joins.push(format!(
+                                " LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
+                                target_table, alias, alias, self.id_column, fk_expr
+                            ));
+                            select_cols.push(format!(
+                                "\"{}\".\"{}\" AS \"{}\"",
+                                alias, self.subject_column, c.field_name
+                            ));
+                        } else if targets.len() > 1 {
+                            let mut coalesce_parts = Vec::new();
+                            for target_type in targets {
+                                let target_table = schema
+                                    .table_name(target_type)
+                                    .unwrap_or_else(|| iri_local_name(target_type));
+                                let alias = format!("_ref{}", ref_idx);
+                                ref_idx += 1;
+                                ref_joins.push(format!(
+                                    " LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
+                                    target_table, alias, alias, self.id_column, fk_expr
+                                ));
+                                coalesce_parts.push(format!(
+                                    "\"{}\".\"{}\"",
+                                    alias, self.subject_column
+                                ));
+                            }
+                            select_cols.push(format!(
+                                "COALESCE({}) AS \"{}\"",
+                                coalesce_parts.join(", "),
+                                c.field_name
+                            ));
+                        } else {
+                            select_cols.push(format!("{}\"{}\"", col_prefix, c.field_name));
+                        }
+                    }
                 } else {
                     select_cols.push(format!("{}\"{}\"", col_prefix, c.field_name));
                 }
             }
             let select_str = select_cols.join(", ");
 
+            let ref_joins_str = ref_joins.join("");
             let from_clause = if has_array_var {
-                format!("\"{}\" AS \"_t\"{}", table, lateral_joins.join(""))
+                format!("\"{}\" AS \"_t\"{}{}", table, lateral_joins.join(""), ref_joins_str)
             } else {
-                format!("\"{}\"", table)
+                format!("\"{}\"{}",  table, ref_joins_str)
             };
 
             // Static WHERE parts (bound subject, bound constraint values)
@@ -510,6 +560,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                         &narrowed_subjects,
                         group.solutions,
                         subject_var,
+                        schema,
                     )?;
 
                     // Collect subjects from probe results and intersect
@@ -665,6 +716,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                         &None, // narrowed subjects already folded into effective_subject_in
                         group.solutions,
                         subject_var,
+                        schema,
                     )?;
 
                     all_bindings.extend(field_bindings);
@@ -688,6 +740,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         narrowed_subjects: &Option<Vec<String>>,
         solutions: &[Binding],
         subject_var: Option<&str>,
+        schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
         // Check predicate compatibility
         let any_pred_bound = solutions.iter().any(|s| s.contains_key(predicate_var));
@@ -769,19 +822,53 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             }
         }
 
-        // For StringArray fields, use unnest() so the DB returns scalar values
-        let field_select = if is_array {
-            format!("unnest(\"{}\") AS \"{}\"", fd.name, fd.name)
+        // For StringArray fields, use unnest() so the DB returns scalar values.
+        // For Reference fields, LEFT JOIN the referenced table to return the full IRI.
+        let (field_select, extra_from) = if is_array {
+            (format!("unnest(\"{}\") AS \"{}\"", fd.name, fd.name), String::new())
+        } else if let FieldType::Reference(ref targets) = fd.field_type {
+            if targets.len() == 1 {
+                let target_table = schema
+                    .table_name(&targets[0])
+                    .unwrap_or_else(|| iri_local_name(&targets[0]));
+                (
+                    format!("\"_rref\".\"{}\" AS \"{}\"", self.subject_column, fd.name),
+                    format!(
+                        " LEFT JOIN \"{}\" AS \"_rref\" ON \"_rref\".\"{}\" = \"{}\".\"{}\"",
+                        target_table, self.id_column, table, fd.name
+                    ),
+                )
+            } else if targets.len() > 1 {
+                let mut coalesce_parts = Vec::new();
+                let mut joins = String::new();
+                for (idx, target_type) in targets.iter().enumerate() {
+                    let target_table = schema
+                        .table_name(target_type)
+                        .unwrap_or_else(|| iri_local_name(target_type));
+                    let alias = format!("_rref{}", idx);
+                    joins.push_str(&format!(
+                        " LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = \"{}\".\"{}\"",
+                        target_table, alias, alias, self.id_column, table, fd.name
+                    ));
+                    coalesce_parts.push(format!("\"{}\".\"{}\"", alias, self.subject_column));
+                }
+                (
+                    format!("COALESCE({}) AS \"{}\"", coalesce_parts.join(", "), fd.name),
+                    joins,
+                )
+            } else {
+                (format!("\"{}\"", fd.name), String::new())
+            }
         } else {
-            format!("\"{}\"", fd.name)
+            (format!("\"{}\"", fd.name), String::new())
         };
 
         let sql = if where_parts.is_empty() {
-            format!("SELECT {}, {} FROM \"{}\"", subj_col, field_select, table)
+            format!("SELECT {}, {} FROM \"{}\"{}", subj_col, field_select, table, extra_from)
         } else {
             format!(
-                "SELECT {}, {} FROM \"{}\" WHERE {}",
-                subj_col, field_select, table, where_parts.join(" AND ")
+                "SELECT {}, {} FROM \"{}\"{} WHERE {}",
+                subj_col, field_select, table, extra_from, where_parts.join(" AND ")
             )
         };
 
@@ -1011,6 +1098,13 @@ fn is_array_field(fields: &[FieldDescriptor], name: &str) -> bool {
     fields
         .iter()
         .any(|f| f.name == name && matches!(f.field_type, FieldType::StringArray))
+}
+
+/// Check if a field is a Reference type.
+fn is_ref_field(fields: &[FieldDescriptor], name: &str) -> bool {
+    fields
+        .iter()
+        .any(|f| f.name == name && matches!(f.field_type, FieldType::Reference(_)))
 }
 
 /// Convert a SQL string value to a typed Term based on schema field type info.

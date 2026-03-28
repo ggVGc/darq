@@ -48,6 +48,10 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
     let mut join_bindings: HashMap<String, SqlExpr> = HashMap::new();
     let mut from_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
+    // Track reference-typed field variables that may need LEFT JOIN resolution
+    // to return full IRIs instead of raw foreign key IDs.
+    // Key: variable name, Value: (pattern_idx, field_column, target_type_iris)
+    let mut ref_field_bindings: HashMap<String, (usize, String, Vec<Iri>)> = HashMap::new();
 
     for (i, pattern) in plan.patterns.iter().enumerate() {
         let alias = format!("p{}", i);
@@ -106,6 +110,9 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                                     column: subject_column.to_string(),
                                 },
                             );
+                            // No longer needs LEFT JOIN resolution — the subject
+                            // pattern provides the full IRI directly.
+                            ref_field_bindings.remove(v);
                         } else {
                             select_bindings.insert(
                                 v.clone(),
@@ -208,6 +215,17 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                                     "\"{}\".\"{}\" IS NOT NULL",
                                     alias, c.field_name
                                 ));
+                                // Track Reference fields for LEFT JOIN IRI resolution.
+                                if let Some(fd) = fields.and_then(|fs| fs.iter().find(|f| f.name == c.field_name)) {
+                                    if let crate::schema::FieldType::Reference(ref targets) = fd.field_type {
+                                        if !targets.is_empty() {
+                                            ref_field_bindings.insert(
+                                                v.clone(),
+                                                (i, c.field_name.clone(), targets.clone()),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         Value::Bound(term) => {
@@ -247,6 +265,53 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                     "FieldScan patterns are not yet supported in SQL translation".into(),
                 ));
             }
+        }
+    }
+
+    // Add LEFT JOINs for reference field variables that were never resolved
+    // by appearing as a subject in a later pattern.  This ensures SELECT
+    // returns the full IRI (from the referenced table's subject column)
+    // instead of the raw foreign-key ID.
+    let mut ref_alias_counter = 0usize;
+    for (var_name, (pattern_idx, field_col, target_types)) in &ref_field_bindings {
+        let field_expr = format!("\"p{}\".\"{}\"", pattern_idx, field_col);
+
+        if target_types.len() == 1 {
+            let target_type = &target_types[0];
+            let target_table = schema
+                .table_name(target_type)
+                .unwrap_or_else(|| iri_local_name(target_type));
+            let ref_alias = format!("_ref{}", ref_alias_counter);
+            ref_alias_counter += 1;
+
+            from_parts.push(format!(
+                "LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
+                target_table, ref_alias, ref_alias, id_column, field_expr
+            ));
+            select_bindings.insert(
+                var_name.clone(),
+                SqlExpr::Constant(format!("\"{}\".\"{}\"", ref_alias, subject_column)),
+            );
+        } else {
+            // Multi-target reference: LEFT JOIN each target, COALESCE results.
+            let mut coalesce_parts = Vec::new();
+            for target_type in target_types {
+                let target_table = schema
+                    .table_name(target_type)
+                    .unwrap_or_else(|| iri_local_name(target_type));
+                let ref_alias = format!("_ref{}", ref_alias_counter);
+                ref_alias_counter += 1;
+
+                from_parts.push(format!(
+                    "LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
+                    target_table, ref_alias, ref_alias, id_column, field_expr
+                ));
+                coalesce_parts.push(format!("\"{}\".\"{}\"", ref_alias, subject_column));
+            }
+            select_bindings.insert(
+                var_name.clone(),
+                SqlExpr::Constant(format!("COALESCE({})", coalesce_parts.join(", "))),
+            );
         }
     }
 
@@ -972,6 +1037,205 @@ mod tests {
             "SELECT \"p0\".\"rdf_subject\" AS \"p\", \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
              FROM \"Person\" AS \"p0\"\n\
              WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"age\" IS NOT NULL"
+        );
+    }
+
+    /// Build a schema where Person has a Reference field "pet" pointing to Duck.
+    fn schema_with_ref() -> Schema {
+        use crate::schema::{FieldDescriptor, FieldType, Resource};
+
+        struct Person;
+        impl Resource for Person {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Person") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/person/test") }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/name"),
+                        name: "name",
+                        field_type: FieldType::String,
+                        indexed: false,
+                    },
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/pet"),
+                        name: "pet",
+                        field_type: FieldType::Reference(vec![Iri::new("http://example.org/Duck")]),
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        struct Duck;
+        impl Resource for Duck {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Duck") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/duck/test") }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/duckName"),
+                    name: "name",
+                    field_type: FieldType::String,
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Person>();
+        schema.register::<Duck>();
+        schema
+    }
+
+    #[test]
+    fn test_reference_field_not_used_as_subject_gets_left_join() {
+        // When a Reference field variable is NOT later used as a subject,
+        // the SQL should LEFT JOIN the referenced table to return the full IRI.
+        let schema = schema_with_ref();
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![
+                    FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    },
+                    FieldConstraint {
+                        field_name: "pet".into(),
+                        value: Value::Variable("pet".into()),
+                    },
+                ],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![
+                Variable("name".into()),
+                Variable("pet".into()),
+            ]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"name\" AS \"name\", \"_ref0\".\"rdf_subject\" AS \"pet\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             LEFT JOIN \"Duck\" AS \"_ref0\" ON \"_ref0\".\"id\" = \"p0\".\"pet\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \"p0\".\"pet\" IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn test_reference_field_used_as_subject_no_extra_left_join() {
+        // When a Reference field variable IS later used as a subject,
+        // the INNER JOIN from the subject pattern resolves the IRI —
+        // no extra LEFT JOIN should be added.
+        let schema = schema_with_ref();
+        let plan = QueryPlan {
+            patterns: vec![
+                QueryPattern::Resource {
+                    subject: Subject::Variable("p".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "pet".into(),
+                        value: Value::Variable("pet".into()),
+                    }],
+                    type_variable: None,
+                },
+                QueryPattern::Resource {
+                    subject: Subject::Variable("pet".into()),
+                    type_iri: Some(Iri::new("http://example.org/Duck")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("dname".into()),
+                    }],
+                    type_variable: None,
+                },
+            ],
+            select: SelectClause::Variables(vec![
+                Variable("pet".into()),
+                Variable("dname".into()),
+            ]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
+        // No LEFT JOIN — the INNER JOIN from the subject pattern resolves the IRI.
+        assert_eq!(
+            sql,
+            "SELECT \"p1\".\"rdf_subject\" AS \"pet\", \"p1\".\"name\" AS \"dname\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\" AND \"p1\".\"name\" IS NOT NULL\n\
+             WHERE \"p0\".\"pet\" IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn test_multi_target_reference_uses_coalesce() {
+        use crate::schema::{FieldDescriptor, FieldType, Resource};
+
+        struct Owner;
+        impl Resource for Owner {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Owner") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/owner/test") }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/pet"),
+                    name: "pet",
+                    field_type: FieldType::Reference(vec![
+                        Iri::new("http://example.org/Cat"),
+                        Iri::new("http://example.org/Dog"),
+                    ]),
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        struct Cat;
+        impl Resource for Cat {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Cat") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/cat/test") }
+            fn field_descriptors() -> Vec<FieldDescriptor> { vec![] }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        struct Dog;
+        impl Resource for Dog {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Dog") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/dog/test") }
+            fn field_descriptors() -> Vec<FieldDescriptor> { vec![] }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Owner>();
+        schema.register::<Cat>();
+        schema.register::<Dog>();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("o".into()),
+                type_iri: Some(Iri::new("http://example.org/Owner")),
+                constraints: vec![FieldConstraint {
+                    field_name: "pet".into(),
+                    value: Value::Variable("pet".into()),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("pet".into())]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT COALESCE(\"_ref0\".\"rdf_subject\", \"_ref1\".\"rdf_subject\") AS \"pet\"\n\
+             FROM \"Owner\" AS \"p0\"\n\
+             LEFT JOIN \"Cat\" AS \"_ref0\" ON \"_ref0\".\"id\" = \"p0\".\"pet\"\n\
+             LEFT JOIN \"Dog\" AS \"_ref1\" ON \"_ref1\".\"id\" = \"p0\".\"pet\"\n\
+             WHERE \"p0\".\"pet\" IS NOT NULL"
         );
     }
 
