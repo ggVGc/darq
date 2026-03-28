@@ -1,0 +1,13 @@
+PREFIX cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
+PREFIX tbl: <http://meta.icos-cp.eu/tables/>
+
+SELECT ?name ?country ?lat ?lon
+WHERE {
+    ?station a tbl:ct_stations ;
+             cpmeta:hasName ?name ;
+             cpmeta:country ?country ;
+             cpmeta:hasLatitude ?lat ;
+             cpmeta:hasLongitude ?lon .
+}
+ORDER BY ?country ?name
+LIMIT 20

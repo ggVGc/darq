@@ -16,3 +16,7 @@ rand = "0.8"
 [[example]]
 name = "people_postgres"
 required-features = ["postgres"]
+
+[[example]]
+name = "cpmeta_query"
+required-features = ["postgres"]
