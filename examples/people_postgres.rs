@@ -46,58 +46,7 @@ fn main() {
         .expect("failed to connect to PostgreSQL");
 
     if let Some(count) = seed_count {
-        const BATCH_SIZE: usize = 100_000;
-
-        client
-            .batch_execute(
-                r#"
-                DROP TABLE IF EXISTS "people";
-                CREATE TABLE "people" (
-                    "_subject" TEXT NOT NULL,
-                    "name"     TEXT NOT NULL,
-                    "age"      INT NOT NULL
-                );
-                "#,
-            )
-            .expect("failed to create table");
-
-        let mut rng = rand::thread_rng();
-        let mut inserted = 0;
-        while inserted < count {
-            let batch = (count - inserted).min(BATCH_SIZE);
-            let values: Vec<String> = (inserted..inserted + batch)
-                .map(|i| {
-                    let name = FIRST_NAMES.choose(&mut rng).unwrap();
-                    let age: i64 = rng.gen_range(18..=80);
-                    let id = format!("{}_{}", name.to_lowercase(), i);
-                    format!(
-                        "('http://example.org/person/{}', '{}', {})",
-                        id, name, age
-                    )
-                })
-                .collect();
-
-            let sql = format!(
-                r#"INSERT INTO "people" ("_subject", "name", "age") VALUES {};"#,
-                values.join(",")
-            );
-            client.batch_execute(&sql).expect("failed to insert batch");
-
-            inserted += batch;
-            println!("Inserted {}/{} people", inserted, count);
-        }
-
-        println!("Creating indices");
-
-        client
-            .batch_execute(r#"CREATE INDEX ON "people"(name);"#)
-            .expect("failed to create index");
-
-        client
-            .batch_execute(r#"CREATE INDEX ON "people"(age);"#)
-            .expect("failed to create index");
-        println!("Done");
-
+        seed(&mut client, count);
         return;
     }
 
@@ -136,6 +85,60 @@ fn main() {
 
     println!("\n=== Oldest person ===");
     run_query(query, &schema, &executor);
+}
+
+fn seed(client: &mut Client, count: usize) {
+    const BATCH_SIZE: usize = 100_000;
+
+    client
+        .batch_execute(
+            r#"
+            DROP TABLE IF EXISTS "people";
+            CREATE TABLE "people" (
+                "_subject" TEXT NOT NULL,
+                "name"     TEXT NOT NULL,
+                "age"      INT NOT NULL
+            );
+            "#,
+        )
+        .expect("failed to create table");
+
+    let mut rng = rand::thread_rng();
+    let mut inserted = 0;
+    while inserted < count {
+        let batch = (count - inserted).min(BATCH_SIZE);
+        let values: Vec<String> = (inserted..inserted + batch)
+            .map(|i| {
+                let name = FIRST_NAMES.choose(&mut rng).unwrap();
+                let age: i64 = rng.gen_range(18..=80);
+                let id = format!("{}_{}", name.to_lowercase(), i);
+                format!(
+                    "('http://example.org/person/{}', '{}', {})",
+                    id, name, age
+                )
+            })
+            .collect();
+
+        let sql = format!(
+            r#"INSERT INTO "people" ("_subject", "name", "age") VALUES {};"#,
+            values.join(",")
+        );
+        client.batch_execute(&sql).expect("failed to insert batch");
+
+        inserted += batch;
+        println!("Inserted {}/{} people", inserted, count);
+    }
+
+    println!("Creating indices");
+
+    client
+        .batch_execute(r#"CREATE INDEX ON "people"(name);"#)
+        .expect("failed to create index");
+
+    client
+        .batch_execute(r#"CREATE INDEX ON "people"(age);"#)
+        .expect("failed to create index");
+    println!("Done");
 }
 
 fn run_query(query: &str, schema: &Schema, executor: &PostgresExecutor) {
