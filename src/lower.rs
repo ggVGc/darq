@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{FieldConstraint, InlineData, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::Schema;
 use crate::sparql::ast::*;
@@ -10,11 +10,34 @@ use crate::sparql::ast::*;
 /// into a resource-level query plan.
 pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<QueryPlan, DarqError> {
     let patterns = lower_bgp(&query.where_pattern, schema)?;
+    let values = query.values.as_ref().map(lower_values_clause);
     Ok(QueryPlan {
         patterns,
         select: query.select.clone(),
         modifier: query.modifier.clone(),
+        values,
     })
+}
+
+fn lower_values_clause(vc: &ValuesClause) -> InlineData {
+    let variables = vc.variables.iter().map(|v| v.0.clone()).collect();
+    let rows = vc
+        .bindings
+        .iter()
+        .map(|row| row.iter().map(data_block_value_to_term).collect())
+        .collect();
+    InlineData { variables, rows }
+}
+
+fn data_block_value_to_term(val: &DataBlockValue) -> Option<Term> {
+    match val {
+        DataBlockValue::Iri(iri) => Some(Term::Iri(iri.clone())),
+        DataBlockValue::Literal(lit) => Some(ast_lit_to_term(lit)),
+        DataBlockValue::Undef => None,
+        DataBlockValue::PrefixedName { .. } => {
+            unreachable!("prefixed names should be expanded before lowering")
+        }
+    }
 }
 
 /// Lower a basic graph pattern into a list of QueryPatterns.

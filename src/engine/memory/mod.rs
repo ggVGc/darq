@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use super::{Binding, Engine};
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{FieldConstraint, InlineData, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, RDF_TYPE, Term};
 use crate::schema::Schema;
 use crate::sparql::ast::{OrderDirection, SolutionModifier};
@@ -174,7 +174,49 @@ fn evaluate_plan(plan: &QueryPlan, store: &ResourceStore, schema: &Schema) -> Ve
         solutions = next_solutions;
     }
 
+    if let Some(ref values) = plan.values {
+        solutions = join_with_values(solutions, values);
+    }
+
     solutions
+}
+
+/// Join existing solutions with inline VALUES data.
+pub fn join_with_values(solutions: Vec<Binding>, values: &InlineData) -> Vec<Binding> {
+    let mut result = Vec::new();
+
+    for existing in &solutions {
+        for row in &values.rows {
+            let mut compatible = true;
+            let mut new_bindings = Binding::new();
+
+            for (i, var_name) in values.variables.iter().enumerate() {
+                match &row[i] {
+                    None => {
+                        // UNDEF: do not constrain or bind
+                    }
+                    Some(term) => {
+                        if let Some(existing_val) = existing.get(var_name) {
+                            if *existing_val != *term {
+                                compatible = false;
+                                break;
+                            }
+                        } else {
+                            new_bindings.insert(var_name.clone(), term.clone());
+                        }
+                    }
+                }
+            }
+
+            if compatible {
+                let mut merged = existing.clone();
+                merged.extend(new_bindings);
+                result.push(merged);
+            }
+        }
+    }
+
+    result
 }
 
 /// Try to match a resource instance against a Resource pattern.

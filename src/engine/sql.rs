@@ -159,6 +159,10 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
             };
         }
 
+        if let Some(ref values) = plan.values {
+            solutions = super::memory::join_with_values(solutions, values);
+        }
+
         Ok(apply_modifiers(solutions, &plan.modifier))
     }
 }
@@ -197,6 +201,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             patterns: plan.patterns.clone(),
             select: SelectClause::Star,
             modifier,
+            values: plan.values.clone(),
         };
         let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
@@ -1299,6 +1304,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1344,6 +1350,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1394,6 +1401,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1461,6 +1469,7 @@ mod tests {
             ],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1543,6 +1552,7 @@ mod tests {
             ],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1605,6 +1615,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1690,6 +1701,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("tag".into())]),
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1732,6 +1744,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("s".into())]),
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1791,6 +1804,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1842,6 +1856,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
+            values: None,
         };
 
         let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
@@ -1925,6 +1940,7 @@ mod tests {
                 limit: Some(5),
                 offset: None,
             },
+            values: None,
         };
 
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();

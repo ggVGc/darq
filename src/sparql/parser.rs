@@ -165,6 +165,8 @@ fn parse_select_query(p: &mut Parser) -> Result<SelectQuery, DarqError> {
     p.skip_ws();
     let mut modifier = parse_solution_modifier(p)?;
     modifier.distinct = distinct;
+    p.skip_ws();
+    let values = parse_values_clause(p)?;
 
     Ok(SelectQuery {
         prefixes,
@@ -172,6 +174,7 @@ fn parse_select_query(p: &mut Parser) -> Result<SelectQuery, DarqError> {
         select,
         where_pattern,
         modifier,
+        values,
     })
 }
 
@@ -423,6 +426,141 @@ fn try_rdf_type_keyword(p: &mut Parser) -> Option<TermOrVariable> {
             p.restore(saved);
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VALUES clause
+// ---------------------------------------------------------------------------
+
+fn parse_values_clause(p: &mut Parser) -> Result<Option<ValuesClause>, DarqError> {
+    let saved = p.save();
+    if p.try_keyword("VALUES") {
+        p.skip_ws();
+        Ok(Some(parse_data_block(p)?))
+    } else {
+        p.restore(saved);
+        Ok(None)
+    }
+}
+
+fn parse_data_block(p: &mut Parser) -> Result<ValuesClause, DarqError> {
+    // Single-variable form: VALUES ?x { ... }
+    // Multi-variable form:  VALUES (?x ?y) { ... }
+    if p.peek() == Some('(') {
+        parse_inline_data_full(p)
+    } else {
+        parse_inline_data_one_var(p)
+    }
+}
+
+/// Parse `Var '{' DataBlockValue* '}'`
+fn parse_inline_data_one_var(p: &mut Parser) -> Result<ValuesClause, DarqError> {
+    let var = parse_variable(p)?;
+    p.skip_ws();
+    p.expect_char('{')?;
+
+    let mut bindings = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.try_char('}') {
+            break;
+        }
+        let val = parse_data_block_value(p)?;
+        bindings.push(vec![val]);
+    }
+
+    Ok(ValuesClause {
+        variables: vec![var],
+        bindings,
+    })
+}
+
+/// Parse `'(' Var* ')' '{' ( '(' DataBlockValue* ')' )* '}'`
+fn parse_inline_data_full(p: &mut Parser) -> Result<ValuesClause, DarqError> {
+    p.expect_char('(')?;
+    let mut variables = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.try_char(')') {
+            break;
+        }
+        variables.push(parse_variable(p)?);
+    }
+
+    p.skip_ws();
+    p.expect_char('{')?;
+
+    let num_vars = variables.len();
+    let mut bindings = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.try_char('}') {
+            break;
+        }
+        p.expect_char('(')?;
+        let mut row = Vec::new();
+        for _ in 0..num_vars {
+            p.skip_ws();
+            row.push(parse_data_block_value(p)?);
+        }
+        p.skip_ws();
+        p.expect_char(')')?;
+        bindings.push(row);
+    }
+
+    Ok(ValuesClause {
+        variables,
+        bindings,
+    })
+}
+
+/// Parse a single data block value: IRI, prefixed name, literal, or UNDEF.
+fn parse_data_block_value(p: &mut Parser) -> Result<DataBlockValue, DarqError> {
+    // UNDEF keyword
+    let saved = p.save();
+    if p.try_keyword("UNDEF") {
+        return Ok(DataBlockValue::Undef);
+    }
+    p.restore(saved);
+
+    // IRI ref: <...>
+    if p.peek() == Some('<') {
+        return Ok(DataBlockValue::Iri(parse_iri_ref(p)?));
+    }
+
+    // String literal: "..." or '...'
+    if let Some(c) = p.peek() {
+        if c == '"' || c == '\'' {
+            return Ok(DataBlockValue::Literal(parse_string_literal(p)?));
+        }
+    }
+
+    // Boolean literal: true/false
+    let saved = p.save();
+    if p.try_keyword("true") {
+        return Ok(DataBlockValue::Literal(AstLiteral::Boolean(true)));
+    }
+    p.restore(saved);
+    if p.try_keyword("false") {
+        return Ok(DataBlockValue::Literal(AstLiteral::Boolean(false)));
+    }
+    p.restore(saved);
+
+    // Integer literal (possibly negative)
+    if let Some(c) = p.peek() {
+        if c.is_ascii_digit() || c == '-' {
+            return Ok(DataBlockValue::Literal(parse_integer_literal(p)?));
+        }
+    }
+
+    // Prefixed name: prefix:local
+    let pn = parse_prefixed_name(p)?;
+    match pn {
+        TermOrVariable::PrefixedName { prefix, local } => {
+            Ok(DataBlockValue::PrefixedName { prefix, local })
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -874,5 +1012,63 @@ mod tests {
             }
             _ => panic!("expected Variables"),
         }
+    }
+
+    #[test]
+    fn test_no_values_clause() {
+        let q = parse("SELECT * WHERE { ?s ?p ?o }").unwrap();
+        assert!(q.values.is_none());
+    }
+
+    #[test]
+    fn test_values_single_var() {
+        let q = parse("SELECT ?x WHERE { ?x ?p ?o } VALUES ?x { 1 2 3 }").unwrap();
+        let vc = q.values.as_ref().unwrap();
+        assert_eq!(vc.variables.len(), 1);
+        assert_eq!(vc.variables[0].0, "x");
+        assert_eq!(vc.bindings.len(), 3);
+        assert!(matches!(&vc.bindings[0][0], DataBlockValue::Literal(AstLiteral::Integer(1))));
+        assert!(matches!(&vc.bindings[1][0], DataBlockValue::Literal(AstLiteral::Integer(2))));
+        assert!(matches!(&vc.bindings[2][0], DataBlockValue::Literal(AstLiteral::Integer(3))));
+    }
+
+    #[test]
+    fn test_values_multi_var() {
+        let q = parse(r#"SELECT * WHERE { ?s ?p ?o } VALUES (?x ?y) { (1 "a") (2 "b") }"#).unwrap();
+        let vc = q.values.as_ref().unwrap();
+        assert_eq!(vc.variables.len(), 2);
+        assert_eq!(vc.variables[0].0, "x");
+        assert_eq!(vc.variables[1].0, "y");
+        assert_eq!(vc.bindings.len(), 2);
+    }
+
+    #[test]
+    fn test_values_undef() {
+        let q = parse(r#"SELECT * WHERE { ?s ?p ?o } VALUES (?x ?y) { (1 UNDEF) }"#).unwrap();
+        let vc = q.values.as_ref().unwrap();
+        assert!(matches!(&vc.bindings[0][0], DataBlockValue::Literal(AstLiteral::Integer(1))));
+        assert!(matches!(&vc.bindings[0][1], DataBlockValue::Undef));
+    }
+
+    #[test]
+    fn test_values_with_iri() {
+        let q = parse("SELECT * WHERE { ?s ?p ?o } VALUES ?x { <http://example.org/a> }").unwrap();
+        let vc = q.values.as_ref().unwrap();
+        assert!(matches!(&vc.bindings[0][0], DataBlockValue::Iri(iri) if iri.0 == "http://example.org/a"));
+    }
+
+    #[test]
+    fn test_values_with_prefixed_name() {
+        let q = parse("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o } VALUES ?x { ex:Alice }").unwrap();
+        let vc = q.values.as_ref().unwrap();
+        assert!(matches!(&vc.bindings[0][0], DataBlockValue::PrefixedName { prefix, local } if prefix == "ex" && local == "Alice"));
+    }
+
+    #[test]
+    fn test_values_empty() {
+        let q = parse("SELECT * WHERE { ?s ?p ?o } VALUES ?x { }").unwrap();
+        let vc = q.values.as_ref().unwrap();
+        assert_eq!(vc.variables.len(), 1);
+        assert!(vc.bindings.is_empty());
     }
 }

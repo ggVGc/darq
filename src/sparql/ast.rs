@@ -7,6 +7,7 @@ pub struct SelectQuery {
     pub select: SelectClause,
     pub where_pattern: GroupGraphPattern,
     pub modifier: SolutionModifier,
+    pub values: Option<ValuesClause>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,4 +71,21 @@ pub struct OrderCondition {
 pub enum OrderDirection {
     Ascending,
     Descending,
+}
+
+/// A single data value in a VALUES block.
+#[derive(Debug, Clone)]
+pub enum DataBlockValue {
+    Iri(Iri),
+    PrefixedName { prefix: String, local: String },
+    Literal(AstLiteral),
+    Undef,
+}
+
+/// A VALUES clause: list of variables and rows of values.
+/// Each inner Vec in `bindings` has the same length as `variables`.
+#[derive(Debug, Clone)]
+pub struct ValuesClause {
+    pub variables: Vec<Variable>,
+    pub bindings: Vec<Vec<DataBlockValue>>,
 }

@@ -318,3 +318,162 @@ fn test_distinct_deduplicates_projected_variables() {
     assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
     assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
 }
+
+// ---------------------------------------------------------------------------
+// VALUES clause
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_values_filters_results() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name ?age
+        WHERE { ?p ex:name ?name . ?p ex:age ?age }
+        ORDER BY ?name
+        VALUES ?name { "Alice" "Carol" }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+    assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Carol".into()))));
+}
+
+#[test]
+fn test_values_introduces_new_variable() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name ?label
+        WHERE { ?p ex:name ?name }
+        ORDER BY ?name
+        VALUES ?label { "tagged" }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    // Each of 3 people gets joined with the single VALUES row
+    assert_eq!(result.rows.len(), 3);
+    assert!(result.variables.contains(&"label".to_string()));
+    let label_col = result.variables.iter().position(|v| v == "label").unwrap();
+    for row in &result.rows {
+        assert_eq!(row[label_col], Some(Term::Literal(Literal::String("tagged".into()))));
+    }
+}
+
+#[test]
+fn test_values_multi_var() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name ?age
+        WHERE { ?p ex:name ?name . ?p ex:age ?age }
+        ORDER BY ?name
+        VALUES (?name ?age) { ("Alice" 30) ("Bob" 25) }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+    assert_eq!(result.rows[0][1], Some(Term::Literal(Literal::Integer(30))));
+    assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
+    assert_eq!(result.rows[1][1], Some(Term::Literal(Literal::Integer(25))));
+}
+
+#[test]
+fn test_values_with_undef() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name ?age
+        WHERE { ?p ex:name ?name . ?p ex:age ?age }
+        ORDER BY ?name
+        VALUES (?name ?age) { ("Alice" 30) ("Bob" UNDEF) }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    // Alice matches (name=Alice, age=30). Bob matches (name=Bob, age=UNDEF means any age).
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+    assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
+}
+
+#[test]
+fn test_values_empty_produces_no_results() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?p ex:name ?name }
+        VALUES ?name { }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    assert_eq!(result.rows.len(), 0);
+}
+
+#[test]
+fn test_values_select_star_includes_values_vars() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT *
+        WHERE { ?p ex:name ?name }
+        ORDER BY ?name
+        VALUES ?tag { "x" }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    assert!(result.variables.contains(&"tag".to_string()));
+    assert_eq!(result.rows.len(), 3);
+}
+
+#[test]
+fn test_values_with_iri() {
+    let (schema, store) = setup();
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?name
+        WHERE { ?p a ex:Person . ?p ex:name ?name }
+        VALUES ?p { <http://example.org/person/alice> }
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+}

@@ -50,12 +50,23 @@ pub enum QueryPattern {
     },
 }
 
+/// A row of inline data: one Option<Term> per variable. None = UNDEF.
+pub type InlineRow = Vec<Option<Term>>;
+
+/// Inline data from a VALUES clause, lowered to Term values.
+#[derive(Debug, Clone)]
+pub struct InlineData {
+    pub variables: Vec<String>,
+    pub rows: Vec<InlineRow>,
+}
+
 /// A complete resource-level query plan, lowered from SPARQL AST.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub patterns: Vec<QueryPattern>,
     pub select: SelectClause,
     pub modifier: SolutionModifier,
+    pub values: Option<InlineData>,
 }
 
 impl QueryPlan {
@@ -122,6 +133,14 @@ impl QueryPlan {
             }
         }
 
+        if let Some(ref vd) = self.values {
+            for v in &vd.variables {
+                if add(v) {
+                    vars.push(v.clone());
+                }
+            }
+        }
+
         vars
     }
 }
@@ -156,6 +175,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         assert_eq!(
@@ -175,6 +195,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         assert_eq!(plan.collect_variables(), vec!["s", "p", "o"]);
@@ -203,6 +224,7 @@ mod tests {
             ],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         // "p" appears in both patterns but should only appear once
@@ -233,6 +255,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         // Only "name" — bound subject and bound age value are excluded
@@ -245,6 +268,7 @@ mod tests {
             patterns: vec![],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         assert!(plan.collect_variables().is_empty());

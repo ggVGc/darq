@@ -315,6 +315,107 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         }
     }
 
+    // VALUES clause: inline data filtering/joining.
+    if let Some(ref values) = plan.values {
+        let values_alias = "_values";
+        let no_undefs = values
+            .rows
+            .iter()
+            .all(|r| r.iter().all(|v| v.is_some()));
+
+        if values.variables.len() == 1 && no_undefs {
+            // Single-variable, no UNDEFs: use IN clause or derived table.
+            let var = &values.variables[0];
+            let in_values: Vec<String> = values
+                .rows
+                .iter()
+                .filter_map(|r| r[0].as_ref().map(sql_literal))
+                .collect();
+
+            if let Some(expr) = select_bindings.get(var) {
+                // Variable already bound by a pattern — add WHERE IN filter.
+                where_parts.push(format!(
+                    "{} IN ({})",
+                    expr.to_sql(),
+                    in_values.join(", ")
+                ));
+            } else {
+                // Variable only from VALUES — add as a derived table.
+                let rows_sql: Vec<String> = in_values
+                    .iter()
+                    .map(|v| format!("SELECT {} AS \"{}\"", v, var))
+                    .collect();
+                let derived = format!("({})", rows_sql.join(" UNION ALL "));
+                if from_parts.is_empty() {
+                    from_parts.push(format!("{} AS \"{}\"", derived, values_alias));
+                } else {
+                    from_parts.push(format!(
+                        "CROSS JOIN {} AS \"{}\"",
+                        derived, values_alias
+                    ));
+                }
+                let expr = SqlExpr::Constant(format!(
+                    "\"{}\".\"{}\"",
+                    values_alias, var
+                ));
+                select_bindings.insert(var.clone(), expr.clone());
+                join_bindings.insert(var.clone(), expr);
+            }
+        } else {
+            // Multi-variable or has UNDEFs: derived table with UNION ALL rows.
+            let rows_sql: Vec<String> = values
+                .rows
+                .iter()
+                .map(|row| {
+                    let vals: Vec<String> = row
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let sql_val = match v {
+                                Some(term) => sql_literal(term),
+                                None => "NULL".to_string(),
+                            };
+                            format!("{} AS \"{}\"", sql_val, values.variables[i])
+                        })
+                        .collect();
+                    format!("SELECT {}", vals.join(", "))
+                })
+                .collect();
+            let derived = format!("({})", rows_sql.join(" UNION ALL "));
+
+            let mut join_conds = Vec::new();
+            for var in &values.variables {
+                if let Some(expr) = join_bindings.get(var) {
+                    join_conds.push(format!(
+                        "\"{}\".\"{}\" = {}",
+                        values_alias, var, expr.to_sql()
+                    ));
+                } else {
+                    let expr = SqlExpr::Constant(format!(
+                        "\"{}\".\"{}\"",
+                        values_alias, var
+                    ));
+                    select_bindings.insert(var.clone(), expr.clone());
+                    join_bindings.insert(var.clone(), expr);
+                }
+            }
+
+            if from_parts.is_empty() {
+                from_parts.push(format!("{} AS \"{}\"", derived, values_alias));
+            } else if join_conds.is_empty() {
+                from_parts.push(format!(
+                    "CROSS JOIN {} AS \"{}\"",
+                    derived, values_alias
+                ));
+            } else {
+                from_parts.push(format!(
+                    "INNER JOIN {} AS \"{}\" ON {}",
+                    derived, values_alias, join_conds.join(" AND ")
+                ));
+            }
+        }
+    }
+
     // Resolve selected variables (using select_bindings for output).
     let vars = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
@@ -439,6 +540,7 @@ mod tests {
                 Variable("age".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -470,6 +572,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -515,6 +618,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -541,6 +645,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -572,6 +677,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -605,6 +711,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(5),
             },
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -633,6 +740,7 @@ mod tests {
                 Variable("type".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -674,6 +782,7 @@ mod tests {
                 limit: Some(1),
                 offset: None,
             },
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -703,6 +812,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("p".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -728,6 +838,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("p".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -760,6 +871,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("x".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -790,6 +902,7 @@ mod tests {
                 Variable("p".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -853,6 +966,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("tag".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -878,6 +992,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("s".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -924,6 +1039,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -967,6 +1083,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -996,6 +1113,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1029,6 +1147,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1114,6 +1233,7 @@ mod tests {
                 Variable("pet".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -1158,6 +1278,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -1226,6 +1347,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("pet".into())]),
             modifier: empty_modifier(),
+            values: None,
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();

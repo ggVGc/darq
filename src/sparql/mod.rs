@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
 use crate::rdf::Iri;
-use ast::{SelectClause, SelectQuery, TermOrVariable, TriplePattern};
+use ast::{DataBlockValue, SelectClause, SelectQuery, TermOrVariable, TriplePattern};
 
 /// Expand all prefixed names in a parsed query into full IRIs.
 pub fn expand_prefixes(query: &mut SelectQuery) -> Result<(), DarqError> {
@@ -17,6 +17,14 @@ pub fn expand_prefixes(query: &mut SelectQuery) -> Result<(), DarqError> {
 
     for pattern in &mut query.where_pattern.patterns {
         expand_pattern(&prefix_map, pattern)?;
+    }
+
+    if let Some(ref mut vc) = query.values {
+        for row in &mut vc.bindings {
+            for val in row {
+                expand_data_block_value(&prefix_map, val)?;
+            }
+        }
     }
 
     Ok(())
@@ -45,6 +53,19 @@ fn expand_term(
     Ok(())
 }
 
+fn expand_data_block_value(
+    prefix_map: &HashMap<&str, &str>,
+    value: &mut DataBlockValue,
+) -> Result<(), DarqError> {
+    if let DataBlockValue::PrefixedName { prefix, local } = value {
+        let base = prefix_map
+            .get(prefix.as_str())
+            .ok_or_else(|| DarqError::UnknownPrefix(prefix.clone()))?;
+        *value = DataBlockValue::Iri(Iri::new(format!("{}{}", base, local)));
+    }
+    Ok(())
+}
+
 /// Check that all variables in the SELECT clause are bound by a WHERE pattern.
 pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
     let select_vars = match &query.select {
@@ -57,6 +78,11 @@ pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
         collect_var(&tp.subject, &mut bound);
         collect_var(&tp.predicate, &mut bound);
         collect_var(&tp.object, &mut bound);
+    }
+    if let Some(ref vc) = query.values {
+        for v in &vc.variables {
+            bound.insert(&v.0);
+        }
     }
 
     let unbound: Vec<String> = select_vars
