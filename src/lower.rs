@@ -23,13 +23,40 @@ fn lower_bgp(
     schema: &Schema,
 ) -> Result<Vec<QueryPattern>, DarqError> {
     let groups = group_by_subject(&bgp.patterns);
+    let ref_constraints = collect_reference_constraints(&bgp.patterns, schema);
     let mut result = Vec::new();
 
     for group in groups {
-        lower_subject_group(&group, schema, &mut result)?;
+        lower_subject_group(&group, schema, &ref_constraints, &mut result)?;
     }
 
     Ok(result)
+}
+
+/// Collect type constraints for variables that appear as objects of Reference-typed predicates.
+/// For example, if `?subm` is the object of `cpmeta:wasSubmittedBy` which is
+/// `Reference([DataSubmission])`, then `?subm` is constrained to `DataSubmission`.
+fn collect_reference_constraints(
+    patterns: &[TriplePattern],
+    schema: &Schema,
+) -> HashMap<String, Vec<Iri>> {
+    let mut constraints: HashMap<String, Vec<Iri>> = HashMap::new();
+    for tp in patterns {
+        if let (TermOrVariable::Iri(pred_iri), TermOrVariable::Variable(Variable(obj_name))) =
+            (&tp.predicate, &tp.object)
+        {
+            let range = schema.range_types(pred_iri);
+            if !range.is_empty() {
+                let entry = constraints.entry(obj_name.clone()).or_default();
+                if entry.is_empty() {
+                    *entry = range;
+                } else {
+                    entry.retain(|t| range.contains(t));
+                }
+            }
+        }
+    }
+    constraints
 }
 
 /// A group of triple patterns sharing the same subject.
@@ -116,6 +143,7 @@ fn object_info(tov: &TermOrVariable) -> ObjectInfo {
 fn lower_subject_group(
     group: &SubjectGroup,
     schema: &Schema,
+    ref_constraints: &HashMap<String, Vec<Iri>>,
     result: &mut Vec<QueryPattern>,
 ) -> Result<(), DarqError> {
     let subject = to_ir_subject(&group.subject);
@@ -157,7 +185,7 @@ fn lower_subject_group(
     let type_iri = if let Some(t) = explicit_type {
         Some(t)
     } else if !concrete_predicates.is_empty() {
-        Some(infer_type(&group.subject, &concrete_predicates, schema)?)
+        Some(infer_type(&group.subject, &concrete_predicates, schema, ref_constraints)?)
     } else {
         None
     };
@@ -198,6 +226,7 @@ fn infer_type(
     subject: &SubjectKey,
     predicates: &[(&Iri, &ObjectInfo)],
     schema: &Schema,
+    ref_constraints: &HashMap<String, Vec<Iri>>,
 ) -> Result<Iri, DarqError> {
     let mut candidate_types: Option<Vec<Iri>> = None;
 
@@ -209,6 +238,16 @@ fn infer_type(
             }
             Some(candidates) => {
                 candidates.retain(|t| types.contains(t));
+            }
+        }
+    }
+
+    // Narrow candidates using reference constraints from other subject groups.
+    if let SubjectKey::Variable(name) = subject {
+        if let Some(ref_types) = ref_constraints.get(name) {
+            match &mut candidate_types {
+                None => candidate_types = Some(ref_types.clone()),
+                Some(candidates) => candidates.retain(|t| ref_types.contains(t)),
             }
         }
     }
