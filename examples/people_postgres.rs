@@ -117,10 +117,12 @@ const FIRST_NAMES: &[&str] = &[
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let count: usize = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    let seed_pos = args.iter().position(|a| a == "--seed");
+    let seed_count: Option<usize> = seed_pos.map(|i| {
+        args.get(i + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10)
+    });
 
     let conn_str = env::var("DATABASE_URL")
         .unwrap_or_else(|_| "host=localhost user=postgres dbname=rdfsql".to_string());
@@ -128,40 +130,61 @@ fn main() {
     let mut client = Client::connect(&conn_str, postgres::NoTls)
         .expect("failed to connect to PostgreSQL");
 
-    // Set up the table and insert random people
-    let mut rng = rand::thread_rng();
-    let values: Vec<String> = (0..count)
-        .map(|i| {
-            let name = FIRST_NAMES.choose(&mut rng).unwrap();
-            let age: i64 = rng.gen_range(18..=80);
-            let id = format!("{}_{}", name.to_lowercase(), i);
-            format!(
-                "('http://example.org/person/{}', '{}', {})",
-                id, name, age
+    if let Some(count) = seed_count {
+        const BATCH_SIZE: usize = 100_000;
+
+        client
+            .batch_execute(
+                r#"
+                DROP TABLE IF EXISTS "people";
+                CREATE TABLE "people" (
+                    "_subject" TEXT NOT NULL,
+                    "name"     TEXT NOT NULL,
+                    "age"      INT NOT NULL
+                );
+                "#,
             )
-        })
-        .collect();
+            .expect("failed to create table");
 
-    let setup_sql = format!(
-        r#"
-        DROP TABLE IF EXISTS "Person";
-        CREATE TABLE "Person" (
-            "_subject" TEXT NOT NULL,
-            "name"     TEXT NOT NULL,
-            "age"      INT NOT NULL
-        );
-        INSERT INTO "Person" ("_subject", "name", "age") VALUES
-            {};
-        CREATE INDEX ON "Person"(age, name) ;
-        "#,
-        values.join(",\n            ")
-    );
+        let mut rng = rand::thread_rng();
+        let mut inserted = 0;
+        while inserted < count {
+            let batch = (count - inserted).min(BATCH_SIZE);
+            let values: Vec<String> = (inserted..inserted + batch)
+                .map(|i| {
+                    let name = FIRST_NAMES.choose(&mut rng).unwrap();
+                    let age: i64 = rng.gen_range(18..=80);
+                    let id = format!("{}_{}", name.to_lowercase(), i);
+                    format!(
+                        "('http://example.org/person/{}', '{}', {})",
+                        id, name, age
+                    )
+                })
+                .collect();
 
-    client
-        .batch_execute(&setup_sql)
-        .expect("failed to set up table");
+            let sql = format!(
+                r#"INSERT INTO "people" ("_subject", "name", "age") VALUES {};"#,
+                values.join(",")
+            );
+            client.batch_execute(&sql).expect("failed to insert batch");
 
-    println!("Inserted {} people with random names and ages.\n", count);
+            inserted += batch;
+            println!("Inserted {}/{} people", inserted, count);
+        }
+
+        println!("Creating indices");
+
+        client
+            .batch_execute(r#"CREATE INDEX ON "people"(name);"#)
+            .expect("failed to create index");
+
+        client
+            .batch_execute(r#"CREATE INDEX ON "people"(age);"#)
+            .expect("failed to create index");
+        println!("Done");
+
+        return;
+    }
 
     let executor = PostgresExecutor::new(client);
 
@@ -198,13 +221,6 @@ fn main() {
 
     println!("\n=== Oldest person ===");
     run_query(query, &schema, &executor);
-
-    // Clean up
-    executor
-        .client
-        .borrow_mut()
-        .batch_execute(r#"DROP TABLE IF EXISTS "Person""#)
-        .expect("failed to clean up");
 }
 
 fn run_query(query: &str, schema: &Schema, executor: &PostgresExecutor) {
