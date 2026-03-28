@@ -3,7 +3,7 @@ pub mod memory;
 pub mod postgres;
 pub mod sql;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
 use crate::ir::QueryPlan;
@@ -58,7 +58,27 @@ pub fn execute(
     let bindings = engine.evaluate_plan(&plan, schema)?;
 
     // 7. Project to selected variables
-    project(bindings, &plan)
+    let mut result = project(bindings, &plan)?;
+
+    // 8. Apply DISTINCT after projection so deduplication uses only selected
+    //    variables. OFFSET and LIMIT follow DISTINCT per the SPARQL spec.
+    if plan.modifier.distinct {
+        let mut seen = HashSet::new();
+        result.rows.retain(|row| seen.insert(row.clone()));
+
+        if let Some(offset) = plan.modifier.offset {
+            if offset < result.rows.len() {
+                result.rows = result.rows.into_iter().skip(offset).collect();
+            } else {
+                result.rows.clear();
+            }
+        }
+        if let Some(limit) = plan.modifier.limit {
+            result.rows.truncate(limit);
+        }
+    }
+
+    Ok(result)
 }
 
 /// Validate that all concrete predicates in the query are known to the schema.

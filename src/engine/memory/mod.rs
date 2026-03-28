@@ -2,7 +2,7 @@ pub mod store;
 
 pub use store::{ResourceInstance, ResourceStore};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::{Binding, Engine};
 use crate::error::DarqError;
@@ -29,17 +29,11 @@ impl Engine for InMemoryEngine<'_> {
     }
 }
 
-/// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
+/// Apply ORDER BY and, when DISTINCT is not active, OFFSET and LIMIT.
+///
+/// DISTINCT, OFFSET, and LIMIT are applied post-projection by `execute()`
+/// when DISTINCT is requested, so this helper skips them in that case.
 fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
-    if modifier.distinct {
-        let mut seen = HashSet::new();
-        bindings.retain(|b| {
-            let mut sorted: Vec<_> = b.iter().collect();
-            sorted.sort_by_key(|(k, _)| *k);
-            seen.insert(format!("{:?}", sorted))
-        });
-    }
-
     if !modifier.order_by.is_empty() {
         bindings.sort_by(|a, b| {
             for cond in &modifier.order_by {
@@ -58,16 +52,18 @@ fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> V
         });
     }
 
-    if let Some(offset) = modifier.offset {
-        if offset < bindings.len() {
-            bindings = bindings.into_iter().skip(offset).collect();
-        } else {
-            bindings.clear();
+    if !modifier.distinct {
+        if let Some(offset) = modifier.offset {
+            if offset < bindings.len() {
+                bindings = bindings.into_iter().skip(offset).collect();
+            } else {
+                bindings.clear();
+            }
         }
-    }
 
-    if let Some(limit) = modifier.limit {
-        bindings.truncate(limit);
+        if let Some(limit) = modifier.limit {
+            bindings.truncate(limit);
+        }
     }
 
     bindings

@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
-
 use super::Binding;
 use super::Engine;
 use crate::error::DarqError;
@@ -71,17 +69,11 @@ impl<'a, E: SqlExecutor> SqlEngine<'a, E> {
     }
 }
 
-/// Apply DISTINCT, ORDER BY, OFFSET, LIMIT.
+/// Apply ORDER BY and, when DISTINCT is not active, OFFSET and LIMIT.
+///
+/// DISTINCT, OFFSET, and LIMIT are applied post-projection by `execute()`
+/// when DISTINCT is requested, so this helper skips them in that case.
 fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
-    if modifier.distinct {
-        let mut seen = HashSet::new();
-        bindings.retain(|b| {
-            let mut sorted: Vec<_> = b.iter().collect();
-            sorted.sort_by_key(|(k, _)| *k);
-            seen.insert(format!("{:?}", sorted))
-        });
-    }
-
     if !modifier.order_by.is_empty() {
         bindings.sort_by(|a, b| {
             for cond in &modifier.order_by {
@@ -100,16 +92,18 @@ fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> V
         });
     }
 
-    if let Some(offset) = modifier.offset {
-        if offset < bindings.len() {
-            bindings = bindings.into_iter().skip(offset).collect();
-        } else {
-            bindings.clear();
+    if !modifier.distinct {
+        if let Some(offset) = modifier.offset {
+            if offset < bindings.len() {
+                bindings = bindings.into_iter().skip(offset).collect();
+            } else {
+                bindings.clear();
+            }
         }
-    }
 
-    if let Some(limit) = modifier.limit {
-        bindings.truncate(limit);
+        if let Some(limit) = modifier.limit {
+            bindings.truncate(limit);
+        }
     }
 
     bindings
@@ -172,21 +166,37 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
 impl<E: SqlExecutor> SqlEngine<'_, E> {
     /// Evaluate a Resource-only plan using a single combined SQL query.
     ///
-    /// Generates one SQL statement (via `to_sql`) with proper JOINs, ORDER BY,
-    /// LIMIT, OFFSET, and DISTINCT, letting the database handle everything.
+    /// Generates one SQL statement (via `to_sql`) with proper JOINs and ORDER BY,
+    /// letting the database handle ordering.  DISTINCT, OFFSET, and LIMIT are
+    /// applied post-projection by `execute()` so that deduplication considers
+    /// only the selected variables.
     fn eval_combined(
         &self,
         plan: &QueryPlan,
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
-        use crate::sparql::ast::SelectClause;
+        use crate::sparql::ast::{SelectClause, SolutionModifier};
 
         // Use SelectClause::Star so the SQL returns all variables, not just
         // the projected ones — projection happens later in execute().
+        // Keep DISTINCT in the SQL as an optimisation (it deduplicates on
+        // all columns, reducing traffic).  The final, correct DISTINCT on
+        // only the projected variables is applied post-projection in
+        // execute().  LIMIT/OFFSET are stripped when DISTINCT is active
+        // because they must follow the post-projection deduplication.
+        let modifier = if plan.modifier.distinct {
+            SolutionModifier {
+                limit: None,
+                offset: None,
+                ..plan.modifier.clone()
+            }
+        } else {
+            plan.modifier.clone()
+        };
         let full_plan = QueryPlan {
             patterns: plan.patterns.clone(),
             select: SelectClause::Star,
-            modifier: plan.modifier.clone(),
+            modifier,
         };
         let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;

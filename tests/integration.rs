@@ -287,3 +287,34 @@ fn test_variable_predicate_constrained_by_prior_pattern() {
     // Each of 3 people has 3 fields scanned by ?person ?p ?o = 9 rows
     assert_eq!(result.rows.len(), 9);
 }
+
+#[test]
+fn test_distinct_deduplicates_projected_variables() {
+    let mut schema = Schema::new();
+    schema.register::<Person>();
+
+    let mut store = ResourceStore::new();
+    // Two people share the same name but have different ages
+    store.load(&Person { id: "alice1".into(), name: "Alice".into(), age: 30 });
+    store.load(&Person { id: "alice2".into(), name: "Alice".into(), age: 25 });
+    store.load(&Person { id: "bob".into(), name: "Bob".into(), age: 40 });
+
+    let eng = InMemoryEngine::new(&store);
+    let result = engine::execute(
+        r#"
+        PREFIX ex: <http://example.org/>
+        SELECT DISTINCT ?name
+        WHERE { ?p ex:name ?name }
+        ORDER BY ?name
+        "#,
+        &schema,
+        &eng,
+    )
+    .unwrap();
+
+    // Without DISTINCT we'd get 3 rows (Alice, Alice, Bob).
+    // DISTINCT should collapse the duplicate Alice.
+    assert_eq!(result.rows.len(), 2);
+    assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
+    assert_eq!(result.rows[1][0], Some(Term::Literal(Literal::String("Bob".into()))));
+}
