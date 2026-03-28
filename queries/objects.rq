@@ -4,10 +4,6 @@ prefix xsd: <http://www.w3.org/2001/XMLSchema#>
 prefix geo: <http://www.opengis.net/ont/geosparql#>
 select *
 where {
-	?dobj cpmeta:hasObjectSpec ?spec .
-	?dobj cpmeta:hasSizeInBytes ?size .
-	?dobj cpmeta:hasName ?fileName .
-	?subm prov:endedAtTime ?submTime .
+	?dobj cpmeta:wasSubmittedBy ?subm .
 }
-order by desc(?fileName)
 offset 0 limit 20

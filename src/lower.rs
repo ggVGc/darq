@@ -867,4 +867,92 @@ mod tests {
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert!(patterns.is_empty());
     }
+
+    // --- Bug reproduction: cross-group reference type disambiguation ---
+
+    // When a variable is the object of a Reference field (constraining it to a
+    // single type) and then used as a subject with a predicate shared by multiple
+    // types, the type should be disambiguated by the reference constraint.
+    #[test]
+    fn test_cross_group_reference_type_disambiguation() {
+        struct Parent;
+        struct Child;
+        struct Sibling;
+
+        impl Resource for Parent {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Parent") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/parent/1") }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/hasChild"),
+                    name: "has_child",
+                    field_type: FieldType::Reference(vec![Iri::new("http://example.org/Child")]),
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        impl Resource for Child {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Child") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/child/1") }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/timestamp"),
+                    name: "timestamp",
+                    field_type: FieldType::DateTime,
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        impl Resource for Sibling {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Sibling") }
+            fn subject_iri(&self) -> Iri { Iri::new("http://example.org/sibling/1") }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/timestamp"),
+                    name: "timestamp",
+                    field_type: FieldType::DateTime,
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { vec![] }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Parent>();
+        schema.register::<Child>();
+        schema.register::<Sibling>();
+
+        // ?parent ex:hasChild ?child .  (hasChild is Reference([Child]))
+        // ?child ex:timestamp ?ts .     (timestamp exists on both Child and Sibling)
+        let bgp = GroupGraphPattern {
+            patterns: vec![
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("parent".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/hasChild")),
+                    object: TermOrVariable::Variable(Variable("child".into())),
+                },
+                TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("child".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/timestamp")),
+                    object: TermOrVariable::Variable(Variable("ts".into())),
+                },
+            ],
+        };
+
+        // The reference constraint from hasChild should disambiguate ?child to Child,
+        // even though ex:timestamp alone is ambiguous (Child vs Sibling).
+        let patterns = lower_bgp(&bgp, &schema).unwrap();
+        assert_eq!(patterns.len(), 2);
+
+        match &patterns[1] {
+            QueryPattern::Resource { type_iri, .. } => {
+                assert_eq!(type_iri.as_ref().unwrap().0, "http://example.org/Child");
+            }
+            _ => panic!("expected Resource pattern for ?child"),
+        }
+    }
 }
