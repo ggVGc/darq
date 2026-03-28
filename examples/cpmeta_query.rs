@@ -34,7 +34,7 @@ fn main() {
 }
 
 fn run_query(query: &str, schema: &darq::schema::Schema, executor: &PostgresExecutor) {
-    let eng = SqlEngine::new(executor).with_subject_column("rdf_subject");
+    let eng = SqlEngine::new(executor).with_subject_column("rdf_subject").with_id_column("id");
     match engine::execute(query, schema, &eng) {
         Ok(result) => {
             let header: Vec<_> = result.variables.iter().map(|v| format!("?{}", v)).collect();

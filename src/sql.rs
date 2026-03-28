@@ -35,9 +35,17 @@ impl SqlExpr {
 ///
 /// Assumes one table per resource type, named after the local part of the
 /// type IRI (e.g. `http://example.org/Person` → `"Person"`), with a
-/// `_subject` column for the resource IRI and one column per field.
-pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result<String, DarqError> {
-    let mut bindings: HashMap<String, SqlExpr> = HashMap::new();
+/// `subject_column` for the resource IRI, an `id_column` for the primary key
+/// used in joins, and one column per field.
+///
+/// When `id_column` differs from `subject_column`, joins use the id column
+/// (matching foreign-key references) while SELECT output uses the subject
+/// column (returning full IRIs).
+pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column: &str) -> Result<String, DarqError> {
+    // select_bindings: used for SELECT output and ORDER BY (returns full IRIs for subjects).
+    // join_bindings:   used for JOIN/WHERE conditions (uses id for subjects).
+    let mut select_bindings: HashMap<String, SqlExpr> = HashMap::new();
+    let mut join_bindings: HashMap<String, SqlExpr> = HashMap::new();
     let mut from_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
 
@@ -64,15 +72,16 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
                         .map(|ti| {
                             let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
                             format!(
-                                "SELECT \"{}\", '{}' AS \"_type\" FROM \"{}\"",
+                                "SELECT \"{}\", \"{}\", '{}' AS \"_type\" FROM \"{}\"",
                                 subject_column,
+                                id_column,
                                 ti.0,
                                 tbl
                             )
                         })
                         .collect();
                     if parts.is_empty() {
-                        format!("(SELECT NULL AS \"{}\", NULL AS \"_type\" WHERE FALSE)", subject_column)
+                        format!("(SELECT NULL AS \"{}\", NULL AS \"{}\", NULL AS \"_type\" WHERE FALSE)", subject_column, id_column)
                     } else {
                         format!("({})", parts.join(" UNION ALL "))
                     }
@@ -81,19 +90,35 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
                 // Subject binding.
                 match subject {
                     Subject::Variable(v) => {
-                        if let Some(existing) = bindings.get(v) {
+                        if let Some(existing) = join_bindings.get(v) {
                             join_conds.push(format!(
                                 "\"{}\".\"{}\" = {}",
                                 alias,
-                                subject_column,
+                                id_column,
                                 existing.to_sql()
                             ));
-                        } else {
-                            bindings.insert(
+                            // Override select binding: use the subject column
+                            // from this pattern (canonical IRI).
+                            select_bindings.insert(
                                 v.clone(),
                                 SqlExpr::Column {
                                     pattern_idx: i,
                                     column: subject_column.to_string(),
+                                },
+                            );
+                        } else {
+                            select_bindings.insert(
+                                v.clone(),
+                                SqlExpr::Column {
+                                    pattern_idx: i,
+                                    column: subject_column.to_string(),
+                                },
+                            );
+                            join_bindings.insert(
+                                v.clone(),
+                                SqlExpr::Column {
+                                    pattern_idx: i,
+                                    column: id_column.to_string(),
                                 },
                             );
                         }
@@ -110,24 +135,24 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
                 if let Some(tv) = type_variable {
                     if let Some(ti) = type_iri {
                         // Known type — bind to a constant.
-                        bindings
-                            .insert(tv.clone(), SqlExpr::Constant(format!("'{}'", ti.0)));
+                        let constant = SqlExpr::Constant(format!("'{}'", ti.0));
+                        select_bindings.insert(tv.clone(), constant.clone());
+                        join_bindings.insert(tv.clone(), constant);
                     } else {
                         // Unknown type — bind to the _type column from the UNION.
-                        if let Some(existing) = bindings.get(tv) {
+                        if let Some(existing) = join_bindings.get(tv) {
                             join_conds.push(format!(
                                 "\"{}\".\"_type\" = {}",
                                 alias,
                                 existing.to_sql()
                             ));
                         } else {
-                            bindings.insert(
-                                tv.clone(),
-                                SqlExpr::Column {
-                                    pattern_idx: i,
-                                    column: "_type".into(),
-                                },
-                            );
+                            let expr = SqlExpr::Column {
+                                pattern_idx: i,
+                                column: "_type".into(),
+                            };
+                            select_bindings.insert(tv.clone(), expr.clone());
+                            join_bindings.insert(tv.clone(), expr);
                         }
                     }
                 }
@@ -148,7 +173,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
 
                     match &c.value {
                         Value::Variable(v) => {
-                            if let Some(existing) = bindings.get(v) {
+                            if let Some(existing) = join_bindings.get(v) {
                                 if is_array {
                                     join_conds.push(format!(
                                         "{} = ANY(\"{}\".\"{}\")",
@@ -165,21 +190,19 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
                                     ));
                                 }
                             } else if is_array {
-                                bindings.insert(
-                                    v.clone(),
-                                    SqlExpr::Unnest {
-                                        pattern_idx: i,
-                                        column: c.field_name.clone(),
-                                    },
-                                );
+                                let expr = SqlExpr::Unnest {
+                                    pattern_idx: i,
+                                    column: c.field_name.clone(),
+                                };
+                                select_bindings.insert(v.clone(), expr.clone());
+                                join_bindings.insert(v.clone(), expr);
                             } else {
-                                bindings.insert(
-                                    v.clone(),
-                                    SqlExpr::Column {
-                                        pattern_idx: i,
-                                        column: c.field_name.clone(),
-                                    },
-                                );
+                                let expr = SqlExpr::Column {
+                                    pattern_idx: i,
+                                    column: c.field_name.clone(),
+                                };
+                                select_bindings.insert(v.clone(), expr.clone());
+                                join_bindings.insert(v.clone(), expr);
                             }
                         }
                         Value::Bound(term) => {
@@ -222,7 +245,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
         }
     }
 
-    // Resolve selected variables.
+    // Resolve selected variables (using select_bindings for output).
     let vars = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
         SelectClause::Star => plan.collect_variables(),
@@ -231,7 +254,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
     let select_cols: Vec<String> = vars
         .iter()
         .filter_map(|v| {
-            bindings
+            select_bindings
                 .get(v)
                 .map(|expr| format!("{} AS \"{}\"", expr.to_sql(), v))
         })
@@ -263,7 +286,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result
                     OrderDirection::Ascending => "ASC",
                     OrderDirection::Descending => "DESC",
                 };
-                match bindings.get(&oc.variable.0) {
+                match select_bindings.get(&oc.variable.0) {
                     Some(expr) => format!("{} {}", expr.to_sql(), dir),
                     None => format!("\"{}\" {}", oc.variable.0, dir),
                 }
@@ -348,7 +371,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
@@ -378,7 +401,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
@@ -423,7 +446,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"pname\", \"p1\".\"name\" AS \"dname\"\n\
@@ -448,7 +471,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
@@ -479,7 +502,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\", \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
@@ -511,7 +534,7 @@ mod tests {
             },
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT DISTINCT \"p0\".\"name\" AS \"name\"\n\
@@ -538,7 +561,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"s\", 'http://example.org/Person' AS \"type\"\n\
@@ -579,7 +602,7 @@ mod tests {
             },
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
@@ -607,7 +630,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
@@ -632,7 +655,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
@@ -664,7 +687,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"x\"\n\
@@ -694,7 +717,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
@@ -757,7 +780,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &schema, "_subject").unwrap();
+        let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
         assert!(
             sql.contains("unnest(\"p0\".\"tags\")"),
             "Should use unnest for array variable column: {}",
@@ -782,11 +805,160 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &schema, "_subject").unwrap();
+        let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
         assert!(
             sql.contains("= ANY(\"p0\".\"tags\")"),
             "Should use = ANY() for bound array constraint: {}",
             sql
+        );
+    }
+
+    #[test]
+    fn test_cross_type_join_with_separate_id() {
+        // When id_column differs from subject_column, joins use id_column
+        // and SELECT uses subject_column for subject variables.
+        let plan = QueryPlan {
+            patterns: vec![
+                QueryPattern::Resource {
+                    subject: Subject::Variable("person".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![
+                        FieldConstraint {
+                            field_name: "name".into(),
+                            value: Value::Variable("pname".into()),
+                        },
+                        FieldConstraint {
+                            field_name: "pet".into(),
+                            value: Value::Variable("pet".into()),
+                        },
+                    ],
+                    type_variable: None,
+                },
+                QueryPattern::Resource {
+                    subject: Subject::Variable("pet".into()),
+                    type_iri: Some(Iri::new("http://example.org/Duck")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("dname".into()),
+                    }],
+                    type_variable: None,
+                },
+            ],
+            select: SelectClause::Variables(vec![
+                Variable("pname".into()),
+                Variable("dname".into()),
+            ]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"name\" AS \"pname\", \"p1\".\"name\" AS \"dname\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\""
+        );
+    }
+
+    #[test]
+    fn test_field_then_subject_variable_uses_subject_column() {
+        // When a variable is first bound as a field value and later used as a
+        // subject, SELECT should use subject_column from the subject pattern
+        // (giving the full IRI), not the original field column (which stores an id).
+        let plan = QueryPlan {
+            patterns: vec![
+                QueryPattern::Resource {
+                    subject: Subject::Variable("person".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "pet".into(),
+                        value: Value::Variable("pet".into()),
+                    }],
+                    type_variable: None,
+                },
+                QueryPattern::Resource {
+                    subject: Subject::Variable("pet".into()),
+                    type_iri: Some(Iri::new("http://example.org/Duck")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("dname".into()),
+                    }],
+                    type_variable: None,
+                },
+            ],
+            select: SelectClause::Variables(vec![
+                Variable("pet".into()),
+                Variable("dname".into()),
+            ]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
+        // ?pet in SELECT should reference p1.rdf_subject (the subject pattern),
+        // not p0.pet (the field where it was first bound).
+        assert_eq!(
+            sql,
+            "SELECT \"p1\".\"rdf_subject\" AS \"pet\", \"p1\".\"name\" AS \"dname\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             INNER JOIN \"Duck\" AS \"p1\" ON \"p1\".\"id\" = \"p0\".\"pet\""
+        );
+    }
+
+    #[test]
+    fn test_bound_subject_with_separate_id() {
+        // Bound subjects should still match against subject_column (full IRI).
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Bound(Iri::new("http://example.org/person/alice")),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"name\" AS \"name\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"rdf_subject\" = 'http://example.org/person/alice'"
+        );
+    }
+
+    #[test]
+    fn test_select_star_with_separate_id() {
+        // SELECT * with separate id/subject columns should use subject_column
+        // for subject variables in the output.
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![
+                    FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    },
+                    FieldConstraint {
+                        field_name: "age".into(),
+                        value: Value::Variable("age".into()),
+                    },
+                ],
+                type_variable: None,
+            }],
+            select: SelectClause::Star,
+            modifier: empty_modifier(),
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"rdf_subject\" AS \"p\", \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
+             FROM \"Person\" AS \"p0\""
         );
     }
 

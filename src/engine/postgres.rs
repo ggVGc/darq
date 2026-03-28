@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use chrono::{DateTime, NaiveDate, Utc};
 use postgres::types::Type;
 use postgres::Client;
 
@@ -33,6 +34,8 @@ fn column_to_string(row: &postgres::Row, idx: usize, col_type: &Type) -> Option<
         row.get::<_, Option<i64>>(idx).map(|v| v.to_string())
     } else if *col_type == Type::INT4 {
         row.get::<_, Option<i32>>(idx).map(|v| v.to_string())
+    } else if *col_type == Type::INT2 {
+        row.get::<_, Option<i16>>(idx).map(|v| v.to_string())
     } else if *col_type == Type::FLOAT4 {
         row.get::<_, Option<f32>>(idx).map(|v| v.to_string())
     } else if *col_type == Type::FLOAT8 {
@@ -40,6 +43,15 @@ fn column_to_string(row: &postgres::Row, idx: usize, col_type: &Type) -> Option<
     } else if *col_type == Type::BOOL {
         row.get::<_, Option<bool>>(idx)
             .map(|v| if v { "true" } else { "false" }.to_string())
+    } else if *col_type == Type::TIMESTAMPTZ {
+        row.get::<_, Option<DateTime<Utc>>>(idx)
+            .map(|v| v.to_rfc3339())
+    } else if *col_type == Type::TIMESTAMP {
+        row.get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .map(|v| v.format("%Y-%m-%dT%H:%M:%S").to_string())
+    } else if *col_type == Type::DATE {
+        row.get::<_, Option<NaiveDate>>(idx)
+            .map(|v| v.format("%Y-%m-%d").to_string())
     } else {
         row.get::<_, Option<String>>(idx)
     }

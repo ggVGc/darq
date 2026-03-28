@@ -2,8 +2,13 @@ prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
 prefix prov: <http://www.w3.org/ns/prov#>
 prefix xsd: <http://www.w3.org/2001/XMLSchema#>
 prefix geo: <http://www.opengis.net/ont/geosparql#>
-select *
+select ?size
 where {
+	?dobj cpmeta:hasObjectSpec ?spec .
+	?dobj cpmeta:hasSizeInBytes ?size .
+	?dobj cpmeta:hasName ?fileName .
 	?dobj cpmeta:wasSubmittedBy ?subm .
+	?subm prov:endedAtTime ?submTime .
 }
+order by desc(?submTime)
 offset 0 limit 20

@@ -48,7 +48,7 @@ fn main() {
         }
     };
 
-    match sql::to_sql(&plan, &schema, "_subject") {
+    match sql::to_sql(&plan, &schema, "_subject", "_subject") {
         Ok(sql) => println!("{}", sql),
         Err(e) => {
             eprintln!("SQL translation error: {}", e);

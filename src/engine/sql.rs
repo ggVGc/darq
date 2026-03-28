@@ -33,6 +33,7 @@ pub trait SqlExecutor {
 pub struct SqlEngine<'a, E> {
     executor: &'a E,
     subject_column: String,
+    id_column: String,
 }
 
 impl<'a, E: SqlExecutor> SqlEngine<'a, E> {
@@ -40,11 +41,28 @@ impl<'a, E: SqlExecutor> SqlEngine<'a, E> {
         Self {
             executor,
             subject_column: "_subject".to_string(),
+            id_column: "_subject".to_string(),
         }
     }
 
     pub fn with_subject_column(mut self, col: impl Into<String>) -> Self {
-        self.subject_column = col.into();
+        let col = col.into();
+        // Keep id_column in sync if it hasn't been explicitly set
+        // (i.e., it still matches the old subject_column default).
+        if self.id_column == self.subject_column {
+            self.id_column = col.clone();
+        }
+        self.subject_column = col;
+        self
+    }
+
+    /// Set the column used as primary key for joins (defaults to the subject column).
+    ///
+    /// When the database uses a separate primary key column (e.g., `id`)
+    /// distinct from the full IRI column (`rdf_subject`), set this so that
+    /// joins match foreign-key references against the correct column.
+    pub fn with_id_column(mut self, col: impl Into<String>) -> Self {
+        self.id_column = col.into();
         self
     }
 
@@ -170,7 +188,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             select: SelectClause::Star,
             modifier: plan.modifier.clone(),
         };
-        let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column)?;
+        let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
         let type_map = build_variable_type_map(plan, schema);
 
