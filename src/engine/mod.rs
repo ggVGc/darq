@@ -1,4 +1,6 @@
 pub mod memory;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod sql;
 
 use std::collections::HashMap;

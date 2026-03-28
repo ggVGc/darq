@@ -3,8 +3,16 @@ name = "darq"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+postgres = ["dep:postgres"]
+
 [dependencies]
+postgres = { version = "0.19", optional = true }
 
 [dev-dependencies]
 postgres = "0.19"
 rand = "0.8"
+
+[[example]]
+name = "people_postgres"
+required-features = ["postgres"]
