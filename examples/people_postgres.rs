@@ -6,51 +6,21 @@ use postgres::Client;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
+use darq::define_resource;
 use darq::engine;
 use darq::engine::sql::{SqlEngine, SqlExecutor, SqlResultSet};
-use darq::rdf::{Iri, Term};
-use darq::schema::{FieldDescriptor, FieldType, Resource, Schema};
+use darq::schema::{FieldType, Schema};
 
 // ---------------------------------------------------------------------------
 // Data model (same as people.rs / people_sql.rs)
 // ---------------------------------------------------------------------------
 
-struct Person {
-    id: String,
-    name: String,
-    age: i64,
-}
-
-impl Resource for Person {
-    fn rdf_type() -> Iri {
-        Iri::new("http://example.org/Person")
-    }
-
-    fn subject_iri(&self) -> Iri {
-        Iri::new(format!("http://example.org/person/{}", self.id))
-    }
-
-    fn field_descriptors() -> Vec<FieldDescriptor> {
-        vec![
-            FieldDescriptor {
-                predicate: Iri::new("http://example.org/name"),
-                name: "name",
-                field_type: FieldType::String,
-                indexed: false,
-            },
-            FieldDescriptor {
-                predicate: Iri::new("http://example.org/age"),
-                name: "age",
-                field_type: FieldType::Integer,
-                indexed: false,
-            },
-        ]
-    }
-
-    fn field_values(&self) -> Vec<Term> {
-        vec![self.name.clone().into(), self.age.into()]
-    }
-}
+define_resource!(
+    Person, "http://example.org/Person", [
+        ("name", "http://example.org/name", FieldType::String),
+        ("age", "http://example.org/age", FieldType::Integer),
+    ]
+);
 
 // ---------------------------------------------------------------------------
 // SqlExecutor implementation for PostgreSQL
@@ -178,10 +148,11 @@ fn main() {
         CREATE TABLE "Person" (
             "_subject" TEXT NOT NULL,
             "name"     TEXT NOT NULL,
-            "age"      BIGINT NOT NULL
+            "age"      INT NOT NULL
         );
         INSERT INTO "Person" ("_subject", "name", "age") VALUES
             {};
+        CREATE INDEX ON "Person"(age, name) ;
         "#,
         values.join(",\n            ")
     );
@@ -207,6 +178,7 @@ fn main() {
                     ex:age ?age .
         }
         ORDER BY ?name
+        LIMIT 10
     "#;
 
     println!("=== All people (ordered by name) ===");

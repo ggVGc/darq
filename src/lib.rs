@@ -1,3 +1,6 @@
+#[macro_use]
+mod macros;
+
 pub mod engine;
 pub mod error;
 pub mod ir;
