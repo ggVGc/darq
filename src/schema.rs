@@ -42,12 +42,27 @@ pub trait Resource {
     /// Return the object Term for each field, in the same order as
     /// `field_descriptors()`.
     fn field_values(&self) -> Vec<Term>;
+
+    /// The SQL table name for this resource type.
+    /// Defaults to the local name of the `rdf_type()` IRI (after the last `#` or `/`).
+    fn sql_table_name() -> String {
+        let iri = Self::rdf_type();
+        let s = &iri.0;
+        if let Some(pos) = s.rfind('#') {
+            s[pos + 1..].to_string()
+        } else if let Some(pos) = s.rfind('/') {
+            s[pos + 1..].to_string()
+        } else {
+            s.clone()
+        }
+    }
 }
 
 /// Static information about a registered resource type.
 pub struct TypeInfo {
     pub type_iri: Iri,
     pub fields: Vec<FieldDescriptor>,
+    pub table_name: String,
 }
 
 /// The schema knows every registered resource type and its fields.
@@ -69,6 +84,7 @@ impl Schema {
     pub fn register<R: Resource>(&mut self) {
         let type_iri = R::rdf_type();
         let fields = R::field_descriptors();
+        let table_name = R::sql_table_name();
 
         for fd in &fields {
             self.predicate_to_types
@@ -82,6 +98,7 @@ impl Schema {
             TypeInfo {
                 type_iri,
                 fields,
+                table_name,
             },
         );
     }
@@ -129,6 +146,11 @@ impl Schema {
     /// Return the field descriptors for a type.
     pub fn fields_for_type(&self, type_iri: &Iri) -> Option<&[FieldDescriptor]> {
         self.types.get(type_iri).map(|info| info.fields.as_slice())
+    }
+
+    /// Return the SQL table name for a registered type.
+    pub fn table_name(&self, type_iri: &Iri) -> Option<&str> {
+        self.types.get(type_iri).map(|info| info.table_name.as_str())
     }
 
     /// Iterate over all registered type IRIs.

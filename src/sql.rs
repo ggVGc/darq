@@ -55,16 +55,18 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
 
                 // Determine the table source.
                 let source = if let Some(ti) = type_iri {
-                    format!("\"{}\"", table_name(ti))
+                    let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
+                    format!("\"{}\"", tbl)
                 } else {
                     // No concrete type — UNION ALL over all registered types.
                     let parts: Vec<String> = schema
                         .known_types()
                         .map(|ti| {
+                            let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
                             format!(
                                 "SELECT \"_subject\", '{}' AS \"_type\" FROM \"{}\"",
                                 ti.0,
-                                table_name(ti)
+                                tbl
                             )
                         })
                         .collect();
@@ -280,7 +282,8 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
 }
 
 /// Extract the local name from an IRI (the part after the last `#` or `/`).
-fn table_name(iri: &Iri) -> &str {
+/// Used as fallback when a type is not registered in the schema.
+fn iri_local_name(iri: &Iri) -> &str {
     let s = &iri.0;
     if let Some(pos) = s.rfind('#') {
         &s[pos + 1..]
@@ -787,11 +790,11 @@ mod tests {
 
     #[test]
     fn test_iri_fragment_table_name() {
-        assert_eq!(table_name(&Iri::new("http://xmlns.com/foaf/0.1#Person")), "Person");
+        assert_eq!(iri_local_name(&Iri::new("http://xmlns.com/foaf/0.1#Person")), "Person");
     }
 
     #[test]
     fn test_iri_path_table_name() {
-        assert_eq!(table_name(&Iri::new("http://example.org/Person")), "Person");
+        assert_eq!(iri_local_name(&Iri::new("http://example.org/Person")), "Person");
     }
 }

@@ -16,7 +16,7 @@ use darq::schema::{FieldType, Schema};
 // ---------------------------------------------------------------------------
 
 define_resource!(
-    Person, "http://example.org/Person", [
+    Person, "http://example.org/Person", table = "people", [
         ("name", "http://example.org/name", FieldType::String),
         ("age", "http://example.org/age", FieldType::Integer),
     ]

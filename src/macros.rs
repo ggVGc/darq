@@ -52,6 +52,46 @@ macro_rules! ref_to {
 /// ```
 #[macro_export]
 macro_rules! define_resource {
+    // With explicit table name override.
+    (
+        $(#[doc = $doc:expr])*
+        $name:ident, $type_iri:expr, table = $table:expr,
+        [ $( ($col:expr, $pred:expr, $ftype:expr) ),* $(,)? ]
+    ) => {
+        $(#[doc = $doc])*
+        pub struct $name;
+
+        impl $crate::schema::Resource for $name {
+            fn rdf_type() -> $crate::rdf::Iri {
+                $crate::rdf::Iri::new($type_iri)
+            }
+
+            fn subject_iri(&self) -> $crate::rdf::Iri {
+                unimplemented!("SQL-backed resource")
+            }
+
+            fn field_descriptors() -> Vec<$crate::schema::FieldDescriptor> {
+                vec![
+                    $($crate::schema::FieldDescriptor {
+                        predicate: $crate::rdf::Iri::new($pred),
+                        name: $col,
+                        field_type: $ftype,
+                        indexed: false,
+                    }),*
+                ]
+            }
+
+            fn field_values(&self) -> Vec<$crate::rdf::Term> {
+                unimplemented!("SQL-backed resource")
+            }
+
+            fn sql_table_name() -> String {
+                $table.to_string()
+            }
+        }
+    };
+
+    // Without table name — uses the default from the trait.
     (
         $(#[doc = $doc:expr])*
         $name:ident, $type_iri:expr,

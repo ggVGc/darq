@@ -170,7 +170,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
 
         for ti in &type_iris {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
-            let table = table_name(ti);
+            let table = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
 
             // Check if any constraint targets a StringArray field with a variable
             let subj_col = self.quoted_subject_col();
@@ -404,7 +404,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
 
         for ti in &type_iris {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
-            let table = table_name(ti);
+            let table = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
 
             let subj_col = self.quoted_subject_col();
             let subject_groups = group_by_subject(solutions, subject_var);
@@ -884,8 +884,9 @@ fn try_bind(var: &str, term: &Term, binding: &mut Binding) -> bool {
     }
 }
 
-/// Extract the local name from an IRI for use as a table name.
-fn table_name(iri: &Iri) -> &str {
+/// Extract the local name from an IRI (the part after the last `#` or `/`).
+/// Used as fallback when a type is not registered in the schema.
+fn iri_local_name(iri: &Iri) -> &str {
     let s = &iri.0;
     if let Some(pos) = s.rfind('#') {
         &s[pos + 1..]
