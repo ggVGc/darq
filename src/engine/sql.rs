@@ -103,6 +103,17 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
         plan: &QueryPlan,
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
+        // If all patterns are Resource (no FieldScan), use a single combined SQL query
+        // so the database handles JOINs, ORDER BY, LIMIT, etc.
+        let all_resource = plan
+            .patterns
+            .iter()
+            .all(|p| matches!(p, QueryPattern::Resource { .. }));
+        if all_resource {
+            return self.eval_combined(plan, schema);
+        }
+
+        // Pipelined approach for plans containing FieldScan patterns.
         let mut solutions: Vec<Binding> = vec![HashMap::new()];
 
         for pattern in &plan.patterns {
@@ -141,6 +152,45 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
 }
 
 impl<E: SqlExecutor> SqlEngine<'_, E> {
+    /// Evaluate a Resource-only plan using a single combined SQL query.
+    ///
+    /// Generates one SQL statement (via `to_sql`) with proper JOINs, ORDER BY,
+    /// LIMIT, OFFSET, and DISTINCT, letting the database handle everything.
+    fn eval_combined(
+        &self,
+        plan: &QueryPlan,
+        schema: &Schema,
+    ) -> Result<Vec<Binding>, DarqError> {
+        use crate::sparql::ast::SelectClause;
+
+        // Use SelectClause::Star so the SQL returns all variables, not just
+        // the projected ones — projection happens later in execute().
+        let full_plan = QueryPlan {
+            patterns: plan.patterns.clone(),
+            select: SelectClause::Star,
+            modifier: plan.modifier.clone(),
+        };
+        let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column)?;
+        let result = self.executor.execute_sql(&sql)?;
+        let type_map = build_variable_type_map(plan, schema);
+
+        let mut bindings = Vec::new();
+        for row in &result.rows {
+            let mut binding = Binding::new();
+            for (col_idx, col_name) in result.columns.iter().enumerate() {
+                if let Some(Some(raw)) = row.get(col_idx) {
+                    let term = match type_map.get(col_name.as_str()) {
+                        Some(ft) => parse_sql_value(raw, ft),
+                        None => Term::Literal(Literal::String(raw.clone())),
+                    };
+                    binding.insert(col_name.clone(), term);
+                }
+            }
+            bindings.push(binding);
+        }
+        Ok(bindings)
+    }
+
     /// Evaluate a Resource pattern against all existing solutions using batched IN clauses.
     fn eval_resource(
         &self,
@@ -897,6 +947,47 @@ fn iri_local_name(iri: &Iri) -> &str {
     }
 }
 
+/// Build a mapping from SPARQL variable name to its SQL field type.
+///
+/// Used by `eval_combined` to parse SQL string results back into typed Terms.
+fn build_variable_type_map(plan: &QueryPlan, schema: &Schema) -> HashMap<String, FieldType> {
+    let mut map = HashMap::new();
+    for pattern in &plan.patterns {
+        if let QueryPattern::Resource {
+            subject,
+            type_iri,
+            constraints,
+            type_variable,
+        } = pattern
+        {
+            // Subject variables are always IRIs.
+            if let Subject::Variable(v) = subject {
+                map.entry(v.clone())
+                    .or_insert(FieldType::Reference(vec![]));
+            }
+            // Type variables are always IRIs.
+            if let Some(tv) = type_variable {
+                map.entry(tv.clone())
+                    .or_insert(FieldType::Reference(vec![]));
+            }
+            // Field constraint variables get their type from the schema.
+            let fields = type_iri
+                .as_ref()
+                .and_then(|ti| schema.fields_for_type(ti));
+            for c in constraints {
+                if let Value::Variable(v) = &c.value {
+                    if let Some(fd) = fields
+                        .and_then(|fs| fs.iter().find(|f| f.name == c.field_name))
+                    {
+                        map.entry(v.clone()).or_insert(fd.field_type.clone());
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
 /// Check if a field is an array type.
 fn is_array_field(fields: &[FieldDescriptor], name: &str) -> bool {
     fields
@@ -1062,8 +1153,10 @@ mod tests {
     #[test]
     fn test_resource_pattern_generates_correct_sql() {
         let mut executor = MockExecutor::new();
+        // Combined path generates: SELECT "p0"."_subject" AS "p", "p0"."name" AS "name"
+        // A real DB returns columns named by alias ("p", "name").
         executor.add_response("FROM \"Person\"", SqlResultSet {
-            columns: vec!["_subject".into(), "name".into()],
+            columns: vec!["p".into(), "name".into()],
             rows: vec![
                 vec![Some("http://example.org/person/alice".into()), Some("Alice".into())],
             ],
@@ -1105,10 +1198,12 @@ mod tests {
     #[test]
     fn test_resource_pattern_with_bound_subject() {
         let mut executor = MockExecutor::new();
+        // Combined path: SELECT "p0"."name" AS "name" FROM "Person" AS "p0"
+        //                WHERE "p0"."_subject" = '...'
         executor.add_response("FROM \"Person\"", SqlResultSet {
-            columns: vec!["_subject".into(), "name".into()],
+            columns: vec!["name".into()],
             rows: vec![
-                vec![Some("http://example.org/person/alice".into()), Some("Alice".into())],
+                vec![Some("Alice".into())],
             ],
         });
 
@@ -1447,10 +1542,11 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_pattern_array_variable_uses_lateral_unnest() {
+    fn test_resource_pattern_array_variable_uses_unnest() {
         let mut executor = MockExecutor::new();
+        // Combined path generates: SELECT "p0"."_subject" AS "s", unnest("p0"."tags") AS "tag"
         executor.add_response("FROM", SqlResultSet {
-            columns: vec!["_subject".into(), "tags".into()],
+            columns: vec!["s".into(), "tag".into()],
             rows: vec![
                 vec![Some("http://example.org/instrument/i1".into()), Some("red".into())],
                 vec![Some("http://example.org/instrument/i1".into()), Some("blue".into())],
@@ -1477,17 +1573,12 @@ mod tests {
         let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
         assert_eq!(bindings.len(), 2);
 
-        // Verify SQL uses LATERAL unnest
+        // Verify SQL uses unnest
         let queries = executor.executed_queries();
         assert_eq!(queries.len(), 1);
         assert!(
-            queries[0].contains("LATERAL unnest"),
-            "Should use LATERAL unnest for array variable: {}",
-            queries[0]
-        );
-        assert!(
-            queries[0].contains("AS \"_t\""),
-            "Should alias table when using LATERAL: {}",
+            queries[0].contains("unnest("),
+            "Should use unnest for array variable: {}",
             queries[0]
         );
     }
@@ -1495,10 +1586,12 @@ mod tests {
     #[test]
     fn test_resource_pattern_array_bound_uses_any() {
         let mut executor = MockExecutor::new();
+        // Combined path: SELECT "p0"."_subject" AS "s" FROM "Instrument" AS "p0"
+        //                WHERE 'red' = ANY("p0"."tags")
         executor.add_response("FROM", SqlResultSet {
-            columns: vec!["_subject".into(), "tags".into()],
+            columns: vec!["s".into()],
             rows: vec![
-                vec![Some("http://example.org/instrument/i1".into()), Some("{red,blue}".into())],
+                vec![Some("http://example.org/instrument/i1".into())],
             ],
         });
 
@@ -1661,6 +1754,81 @@ mod tests {
         assert_eq!(
             parse_sql_value("http://example.org/foo", &FieldType::Reference(vec![])),
             Term::Iri(Iri::new("http://example.org/foo"))
+        );
+    }
+
+    #[test]
+    fn test_combined_query_includes_order_by_and_limit() {
+        let mut executor = MockExecutor::new();
+        executor.add_response("FROM \"Person\"", SqlResultSet {
+            columns: vec!["p".into(), "name".into(), "age".into()],
+            rows: vec![
+                vec![
+                    Some("http://example.org/person/alice".into()),
+                    Some("Alice".into()),
+                    Some("30".into()),
+                ],
+            ],
+        });
+
+        let engine = SqlEngine::new(&executor);
+        let schema = test_schema();
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![
+                    FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    },
+                    FieldConstraint {
+                        field_name: "age".into(),
+                        value: Value::Variable("age".into()),
+                    },
+                ],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![
+                Variable("name".into()),
+                Variable("age".into()),
+            ]),
+            modifier: SolutionModifier {
+                distinct: false,
+                order_by: vec![crate::sparql::ast::OrderCondition {
+                    variable: Variable("age".into()),
+                    direction: crate::sparql::ast::OrderDirection::Descending,
+                }],
+                limit: Some(5),
+                offset: None,
+            },
+        };
+
+        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].get("age"),
+            Some(&Term::Literal(Literal::Integer(30)))
+        );
+
+        // The combined path should emit a single SQL query with ORDER BY and LIMIT
+        let queries = executor.executed_queries();
+        assert_eq!(queries.len(), 1, "Should use a single combined query");
+        assert!(
+            queries[0].contains("ORDER BY"),
+            "SQL should contain ORDER BY: {}",
+            queries[0]
+        );
+        assert!(
+            queries[0].contains("DESC"),
+            "SQL should contain DESC: {}",
+            queries[0]
+        );
+        assert!(
+            queries[0].contains("LIMIT 5"),
+            "SQL should contain LIMIT: {}",
+            queries[0]
         );
     }
 }

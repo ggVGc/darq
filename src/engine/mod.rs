@@ -1,7 +1,7 @@
 pub mod memory;
 pub mod sql;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::error::DarqError;
 use crate::ir::QueryPlan;

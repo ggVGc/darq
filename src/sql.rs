@@ -36,7 +36,7 @@ impl SqlExpr {
 /// Assumes one table per resource type, named after the local part of the
 /// type IRI (e.g. `http://example.org/Person` → `"Person"`), with a
 /// `_subject` column for the resource IRI and one column per field.
-pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
+pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str) -> Result<String, DarqError> {
     let mut bindings: HashMap<String, SqlExpr> = HashMap::new();
     let mut from_parts: Vec<String> = Vec::new();
     let mut where_parts: Vec<String> = Vec::new();
@@ -64,14 +64,15 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
                         .map(|ti| {
                             let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
                             format!(
-                                "SELECT \"_subject\", '{}' AS \"_type\" FROM \"{}\"",
+                                "SELECT \"{}\", '{}' AS \"_type\" FROM \"{}\"",
+                                subject_column,
                                 ti.0,
                                 tbl
                             )
                         })
                         .collect();
                     if parts.is_empty() {
-                        "(SELECT NULL AS \"_subject\", NULL AS \"_type\" WHERE FALSE)".to_string()
+                        format!("(SELECT NULL AS \"{}\", NULL AS \"_type\" WHERE FALSE)", subject_column)
                     } else {
                         format!("({})", parts.join(" UNION ALL "))
                     }
@@ -82,8 +83,9 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
                     Subject::Variable(v) => {
                         if let Some(existing) = bindings.get(v) {
                             join_conds.push(format!(
-                                "\"{}\".\"_subject\" = {}",
+                                "\"{}\".\"{}\" = {}",
                                 alias,
+                                subject_column,
                                 existing.to_sql()
                             ));
                         } else {
@@ -91,15 +93,15 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema) -> Result<String, DarqError> {
                                 v.clone(),
                                 SqlExpr::Column {
                                     pattern_idx: i,
-                                    column: "_subject".into(),
+                                    column: subject_column.to_string(),
                                 },
                             );
                         }
                     }
                     Subject::Bound(iri) => {
                         where_parts.push(format!(
-                            "\"{}\".\"_subject\" = '{}'",
-                            alias, iri.0
+                            "\"{}\".\"{}\" = '{}'",
+                            alias, subject_column, iri.0
                         ));
                     }
                 }
@@ -346,7 +348,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
@@ -376,7 +378,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
@@ -421,7 +423,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"pname\", \"p1\".\"name\" AS \"dname\"\n\
@@ -446,7 +448,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
@@ -477,7 +479,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\", \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
@@ -509,7 +511,7 @@ mod tests {
             },
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT DISTINCT \"p0\".\"name\" AS \"name\"\n\
@@ -536,7 +538,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"s\", 'http://example.org/Person' AS \"type\"\n\
@@ -577,7 +579,7 @@ mod tests {
             },
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\", \"p0\".\"age\" AS \"age\"\n\
@@ -605,7 +607,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
@@ -630,7 +632,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
@@ -662,7 +664,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"x\"\n\
@@ -692,7 +694,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &Schema::new()).unwrap();
+        let sql = to_sql(&plan, &Schema::new(), "_subject").unwrap();
         assert_eq!(
             sql,
             "SELECT \"p0\".\"_subject\" AS \"p\"\n\
@@ -755,7 +757,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &schema).unwrap();
+        let sql = to_sql(&plan, &schema, "_subject").unwrap();
         assert!(
             sql.contains("unnest(\"p0\".\"tags\")"),
             "Should use unnest for array variable column: {}",
@@ -780,7 +782,7 @@ mod tests {
             modifier: empty_modifier(),
         };
 
-        let sql = to_sql(&plan, &schema).unwrap();
+        let sql = to_sql(&plan, &schema, "_subject").unwrap();
         assert!(
             sql.contains("= ANY(\"p0\".\"tags\")"),
             "Should use = ANY() for bound array constraint: {}",
