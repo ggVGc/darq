@@ -447,6 +447,8 @@ define_resource!(
         ("license",               dcterms!("license"),            FieldType::String),
         ("see_also",              rdfs!("seeAlso"),               FieldType::String),
         ("creator",               dcterms!("creator"),            FieldType::StringArray),
+        ("deprecated_by_object",  cpmeta!("deprecatedByObject"),  ref_to!(tbl!("ct_static_objects"))),
+        ("deprecated_by_collection", cpmeta!("deprecatedByCollection"), ref_to!(tbl!("ct_plain_collections"))),
     ]
 );
 
@@ -461,6 +463,7 @@ define_resource!(
         ("has_doi",              cpmeta!("hasDoi"),              FieldType::String),
         ("has_spatial_coverage", cpmeta!("hasSpatialCoverage"),  ref_to!(tbl!("ct_spatial_coverages"))),
         ("see_also",             rdfs!("seeAlso"),               FieldType::String),
+        ("deprecated_by",       cpmeta!("deprecatedBy"),         ref_to!(tbl!("ct_collections"))),
     ]
 );
 
