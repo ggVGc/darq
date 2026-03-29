@@ -40,7 +40,14 @@ fn main() {
     let schema = test_schema::test_schema();
 
     match lower::lower(&query, &schema) {
-        Ok(plan) => println!("{:#?}", plan),
+        Ok(plans) => {
+            for (i, plan) in plans.iter().enumerate() {
+                if plans.len() > 1 {
+                    println!("--- Alternative {} ---", i + 1);
+                }
+                println!("{:#?}", plan);
+            }
+        }
         Err(e) => {
             eprintln!("Lowering error: {}", e);
             process::exit(1);

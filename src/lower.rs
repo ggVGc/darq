@@ -7,30 +7,59 @@ use crate::schema::Schema;
 use crate::sparql::ast::*;
 
 /// Lower a parsed (and prefix-expanded, predicate-validated) SPARQL query
-/// into a resource-level query plan.
-pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<QueryPlan, DarqError> {
-    let patterns = lower_bgp(&query.where_pattern, schema)?;
+/// into one or more resource-level query plans.
+///
+/// When a subject's type is ambiguous (multiple candidate types), produces one
+/// plan per candidate so the caller can evaluate all plans and union the results.
+pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, DarqError> {
     let values = query.values.as_ref().map(lower_values_clause);
+    let pattern_sets = lower_bgp_alternatives(&query.where_pattern, schema)?;
 
-    // Collect known variable types from the main BGP for propagation into filters.
-    let mut outer_var_types: HashMap<String, Iri> = HashMap::new();
-    for pattern in &patterns {
-        if let QueryPattern::Resource { subject: crate::ir::Subject::Variable(name), type_iri: Some(ti), .. } = pattern {
-            outer_var_types.insert(name.clone(), ti.clone());
+    let mut plans = Vec::new();
+    for patterns in pattern_sets {
+        // Collect known variable types from the main BGP for propagation into filters.
+        let mut outer_var_types: HashMap<String, Iri> = HashMap::new();
+        for pattern in &patterns {
+            if let QueryPattern::Resource { subject: crate::ir::Subject::Variable(name), type_iri: Some(ti), .. } = pattern {
+                outer_var_types.insert(name.clone(), ti.clone());
+            }
         }
+
+        let filters = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
+
+        check_pattern_connectivity(&patterns, &filters, values.as_ref())?;
+
+        plans.push(QueryPlan {
+            patterns,
+            filters,
+            select: query.select.clone(),
+            modifier: query.modifier.clone(),
+            values: values.clone(),
+        });
     }
+    Ok(plans)
+}
 
-    let filters = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
-
-    check_pattern_connectivity(&patterns, &filters, values.as_ref())?;
-
-    Ok(QueryPlan {
-        patterns,
-        filters,
-        select: query.select.clone(),
-        modifier: query.modifier.clone(),
-        values,
-    })
+/// Like [`lower_bgp`] but handles ambiguous types by producing multiple
+/// alternative pattern sets — one per candidate type. Recurses to handle
+/// multiple ambiguous subjects in the same BGP.
+fn lower_bgp_alternatives(
+    ggp: &GroupGraphPattern,
+    schema: &Schema,
+) -> Result<Vec<Vec<QueryPattern>>, DarqError> {
+    match lower_bgp(ggp, schema) {
+        Ok(patterns) => Ok(vec![patterns]),
+        Err(DarqError::AmbiguousType { ref subject, ref candidates }) if candidates.len() > 1 => {
+            let mut all = Vec::new();
+            for candidate in candidates {
+                let augmented = augment_with_type(ggp, subject, candidate);
+                let alternatives = lower_bgp_alternatives(&augmented, schema)?;
+                all.extend(alternatives);
+            }
+            Ok(all)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Collect variables from a single QueryPattern, excluding anonymous variables.
@@ -1391,7 +1420,9 @@ mod tests {
             values: None,
         };
 
-        let plan = lower(&query, &schema).unwrap();
+        let plans = lower(&query, &schema).unwrap();
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
 
         // Should have 2 NOT EXISTS filters (Alpha and Gamma), not 3.
         assert_eq!(plan.filters.len(), 2, "expected 2 filters (Alpha + Gamma), got {}", plan.filters.len());
@@ -1406,5 +1437,82 @@ mod tests {
         assert!(filter_types.contains(&"http://example.org/Alpha".to_string()));
         assert!(filter_types.contains(&"http://example.org/Gamma".to_string()));
         assert!(!filter_types.contains(&"http://example.org/Beta".to_string()));
+    }
+
+    #[test]
+    fn test_ambiguous_main_bgp_produces_multiple_plans() {
+        // Two types share the same predicate "timestamp":
+        //   Child  → timestamp: DateTime
+        //   Sibling → timestamp: DateTime
+        // Query: ?x timestamp ?ts  (ambiguous — matches both types)
+        // Should produce 2 plans, one per candidate type.
+
+        struct Child;
+        struct Sibling;
+
+        impl Resource for Child {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Child") }
+            fn subject_iri(&self) -> Iri { unimplemented!() }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/timestamp"),
+                    name: "timestamp",
+                    field_type: FieldType::DateTime,
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { unimplemented!() }
+        }
+
+        impl Resource for Sibling {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Sibling") }
+            fn subject_iri(&self) -> Iri { unimplemented!() }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/timestamp"),
+                    name: "timestamp",
+                    field_type: FieldType::DateTime,
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { unimplemented!() }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Child>();
+        schema.register::<Sibling>();
+
+        let query = crate::sparql::ast::SelectQuery {
+            prefixes: vec![],
+            base: None,
+            select: SelectClause::Variables(vec![Variable("x".into()), Variable("ts".into())]),
+            where_pattern: GroupGraphPattern {
+                patterns: vec![
+                    TriplePattern {
+                        subject: TermOrVariable::Variable(Variable("x".into())),
+                        predicate: TermOrVariable::Iri(Iri::new("http://example.org/timestamp")),
+                        object: TermOrVariable::Variable(Variable("ts".into())),
+                    },
+                ],
+                filters: vec![],
+            },
+            modifier: SolutionModifier::default(),
+            values: None,
+        };
+
+        let plans = lower(&query, &schema).unwrap();
+        assert_eq!(plans.len(), 2, "expected 2 plans for ambiguous type, got {}", plans.len());
+
+        // Each plan should have one Resource pattern with a different type.
+        let plan_types: Vec<_> = plans.iter().map(|p| {
+            assert_eq!(p.patterns.len(), 1);
+            match &p.patterns[0] {
+                QueryPattern::Resource { type_iri, .. } => type_iri.as_ref().unwrap().0.clone(),
+                _ => panic!("expected Resource pattern"),
+            }
+        }).collect();
+
+        assert!(plan_types.contains(&"http://example.org/Child".to_string()));
+        assert!(plan_types.contains(&"http://example.org/Sibling".to_string()));
     }
 }

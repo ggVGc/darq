@@ -454,7 +454,7 @@ define_resource!(
     /// cpmeta:Collection (778 instances)
     Collection, tbl!("ct_collections"), [
         ("has_part",             dcterms!("hasPart"),            FieldType::StringArray),
-        ("creator",              dcterms!("creator"),            FieldType::String),
+        ("creator",              dcterms!("creator"),            ref_to!(tbl!("ct_central_facilities"))),
         ("title",                dcterms!("title"),              FieldType::String),
         ("description",          dcterms!("description"),        FieldType::String),
         ("is_next_version_of",   cpmeta!("isNextVersionOf"),    ref_arr_to!(tbl!("ct_collections"))),

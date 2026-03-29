@@ -1,6 +1,7 @@
 prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
+prefix terms: <http://purl.org/dc/terms/>
 select ?dobj where {
-	?dobj a <http://meta.icos-cp.eu/tables/ct_static_objects> .
+	?dobj terms:hasPart ?part .
 	FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj}
 }
 limit 10

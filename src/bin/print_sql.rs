@@ -40,19 +40,24 @@ fn main() {
 
     let schema = test_schema::test_schema();
 
-    let plan = match lower::lower(&query, &schema) {
-        Ok(plan) => plan,
+    let plans = match lower::lower(&query, &schema) {
+        Ok(plans) => plans,
         Err(e) => {
             eprintln!("Lowering error: {}", e);
             process::exit(1);
         }
     };
 
-    match sql::to_sql(&plan, &schema, "_subject", "_subject") {
-        Ok(sql) => println!("{}", sql),
-        Err(e) => {
-            eprintln!("SQL translation error: {}", e);
-            process::exit(1);
+    for (i, plan) in plans.iter().enumerate() {
+        if plans.len() > 1 {
+            println!("-- Alternative {}", i + 1);
+        }
+        match sql::to_sql(plan, &schema, "_subject", "_subject") {
+            Ok(sql) => println!("{}", sql),
+            Err(e) => {
+                eprintln!("SQL translation error: {}", e);
+                process::exit(1);
+            }
         }
     }
 }
