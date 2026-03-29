@@ -72,6 +72,10 @@ pub struct TypeInfo {
 pub struct Schema {
     types: HashMap<Iri, TypeInfo>,
     predicate_to_types: HashMap<Iri, Vec<Iri>>,
+    /// Registered rewrites for `FILTER NOT EXISTS {[] predicate ?var}` patterns.
+    /// Key: (predicate IRI, target type IRI of ?var).
+    /// Value: field names on the target type that must all be NULL.
+    not_exists_rewrites: HashMap<(Iri, Iri), Vec<String>>,
 }
 
 impl Schema {
@@ -79,6 +83,7 @@ impl Schema {
         Schema {
             types: HashMap::new(),
             predicate_to_types: HashMap::new(),
+            not_exists_rewrites: HashMap::new(),
         }
     }
 
@@ -191,6 +196,29 @@ impl Schema {
             }
         }
         targets
+    }
+
+    /// Register a rewrite rule: `FILTER NOT EXISTS {[] predicate ?var}` where
+    /// `?var` has type `target_type` can be replaced by checking that the listed
+    /// fields on the target type are all NULL.
+    pub fn register_not_exists_rewrite(
+        &mut self,
+        predicate: Iri,
+        target_type: Iri,
+        null_fields: Vec<&'static str>,
+    ) {
+        self.not_exists_rewrites.insert(
+            (predicate, target_type),
+            null_fields.into_iter().map(String::from).collect(),
+        );
+    }
+
+    /// Look up a NOT EXISTS rewrite for the given predicate and target type.
+    /// Returns the field names that must all be NULL, or None if no rewrite is registered.
+    pub fn not_exists_rewrite(&self, predicate: &Iri, target_type: &Iri) -> Option<&[String]> {
+        self.not_exists_rewrites
+            .get(&(predicate.clone(), target_type.clone()))
+            .map(|v| v.as_slice())
     }
 }
 

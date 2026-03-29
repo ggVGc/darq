@@ -66,11 +66,23 @@ pub struct NotExistsFilter {
     pub inner_patterns: Vec<QueryPattern>,
 }
 
+/// A null-check filter: specified fields on a variable's resource must be NULL.
+/// Used as an optimized replacement for `FILTER NOT EXISTS {[] pred ?var}`
+/// when the schema registers a rewrite via `register_not_exists_rewrite`.
+#[derive(Debug, Clone)]
+pub struct NullCheckFilter {
+    /// The outer variable to check (e.g., "dobj").
+    pub variable: String,
+    /// Field names that must all be NULL.
+    pub field_names: Vec<String>,
+}
+
 /// A complete resource-level query plan, lowered from SPARQL AST.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub patterns: Vec<QueryPattern>,
     pub filters: Vec<NotExistsFilter>,
+    pub null_checks: Vec<NullCheckFilter>,
     pub select: SelectClause,
     pub modifier: SolutionModifier,
     pub values: Option<InlineData>,
@@ -183,6 +195,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -204,6 +217,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -234,6 +248,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -266,6 +281,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -280,6 +296,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 

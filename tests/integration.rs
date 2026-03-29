@@ -477,3 +477,32 @@ fn test_values_with_iri() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0], Some(Term::Literal(Literal::String("Alice".into()))));
 }
+
+#[test]
+fn test_cpmeta_not_exists_rewrite_to_null_checks() {
+    let input = std::fs::read_to_string("queries/objects.rq").unwrap();
+    let mut query = darq::sparql::parser::parse(&input).unwrap();
+    darq::sparql::expand_prefixes(&mut query).unwrap();
+
+    let schema = darq::cpmeta_schema::cpmeta_schema();
+    let plans = darq::lower::lower(&query, &schema).unwrap();
+
+    // The query has FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj},
+    // and ?dobj is a StaticObject — should rewrite to null checks.
+    assert_eq!(plans.len(), 1);
+    let plan = &plans[0];
+    assert!(plan.filters.is_empty(), "NOT EXISTS should be rewritten, but got {:?}", plan.filters);
+    assert_eq!(plan.null_checks.len(), 1);
+    assert_eq!(plan.null_checks[0].variable, "dobj");
+    assert_eq!(
+        plan.null_checks[0].field_names,
+        vec!["deprecated_by_object", "deprecated_by_collection"],
+    );
+
+    // Verify the SQL uses IS NULL instead of NOT EXISTS
+    let sql = darq::sql::to_sql(plan, &schema, "rdf_subject", "id").unwrap();
+    assert!(sql.contains("\"deprecated_by_object\" IS NULL"), "SQL should use IS NULL:\n{}", sql);
+    assert!(sql.contains("\"deprecated_by_collection\" IS NULL"), "SQL should use IS NULL:\n{}", sql);
+    assert!(!sql.contains("NOT EXISTS"), "SQL should not contain NOT EXISTS:\n{}", sql);
+    assert!(!sql.contains("NOT IN"), "SQL should not contain NOT IN:\n{}", sql);
+}

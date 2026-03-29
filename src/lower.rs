@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, NullCheckFilter, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::Schema;
 use crate::sparql::ast::*;
@@ -25,13 +25,14 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             }
         }
 
-        let filters = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
+        let (filters, null_checks) = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
 
         check_pattern_connectivity(&patterns, &filters, values.as_ref())?;
 
         plans.push(QueryPlan {
             patterns,
             filters,
+            null_checks,
             select: query.select.clone(),
             modifier: query.modifier.clone(),
             values: values.clone(),
@@ -243,21 +244,28 @@ fn data_block_value_to_term(val: &DataBlockValue) -> Option<Term> {
     }
 }
 
-/// Lower FILTER NOT EXISTS clauses into NotExistsFilters.
+/// Lower FILTER NOT EXISTS clauses into NotExistsFilters or NullCheckFilters.
+/// When the schema has a registered rewrite for `NOT EXISTS {[] pred ?var}`,
+/// emits a NullCheckFilter instead of the expensive subquery.
 /// When the inner pattern has an ambiguous type, produce one filter per candidate type,
 /// narrowing candidates using known types from the outer query.
 fn lower_filters(
     filters: &[Filter],
     schema: &Schema,
     outer_var_types: &HashMap<String, Iri>,
-) -> Result<Vec<NotExistsFilter>, DarqError> {
-    let mut result = Vec::new();
+) -> Result<(Vec<NotExistsFilter>, Vec<NullCheckFilter>), DarqError> {
+    let mut not_exists = Vec::new();
+    let mut null_checks = Vec::new();
     for filter in filters {
         match filter {
             Filter::NotExists(ggp) => {
+                if let Some(nc) = try_not_exists_rewrite(ggp, schema, outer_var_types) {
+                    null_checks.push(nc);
+                    continue;
+                }
                 match lower_bgp(ggp, schema) {
                     Ok(patterns) => {
-                        result.push(NotExistsFilter { inner_patterns: patterns });
+                        not_exists.push(NotExistsFilter { inner_patterns: patterns });
                     }
                     Err(DarqError::AmbiguousType { ref subject, ref candidates })
                         if candidates.len() > 1 =>
@@ -268,7 +276,7 @@ fn lower_filters(
                         for candidate in &narrowed {
                             let augmented = augment_with_type(ggp, subject, candidate);
                             let patterns = lower_bgp(&augmented, schema)?;
-                            result.push(NotExistsFilter { inner_patterns: patterns });
+                            not_exists.push(NotExistsFilter { inner_patterns: patterns });
                         }
                     }
                     Err(e) => return Err(e),
@@ -276,7 +284,46 @@ fn lower_filters(
             }
         }
     }
-    Ok(result)
+    Ok((not_exists, null_checks))
+}
+
+/// Try to rewrite `FILTER NOT EXISTS {[] pred ?var}` as a null-check on the
+/// outer variable's resource fields, using a schema-registered rewrite.
+fn try_not_exists_rewrite(
+    ggp: &GroupGraphPattern,
+    schema: &Schema,
+    outer_var_types: &HashMap<String, Iri>,
+) -> Option<NullCheckFilter> {
+    if ggp.patterns.len() != 1 || !ggp.filters.is_empty() {
+        return None;
+    }
+    let tp = &ggp.patterns[0];
+
+    // Subject must be anonymous (blank node / [])
+    match &tp.subject {
+        TermOrVariable::Variable(Variable(name)) if name.starts_with("__anon_") => {}
+        _ => return None,
+    }
+
+    // Predicate must be a concrete IRI
+    let pred_iri = match &tp.predicate {
+        TermOrVariable::Iri(iri) => iri,
+        _ => return None,
+    };
+
+    // Object must be a variable with a known type in the outer query
+    let obj_name = match &tp.object {
+        TermOrVariable::Variable(Variable(name)) => name,
+        _ => return None,
+    };
+
+    let obj_type = outer_var_types.get(obj_name)?;
+    let null_fields = schema.not_exists_rewrite(pred_iri, obj_type)?;
+
+    Some(NullCheckFilter {
+        variable: obj_name.clone(),
+        field_names: null_fields.to_vec(),
+    })
 }
 
 /// Narrow ambiguous subject type candidates using known types of variables
@@ -1514,5 +1561,100 @@ mod tests {
 
         assert!(plan_types.contains(&"http://example.org/Child".to_string()));
         assert!(plan_types.contains(&"http://example.org/Sibling".to_string()));
+    }
+
+    #[test]
+    fn test_not_exists_rewrite_to_null_check() {
+        // Schema: Item has "deprecated_by" field and "link" predicate.
+        // Versioner has "is_next_version_of" which is a Reference to Item.
+        // Rewrite: NOT EXISTS {[] isNextVersionOf ?x} on Item → deprecated_by IS NULL.
+        use crate::schema::Resource;
+
+        struct Item {
+            _id: String,
+        }
+        impl Resource for Item {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Item") }
+            fn subject_iri(&self) -> Iri { Iri::new(format!("http://example.org/item/{}", self._id)) }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/link"),
+                        name: "link",
+                        field_type: FieldType::String,
+                        indexed: false,
+                    },
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/deprecatedBy"),
+                        name: "deprecated_by",
+                        field_type: FieldType::Reference(vec![Iri::new("http://example.org/Item")]),
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> { vec!["".into(), "".into()] }
+        }
+
+        struct Versioner {
+            _id: String,
+        }
+        impl Resource for Versioner {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Versioner") }
+            fn subject_iri(&self) -> Iri { Iri::new(format!("http://example.org/ver/{}", self._id)) }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![FieldDescriptor {
+                    predicate: Iri::new("http://example.org/isNextVersionOf"),
+                    name: "is_next_version_of",
+                    field_type: FieldType::Reference(vec![Iri::new("http://example.org/Item")]),
+                    indexed: false,
+                }]
+            }
+            fn field_values(&self) -> Vec<Term> { vec!["".into()] }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Item>();
+        schema.register::<Versioner>();
+        schema.register_not_exists_rewrite(
+            Iri::new("http://example.org/isNextVersionOf"),
+            Iri::new("http://example.org/Item"),
+            vec!["deprecated_by"],
+        );
+
+        // Query: ?x ex:link ?l . FILTER NOT EXISTS {[] ex:isNextVersionOf ?x}
+        let query = SelectQuery {
+            prefixes: vec![],
+            base: None,
+            select: SelectClause::Star,
+            where_pattern: GroupGraphPattern {
+                patterns: vec![TriplePattern {
+                    subject: TermOrVariable::Variable(Variable("x".into())),
+                    predicate: TermOrVariable::Iri(Iri::new("http://example.org/link")),
+                    object: TermOrVariable::Variable(Variable("l".into())),
+                }],
+                filters: vec![Filter::NotExists(GroupGraphPattern {
+                    patterns: vec![TriplePattern {
+                        subject: TermOrVariable::Variable(Variable("__anon_0".into())),
+                        predicate: TermOrVariable::Iri(Iri::new("http://example.org/isNextVersionOf")),
+                        object: TermOrVariable::Variable(Variable("x".into())),
+                    }],
+                    filters: vec![],
+                })],
+            },
+            modifier: SolutionModifier::default(),
+            values: None,
+        };
+
+        let plans = lower(&query, &schema).unwrap();
+        assert_eq!(plans.len(), 1);
+        let plan = &plans[0];
+
+        // Should have no NOT EXISTS filters (rewritten away)
+        assert!(plan.filters.is_empty(), "expected no NOT EXISTS filters, got {:?}", plan.filters);
+
+        // Should have one null-check filter on "x" with field "deprecated_by"
+        assert_eq!(plan.null_checks.len(), 1, "expected 1 null check, got {:?}", plan.null_checks);
+        assert_eq!(plan.null_checks[0].variable, "x");
+        assert_eq!(plan.null_checks[0].field_names, vec!["deprecated_by"]);
     }
 }

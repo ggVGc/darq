@@ -463,6 +463,15 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         where_parts.push(format!("NOT EXISTS ({})", subquery));
     }
 
+    // Null-check filters: emit IS NULL for each field on the variable's table.
+    for nc in &plan.null_checks {
+        if let Some(SqlExpr::Column { pattern_idx, .. }) = join_bindings.get(&nc.variable) {
+            for field in &nc.field_names {
+                where_parts.push(format!("\"p{}\".\"{}\" IS NULL", pattern_idx, field));
+            }
+        }
+    }
+
     // Resolve selected variables (using select_bindings for output).
     let vars = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
@@ -546,6 +555,7 @@ pub fn to_union_sql(
         let inner_plan = QueryPlan {
             patterns: plan.patterns.clone(),
             filters: plan.filters.clone(),
+            null_checks: plan.null_checks.clone(),
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: plan.values.clone(),
@@ -898,6 +908,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -931,6 +942,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -978,6 +990,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1006,6 +1019,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1039,6 +1053,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1074,6 +1089,7 @@ mod tests {
                 offset: Some(5),
             },
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1104,6 +1120,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1147,6 +1164,7 @@ mod tests {
                 offset: None,
             },
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1178,6 +1196,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("p".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1205,6 +1224,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("p".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1239,6 +1259,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("x".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1271,6 +1292,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1336,6 +1358,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("tag".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1363,6 +1386,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("s".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1411,6 +1435,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1456,6 +1481,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1487,6 +1513,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1522,6 +1549,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1609,6 +1637,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1655,6 +1684,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1725,6 +1755,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("pet".into())]),
             modifier: empty_modifier(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1766,6 +1797,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            null_checks: vec![],
             values: None,
         };
 
@@ -1808,6 +1840,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            null_checks: vec![],
             values: None,
         };
 
@@ -1850,6 +1883,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            null_checks: vec![],
             values: None,
         };
 
@@ -1900,6 +1934,7 @@ mod tests {
             ],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            null_checks: vec![],
             values: None,
         };
 
@@ -1949,6 +1984,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            null_checks: vec![],
             values: None,
         };
 
@@ -1992,6 +2028,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            null_checks: vec![],
             values: None,
         };
 
@@ -2031,6 +2068,7 @@ mod tests {
                 ..SolutionModifier::default()
             },
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
         let plan_b = QueryPlan {
@@ -2049,6 +2087,7 @@ mod tests {
                 ..SolutionModifier::default()
             },
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -2061,5 +2100,44 @@ mod tests {
         assert!(sql.contains("LIMIT 10"), "expected LIMIT 10 in:\n{}", sql);
         // Only one LIMIT — subqueries should not have it
         assert_eq!(sql.matches("LIMIT").count(), 1, "expected exactly one LIMIT in:\n{}", sql);
+    }
+
+    #[test]
+    fn test_null_check_filter_generates_is_null() {
+        use crate::ir::NullCheckFilter;
+
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("x".into()),
+                type_iri: Some(Iri::new("http://example.org/Item")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![],
+            null_checks: vec![NullCheckFilter {
+                variable: "x".into(),
+                field_names: vec!["deprecated_by_a".into(), "deprecated_by_b".into()],
+            }],
+            select: SelectClause::Star,
+            modifier: SolutionModifier::default(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
+        assert!(
+            sql.contains("\"p0\".\"deprecated_by_a\" IS NULL"),
+            "expected IS NULL for deprecated_by_a in:\n{}", sql
+        );
+        assert!(
+            sql.contains("\"p0\".\"deprecated_by_b\" IS NULL"),
+            "expected IS NULL for deprecated_by_b in:\n{}", sql
+        );
+        assert!(
+            !sql.contains("NOT EXISTS"),
+            "should not contain NOT EXISTS subquery:\n{}", sql
+        );
     }
 }

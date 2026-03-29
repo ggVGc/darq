@@ -9,6 +9,7 @@
 //! let engine = SqlEngine::new(&executor).with_subject_column("rdf_subject");
 //! ```
 
+use crate::rdf::Iri;
 use crate::schema::{FieldType, Schema};
 
 // ---------------------------------------------------------------------------
@@ -515,5 +516,19 @@ pub fn cpmeta_schema() -> Schema {
     schema.register::<StaticObject>();
     schema.register::<Collection>();
     schema.register::<PlainCollection>();
+
+    // NOT EXISTS rewrites: `FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?x}`
+    // becomes null-checks on the deprecation fields of ?x's type.
+    schema.register_not_exists_rewrite(
+        Iri::new(cpmeta!("isNextVersionOf")),
+        Iri::new(tbl!("ct_static_objects")),
+        vec!["deprecated_by_object", "deprecated_by_collection"],
+    );
+    schema.register_not_exists_rewrite(
+        Iri::new(cpmeta!("isNextVersionOf")),
+        Iri::new(tbl!("ct_collections")),
+        vec!["deprecated_by"],
+    );
+
     schema
 }

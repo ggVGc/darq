@@ -206,6 +206,24 @@ fn evaluate_plan(plan: &QueryPlan, store: &ResourceStore, schema: &Schema) -> Ve
         }
     }
 
+    // Apply null-check filters: retain solutions where the named fields are unset.
+    for nc in &plan.null_checks {
+        solutions.retain(|existing| {
+            let subject_iri = match existing.get(&nc.variable) {
+                Some(Term::Iri(iri)) => iri,
+                _ => return true,
+            };
+            if let Some(instance) = store.find_by_subject(subject_iri) {
+                for field_name in &nc.field_names {
+                    if instance.fields.contains_key(field_name.as_str()) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
+    }
+
     solutions
 }
 

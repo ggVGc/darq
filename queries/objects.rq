@@ -2,10 +2,19 @@ prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
 prefix prov: <http://www.w3.org/ns/prov#>
 prefix xsd: <http://www.w3.org/2001/XMLSchema#>
 prefix geo: <http://www.opengis.net/ont/geosparql#>
-select ?dobj
+select *
 where {
+	?spec cpmeta:hasDataLevel [] .
+	FILTER NOT EXISTS {?spec cpmeta:hasAssociatedProject ?pro . ?pro cpmeta:hasHideFromSearchPolicy true} .
+	?dobj cpmeta:hasObjectSpec ?spec .
+	?dobj cpmeta:hasSizeInBytes ?size .
+	?dobj cpmeta:hasName ?fileName .
 	?dobj cpmeta:wasSubmittedBy ?subm .
+	?dobj cpmeta:wasAcquiredBy ?ac .
+        ?ac prov:startedAtTime ?timeStart .
+	?ac prov:endedAtTime ?timeEnd .
         ?subm prov:endedAtTime ?submTime .
 	FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj}
 }
-limit 1
+order by desc(?submTime)
+offset 0 limit 20

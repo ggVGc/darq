@@ -134,6 +134,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         let full_plan = QueryPlan {
             patterns: plan.patterns.clone(),
             filters: plan.filters.clone(),
+            null_checks: plan.null_checks.clone(),
             select: SelectClause::Star,
             modifier,
             values: plan.values.clone(),
@@ -1324,6 +1325,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1371,6 +1373,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1423,6 +1426,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1492,6 +1496,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1576,6 +1581,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1640,6 +1646,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1727,6 +1734,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("tag".into())]),
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1771,6 +1779,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable("s".into())]),
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1832,6 +1841,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1885,6 +1895,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
@@ -1970,6 +1981,7 @@ mod tests {
                 offset: None,
             },
             filters: vec![],
+            null_checks: vec![],
             values: None,
         };
 
