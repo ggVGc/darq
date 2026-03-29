@@ -15,9 +15,7 @@ pub fn expand_prefixes(query: &mut SelectQuery) -> Result<(), DarqError> {
         .map(|p| (p.prefix.as_str(), p.iri.0.as_str()))
         .collect();
 
-    for pattern in &mut query.where_pattern.patterns {
-        expand_pattern(&prefix_map, pattern)?;
-    }
+    expand_ggp(&prefix_map, &mut query.where_pattern)?;
 
     if let Some(ref mut vc) = query.values {
         for row in &mut vc.bindings {
@@ -27,6 +25,21 @@ pub fn expand_prefixes(query: &mut SelectQuery) -> Result<(), DarqError> {
         }
     }
 
+    Ok(())
+}
+
+fn expand_ggp(
+    prefix_map: &HashMap<&str, &str>,
+    ggp: &mut ast::GroupGraphPattern,
+) -> Result<(), DarqError> {
+    for pattern in &mut ggp.patterns {
+        expand_pattern(prefix_map, pattern)?;
+    }
+    for filter in &mut ggp.filters {
+        match filter {
+            ast::Filter::NotExists(inner) => expand_ggp(prefix_map, inner)?,
+        }
+    }
     Ok(())
 }
 

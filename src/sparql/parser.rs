@@ -6,11 +6,12 @@ use super::ast::*;
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    blank_counter: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Parser { input, pos: 0 }
+        Parser { input, pos: 0, blank_counter: 0 }
     }
 
     fn remaining(&self) -> &'a str {
@@ -135,6 +136,13 @@ impl<'a> Parser<'a> {
             remaining
         };
         DarqError::ParseError(format!("{} at: {:?}", msg, context))
+    }
+
+    /// Generate a fresh anonymous variable for blank nodes (`[]`).
+    fn fresh_blank_variable(&mut self) -> Variable {
+        let name = format!("__anon_{}", self.blank_counter);
+        self.blank_counter += 1;
+        Variable(name)
     }
 }
 
@@ -273,53 +281,54 @@ fn parse_where_clause(p: &mut Parser) -> Result<GroupGraphPattern, DarqError> {
 
 fn parse_group_graph_pattern(p: &mut Parser) -> Result<GroupGraphPattern, DarqError> {
     p.expect_char('{')?;
-    p.skip_ws();
-    let patterns = parse_triples_block(p)?;
-    p.skip_ws();
-    p.expect_char('}')?;
-    Ok(GroupGraphPattern { patterns })
-}
+    let mut patterns = Vec::new();
+    let mut filters = Vec::new();
 
-// ---------------------------------------------------------------------------
-// Triples block
-// ---------------------------------------------------------------------------
-
-fn parse_triples_block(p: &mut Parser) -> Result<Vec<TriplePattern>, DarqError> {
-    let mut all_patterns = Vec::new();
-
-    // Try to parse the first triple group
-    let saved = p.save();
-    match parse_triples_same_subject(p) {
-        Ok(patterns) => {
-            all_patterns.extend(patterns);
-        }
-        Err(_) => {
-            p.restore(saved);
-            return Ok(all_patterns);
-        }
-    }
-
-    // Parse subsequent '. TriplesSameSubject' groups
     loop {
         p.skip_ws();
-        if !p.try_char('.') {
-            break;
+        // Try FILTER
+        let saved = p.save();
+        if p.try_keyword("FILTER") {
+            p.skip_ws();
+            filters.push(parse_filter(p)?);
+            p.skip_ws();
+            p.try_char('.');
+            continue;
         }
-        p.skip_ws();
-        // After a dot, there might be another triple group or the closing '}'
+        p.restore(saved);
+
+        // Try triples
         let saved = p.save();
         match parse_triples_same_subject(p) {
-            Ok(patterns) => all_patterns.extend(patterns),
+            Ok(pats) => {
+                patterns.extend(pats);
+                p.skip_ws();
+                p.try_char('.');
+            }
             Err(_) => {
-                // Trailing dot is fine
                 p.restore(saved);
                 break;
             }
         }
     }
 
-    Ok(all_patterns)
+    p.skip_ws();
+    p.expect_char('}')?;
+    Ok(GroupGraphPattern { patterns, filters })
 }
+
+fn parse_filter(p: &mut Parser) -> Result<Filter, DarqError> {
+    p.expect_keyword("NOT")?;
+    p.expect_ws()?;
+    p.expect_keyword("EXISTS")?;
+    p.skip_ws();
+    let inner = parse_group_graph_pattern(p)?;
+    Ok(Filter::NotExists(inner))
+}
+
+// ---------------------------------------------------------------------------
+// Triples block
+// ---------------------------------------------------------------------------
 
 /// Parse subject + property-list, desugaring ';' and ',' into flat triple patterns.
 fn parse_triples_same_subject(p: &mut Parser) -> Result<Vec<TriplePattern>, DarqError> {
@@ -676,6 +685,16 @@ fn parse_usize(p: &mut Parser) -> Result<usize, DarqError> {
 // ---------------------------------------------------------------------------
 
 fn parse_term_or_variable(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
+    // Blank node: []
+    if p.peek() == Some('[') {
+        let saved = p.save();
+        p.advance(1);
+        p.skip_ws();
+        if p.try_char(']') {
+            return Ok(TermOrVariable::Variable(p.fresh_blank_variable()));
+        }
+        p.restore(saved);
+    }
     // Variable: ?x or $x
     if let Some(c) = p.peek() {
         if c == '?' || c == '$' {
@@ -1070,5 +1089,80 @@ mod tests {
         let vc = q.values.as_ref().unwrap();
         assert_eq!(vc.variables.len(), 1);
         assert!(vc.bindings.is_empty());
+    }
+
+    #[test]
+    fn test_blank_node_subject() {
+        let q = parse("SELECT * WHERE { [] ?p ?o }").unwrap();
+        assert_eq!(q.where_pattern.patterns.len(), 1);
+        match &q.where_pattern.patterns[0].subject {
+            TermOrVariable::Variable(Variable(name)) => {
+                assert!(name.starts_with("__anon_"));
+            }
+            other => panic!("expected anonymous variable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_filter_not_exists() {
+        let q = parse(
+            "SELECT * WHERE { ?s ?p ?o . FILTER NOT EXISTS { ?x <http://example.org/r> ?s } }",
+        )
+        .unwrap();
+        assert_eq!(q.where_pattern.patterns.len(), 1);
+        assert_eq!(q.where_pattern.filters.len(), 1);
+        match &q.where_pattern.filters[0] {
+            Filter::NotExists(inner) => {
+                assert_eq!(inner.patterns.len(), 1);
+                assert!(matches!(
+                    &inner.patterns[0].subject,
+                    TermOrVariable::Variable(Variable(v)) if v == "x"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_not_exists_with_blank_node() {
+        let q = parse(
+            "SELECT * WHERE { ?dobj ?p ?o . FILTER NOT EXISTS { [] <http://example.org/next> ?dobj } }",
+        )
+        .unwrap();
+        assert_eq!(q.where_pattern.patterns.len(), 1);
+        assert_eq!(q.where_pattern.filters.len(), 1);
+        match &q.where_pattern.filters[0] {
+            Filter::NotExists(inner) => {
+                assert_eq!(inner.patterns.len(), 1);
+                // Subject is anonymous
+                match &inner.patterns[0].subject {
+                    TermOrVariable::Variable(Variable(name)) => {
+                        assert!(name.starts_with("__anon_"));
+                    }
+                    other => panic!("expected anonymous variable, got {:?}", other),
+                }
+                // Object is ?dobj (shared with outer)
+                assert!(matches!(
+                    &inner.patterns[0].object,
+                    TermOrVariable::Variable(Variable(v)) if v == "dobj"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_not_exists_no_dot_before() {
+        // FILTER can appear without a dot before it
+        let q = parse(
+            "SELECT * WHERE { ?s ?p ?o FILTER NOT EXISTS { ?x <http://example.org/r> ?s } }",
+        );
+        // This should fail because there's no dot between the triple and FILTER
+        // and `FILTER` is not a valid verb/object — but the parser might handle
+        // it if FILTER appears after the property list. Let's check:
+        // Actually, the triples_same_subject will consume `?s ?p ?o` then the
+        // loop tries to read `.` — doesn't find it, breaks, then tries FILTER.
+        // Wait, the loop in parse_group_graph_pattern tries triples_same_subject
+        // first. It consumes `?s ?p ?o`, then the dot check. No dot found after `?o`,
+        // so it doesn't consume a dot. Then the loop continues, tries FILTER keyword.
+        assert!(q.is_ok());
     }
 }

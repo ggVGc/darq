@@ -178,7 +178,102 @@ fn evaluate_plan(plan: &QueryPlan, store: &ResourceStore, schema: &Schema) -> Ve
         solutions = join_with_values(solutions, values);
     }
 
+    // Apply NOT EXISTS filters
+    for filter in &plan.filters {
+        solutions.retain(|existing| {
+            !inner_pattern_matches(existing, &filter.inner_patterns, store, schema)
+        });
+    }
+
     solutions
+}
+
+/// Check if inner NOT EXISTS patterns produce any matches starting from an outer binding.
+fn inner_pattern_matches(
+    existing: &Binding,
+    inner_patterns: &[QueryPattern],
+    store: &ResourceStore,
+    schema: &Schema,
+) -> bool {
+    let mut solutions: Vec<Binding> = vec![existing.clone()];
+
+    for pattern in inner_patterns {
+        let mut next = Vec::new();
+        for sol in &solutions {
+            match pattern {
+                QueryPattern::Resource {
+                    subject,
+                    type_iri,
+                    constraints,
+                    type_variable,
+                } => {
+                    let instances: Vec<_> = match type_iri {
+                        Some(ti) => store.instances_of(ti).iter().collect(),
+                        None => store.all_instances().collect(),
+                    };
+                    for instance in instances {
+                        if let Some(binding) = match_resource(
+                            subject,
+                            constraints,
+                            type_variable.as_deref(),
+                            instance,
+                            sol,
+                        ) {
+                            let mut merged = sol.clone();
+                            merged.extend(binding);
+                            next.push(merged);
+                        }
+                    }
+                }
+                QueryPattern::FieldScan {
+                    subject,
+                    predicate_var,
+                    object,
+                    type_iri,
+                } => {
+                    let instances: Vec<_> = match type_iri {
+                        Some(ti) => store.instances_of(ti).iter().collect(),
+                        None => store.all_instances().collect(),
+                    };
+                    for instance in instances {
+                        let subject_binding =
+                            match check_subject(subject, &instance.subject, sol) {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                        let fields_for_type =
+                            schema.fields_for_type(&instance.type_iri).unwrap_or(&[]);
+                        for fd in fields_for_type {
+                            if let Some(field_value) = instance.fields.get(fd.name) {
+                                let pred_term = Term::Iri(fd.predicate.clone());
+                                if let Some(obj_binding) =
+                                    check_value(object, field_value, sol, &subject_binding)
+                                {
+                                    let mut merged = sol.clone();
+                                    merged.extend(subject_binding.clone());
+                                    if check_and_bind_var(
+                                        predicate_var,
+                                        &pred_term,
+                                        sol,
+                                        &mut merged,
+                                    ) {
+                                        merged.extend(obj_binding);
+                                        next.push(merged);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        solutions = next;
+        if solutions.is_empty() {
+            return false;
+        }
+    }
+
+    !solutions.is_empty()
 }
 
 /// Join existing solutions with inline VALUES data.
@@ -575,5 +670,73 @@ mod tests {
             Some(Term::Literal(Literal::String("Bob".into())))
         );
         assert_eq!(result.rows[1][1], Some(Term::Literal(Literal::Integer(25))));
+    }
+
+    #[test]
+    fn test_filter_not_exists_basic() {
+        // Setup: Alice age 30, Bob age 25
+        // Query: SELECT people who do NOT have age 30
+        // FILTER NOT EXISTS { ?p ex:age 30 }
+        // This should only return Bob
+        let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
+        let result = execute(
+            "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name . FILTER NOT EXISTS { ?p ex:age 30 } } ORDER BY ?name",
+            &schema,
+            &engine,
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0][0],
+            Some(Term::Literal(Literal::String("Bob".into())))
+        );
+    }
+
+    #[test]
+    fn test_filter_not_exists_no_match() {
+        // FILTER NOT EXISTS with a condition that matches nobody → all results returned
+        let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
+        let result = execute(
+            "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name . FILTER NOT EXISTS { ?p ex:age 999 } } ORDER BY ?name",
+            &schema,
+            &engine,
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_not_exists_all_match() {
+        // FILTER NOT EXISTS where the inner pattern always matches → no results
+        let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
+        let result = execute(
+            "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name . FILTER NOT EXISTS { ?p ex:name ?name } }",
+            &schema,
+            &engine,
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_not_exists_with_blank_node() {
+        // Use [] blank node in inner pattern
+        // "Give me people where no other person has the same name"
+        // Since Alice and Bob have unique names, both should be returned.
+        // Actually, the blank node [] will match the person themselves too.
+        // [] ex:name ?name means "exists something with this name" — always true.
+        // So this should return 0 results.
+        let (schema, store) = setup();
+        let engine = InMemoryEngine::new(&store);
+        let result = execute(
+            "PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?p ex:name ?name . FILTER NOT EXISTS { [] ex:name ?name } }",
+            &schema,
+            &engine,
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 0);
     }
 }

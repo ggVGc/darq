@@ -60,10 +60,17 @@ pub struct InlineData {
     pub rows: Vec<InlineRow>,
 }
 
+/// A NOT EXISTS filter: inner patterns that must NOT produce matches.
+#[derive(Debug, Clone)]
+pub struct NotExistsFilter {
+    pub inner_patterns: Vec<QueryPattern>,
+}
+
 /// A complete resource-level query plan, lowered from SPARQL AST.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub patterns: Vec<QueryPattern>,
+    pub filters: Vec<NotExistsFilter>,
     pub select: SelectClause,
     pub modifier: SolutionModifier,
     pub values: Option<InlineData>,
@@ -175,6 +182,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -195,6 +203,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -224,6 +233,7 @@ mod tests {
             ],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -255,6 +265,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -268,6 +279,7 @@ mod tests {
             patterns: vec![],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 

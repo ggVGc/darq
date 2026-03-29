@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::DarqError;
-use crate::ir::{QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term};
 use crate::schema::Schema;
 use crate::sparql::ast::{OrderDirection, SelectClause};
@@ -416,6 +416,14 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         }
     }
 
+    // NOT EXISTS filters → correlated subqueries.
+    for (fi, filter) in plan.filters.iter().enumerate() {
+        let subquery = generate_not_exists_subquery(
+            filter, fi, schema, subject_column, id_column, &join_bindings,
+        )?;
+        where_parts.push(format!("NOT EXISTS ({})", subquery));
+    }
+
     // Resolve selected variables (using select_bindings for output).
     let vars = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
@@ -506,6 +514,171 @@ pub(crate) fn sql_literal(term: &Term) -> String {
     }
 }
 
+/// Generate a correlated NOT EXISTS subquery from a filter's inner patterns.
+fn generate_not_exists_subquery(
+    filter: &NotExistsFilter,
+    filter_idx: usize,
+    schema: &Schema,
+    subject_column: &str,
+    id_column: &str,
+    outer_bindings: &HashMap<String, SqlExpr>,
+) -> Result<String, DarqError> {
+    let mut inner_from: Vec<String> = Vec::new();
+    let mut inner_where: Vec<String> = Vec::new();
+    let mut inner_bindings: HashMap<String, SqlExpr> = HashMap::new();
+
+    for (i, pattern) in filter.inner_patterns.iter().enumerate() {
+        let alias = format!("_ne{}_{}", filter_idx, i);
+
+        match pattern {
+            QueryPattern::Resource {
+                subject,
+                type_iri,
+                constraints,
+                ..
+            } => {
+                let source = if let Some(ti) = type_iri {
+                    let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
+                    format!("\"{}\"", tbl)
+                } else {
+                    return Err(DarqError::SqlError(
+                        "NOT EXISTS inner pattern requires a known type".into(),
+                    ));
+                };
+
+                let mut join_conds: Vec<String> = Vec::new();
+
+                // Subject binding/correlation.
+                match subject {
+                    Subject::Variable(v) => {
+                        if let Some(outer_expr) = outer_bindings.get(v) {
+                            // Correlate with outer query
+                            join_conds.push(format!(
+                                "\"{}\".\"{}\" = {}",
+                                alias, id_column, outer_expr.to_sql()
+                            ));
+                        } else if let Some(inner_expr) = inner_bindings.get(v) {
+                            join_conds.push(format!(
+                                "\"{}\".\"{}\" = {}",
+                                alias, id_column, inner_expr.to_sql()
+                            ));
+                        } else {
+                            inner_bindings.insert(
+                                v.clone(),
+                                SqlExpr::Column {
+                                    pattern_idx: i,
+                                    column: id_column.to_string(),
+                                },
+                            );
+                        }
+                    }
+                    Subject::Bound(iri) => {
+                        inner_where.push(format!(
+                            "\"{}\".\"{}\" = '{}'",
+                            alias, subject_column, iri.0
+                        ));
+                    }
+                }
+
+                // Field constraints.
+                let fields = type_iri
+                    .as_ref()
+                    .and_then(|ti| schema.fields_for_type(ti));
+
+                for c in constraints {
+                    let is_array = fields
+                        .map(|fs| {
+                            fs.iter().any(|f| {
+                                f.name == c.field_name
+                                    && matches!(f.field_type, crate::schema::FieldType::StringArray)
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    match &c.value {
+                        Value::Variable(v) => {
+                            // Check outer bindings first (correlation), then inner
+                            if let Some(outer_expr) = outer_bindings.get(v) {
+                                if is_array {
+                                    join_conds.push(format!(
+                                        "{} = ANY(\"{}\".\"{}\")",
+                                        outer_expr.to_sql(), alias, c.field_name,
+                                    ));
+                                } else {
+                                    join_conds.push(format!(
+                                        "\"{}\".\"{}\" = {}",
+                                        alias, c.field_name, outer_expr.to_sql()
+                                    ));
+                                }
+                            } else if let Some(inner_expr) = inner_bindings.get(v) {
+                                if is_array {
+                                    join_conds.push(format!(
+                                        "{} = ANY(\"{}\".\"{}\")",
+                                        inner_expr.to_sql(), alias, c.field_name,
+                                    ));
+                                } else {
+                                    join_conds.push(format!(
+                                        "\"{}\".\"{}\" = {}",
+                                        alias, c.field_name, inner_expr.to_sql()
+                                    ));
+                                }
+                            } else {
+                                // New inner binding
+                                let col_ref = format!("\"{}\".\"{}\"", alias, c.field_name);
+                                inner_bindings.insert(
+                                    v.clone(),
+                                    SqlExpr::Constant(col_ref),
+                                );
+                            }
+                        }
+                        Value::Bound(term) => {
+                            if is_array {
+                                inner_where.push(format!(
+                                    "{} = ANY(\"{}\".\"{}\")",
+                                    sql_literal(term), alias, c.field_name
+                                ));
+                            } else {
+                                inner_where.push(format!(
+                                    "\"{}\".\"{}\" = {}",
+                                    alias, c.field_name, sql_literal(term)
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Build FROM/JOIN for inner query using same pattern as outer.
+                if inner_from.is_empty() {
+                    inner_from.push(format!("{} AS \"{}\"", source, alias));
+                    inner_where.extend(join_conds);
+                } else if join_conds.is_empty() {
+                    inner_from.push(format!("CROSS JOIN {} AS \"{}\"", source, alias));
+                } else {
+                    inner_from.push(format!(
+                        "INNER JOIN {} AS \"{}\" ON {}",
+                        source, alias, join_conds.join(" AND ")
+                    ));
+                }
+            }
+
+            QueryPattern::FieldScan { .. } => {
+                return Err(DarqError::SqlError(
+                    "FieldScan not supported in NOT EXISTS subquery".into(),
+                ));
+            }
+        }
+    }
+
+    let mut sql = "SELECT 1".to_string();
+    if !inner_from.is_empty() {
+        sql.push_str(&format!(" FROM {}", inner_from.join("\n")));
+    }
+    if !inner_where.is_empty() {
+        sql.push_str(&format!(" WHERE {}", inner_where.join(" AND ")));
+    }
+    Ok(sql)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +713,7 @@ mod tests {
                 Variable("age".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -572,6 +746,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -618,6 +793,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -645,6 +821,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -677,6 +854,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -711,6 +889,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(5),
             },
+            filters: vec![],
             values: None,
         };
 
@@ -740,6 +919,7 @@ mod tests {
                 Variable("type".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -782,6 +962,7 @@ mod tests {
                 limit: Some(1),
                 offset: None,
             },
+            filters: vec![],
             values: None,
         };
 
@@ -812,6 +993,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("p".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -838,6 +1020,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("p".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -871,6 +1054,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("x".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -902,6 +1086,7 @@ mod tests {
                 Variable("p".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -966,6 +1151,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("tag".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -992,6 +1178,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("s".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1039,6 +1226,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1083,6 +1271,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1113,6 +1302,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("name".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1147,6 +1337,7 @@ mod tests {
             }],
             select: SelectClause::Star,
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1233,6 +1424,7 @@ mod tests {
                 Variable("pet".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1278,6 +1470,7 @@ mod tests {
                 Variable("dname".into()),
             ]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1347,6 +1540,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable("pet".into())]),
             modifier: empty_modifier(),
+            filters: vec![],
             values: None,
         };
 
@@ -1358,6 +1552,90 @@ mod tests {
              LEFT JOIN \"Cat\" AS \"_ref0\" ON \"_ref0\".\"id\" = \"p0\".\"pet\"\n\
              LEFT JOIN \"Dog\" AS \"_ref1\" ON \"_ref1\".\"id\" = \"p0\".\"pet\"\n\
              WHERE \"p0\".\"pet\" IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn test_not_exists_simple() {
+        // Outer: ?p a Person, ?p name ?name
+        // Filter: NOT EXISTS { ?p age 30 }
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![NotExistsFilter {
+                inner_patterns: vec![QueryPattern::Resource {
+                    subject: Subject::Variable("p".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "age".into(),
+                        value: Value::Bound(Term::Literal(Literal::Integer(30))),
+                    }],
+                    type_variable: None,
+                }],
+            }],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"name\" AS \"name\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \
+             NOT EXISTS (SELECT 1 FROM \"Person\" AS \"_ne0_0\" \
+             WHERE \"_ne0_0\".\"age\" = 30 AND \
+             \"_ne0_0\".\"_subject\" = \"p0\".\"_subject\")"
+        );
+    }
+
+    #[test]
+    fn test_not_exists_with_correlated_field() {
+        // Outer: ?dobj a Person, ?dobj name ?name
+        // Filter: NOT EXISTS { ?x a Person, ?x age ?name } (correlate on ?name)
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("dobj".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![NotExistsFilter {
+                inner_patterns: vec![QueryPattern::Resource {
+                    subject: Subject::Variable("x".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "name".into(),
+                        value: Value::Variable("name".into()),
+                    }],
+                    type_variable: None,
+                }],
+            }],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
+        // The inner subquery should correlate ?name with the outer binding
+        assert_eq!(
+            sql,
+            "SELECT \"p0\".\"name\" AS \"name\"\n\
+             FROM \"Person\" AS \"p0\"\n\
+             WHERE \"p0\".\"name\" IS NOT NULL AND \
+             NOT EXISTS (SELECT 1 FROM \"Person\" AS \"_ne0_0\" \
+             WHERE \"_ne0_0\".\"name\" = \"p0\".\"name\")"
         );
     }
 

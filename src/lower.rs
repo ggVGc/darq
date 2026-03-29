@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, InlineData, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::Schema;
 use crate::sparql::ast::*;
@@ -11,8 +11,10 @@ use crate::sparql::ast::*;
 pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<QueryPlan, DarqError> {
     let patterns = lower_bgp(&query.where_pattern, schema)?;
     let values = query.values.as_ref().map(lower_values_clause);
+    let filters = lower_filters(&query.where_pattern.filters, schema)?;
     Ok(QueryPlan {
         patterns,
+        filters,
         select: query.select.clone(),
         modifier: query.modifier.clone(),
         values,
@@ -37,6 +39,51 @@ fn data_block_value_to_term(val: &DataBlockValue) -> Option<Term> {
         DataBlockValue::PrefixedName { .. } => {
             unreachable!("prefixed names should be expanded before lowering")
         }
+    }
+}
+
+/// Lower FILTER NOT EXISTS clauses into NotExistsFilters.
+/// When the inner pattern has an ambiguous type, produce one filter per candidate type.
+fn lower_filters(
+    filters: &[Filter],
+    schema: &Schema,
+) -> Result<Vec<NotExistsFilter>, DarqError> {
+    let mut result = Vec::new();
+    for filter in filters {
+        match filter {
+            Filter::NotExists(ggp) => {
+                match lower_bgp(ggp, schema) {
+                    Ok(patterns) => {
+                        result.push(NotExistsFilter { inner_patterns: patterns });
+                    }
+                    Err(DarqError::AmbiguousType { ref subject, ref candidates })
+                        if candidates.len() > 1 =>
+                    {
+                        for candidate in candidates {
+                            let augmented = augment_with_type(ggp, subject, candidate);
+                            let patterns = lower_bgp(&augmented, schema)?;
+                            result.push(NotExistsFilter { inner_patterns: patterns });
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Prepend `?subject a <type_iri>` to a GGP to disambiguate the subject's type.
+fn augment_with_type(ggp: &GroupGraphPattern, subject_name: &str, type_iri: &Iri) -> GroupGraphPattern {
+    let mut patterns = vec![TriplePattern {
+        subject: TermOrVariable::Variable(Variable(subject_name.to_string())),
+        predicate: TermOrVariable::RdfType,
+        object: TermOrVariable::Iri(type_iri.clone()),
+    }];
+    patterns.extend(ggp.patterns.clone());
+    GroupGraphPattern {
+        patterns,
+        filters: ggp.filters.clone(),
     }
 }
 
@@ -411,7 +458,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("age".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -446,7 +494,8 @@ mod tests {
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
                 object: TermOrVariable::Variable(Variable("name".into())),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -469,7 +518,8 @@ mod tests {
                 predicate: TermOrVariable::Variable(Variable("p".into())),
                 object: TermOrVariable::Variable(Variable("o".into())),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -507,7 +557,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("o".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 2);
@@ -533,7 +584,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("name".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -564,7 +616,8 @@ mod tests {
                 predicate: TermOrVariable::RdfType,
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Unknown")),
             }],
-        };
+        filters: vec![],
+            };
 
         let err = lower_bgp(&bgp, &schema).unwrap_err();
         assert!(matches!(err, DarqError::UnknownType(_)));
@@ -583,7 +636,8 @@ mod tests {
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
                 object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -637,7 +691,8 @@ mod tests {
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/owner")),
                 object: TermOrVariable::Iri(Iri::new("http://example.org/person/bob")),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -664,7 +719,8 @@ mod tests {
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
                 object: TermOrVariable::Variable(Variable("name".into())),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -701,7 +757,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("age".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 2);
@@ -748,7 +805,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("a".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 2);
@@ -787,7 +845,8 @@ mod tests {
                 predicate: TermOrVariable::RdfType,
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -812,7 +871,8 @@ mod tests {
                 predicate: TermOrVariable::RdfType,
                 object: TermOrVariable::Variable(Variable("type".into())),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -837,7 +897,8 @@ mod tests {
                 predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -863,7 +924,8 @@ mod tests {
                 predicate: TermOrVariable::Variable(Variable("p".into())),
                 object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
             }],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -900,7 +962,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("name".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert_eq!(patterns.len(), 1);
@@ -925,7 +988,7 @@ mod tests {
     fn test_lower_empty_bgp() {
         let schema = test_schema();
 
-        let bgp = GroupGraphPattern { patterns: vec![] };
+        let bgp = GroupGraphPattern { patterns: vec![], filters: vec![] };
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert!(patterns.is_empty());
     }
@@ -1003,7 +1066,8 @@ mod tests {
                     object: TermOrVariable::Variable(Variable("ts".into())),
                 },
             ],
-        };
+        filters: vec![],
+            };
 
         // The reference constraint from hasChild should disambiguate ?child to Child,
         // even though ex:timestamp alone is ambiguous (Child vs Sibling).

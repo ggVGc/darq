@@ -83,11 +83,23 @@ pub fn execute(
 
 /// Validate that all concrete predicates in the query are known to the schema.
 fn validate_predicates(query: &SelectQuery, schema: &Schema) -> Result<(), DarqError> {
-    for pattern in &query.where_pattern.patterns {
+    validate_predicates_in_ggp(&query.where_pattern, schema)
+}
+
+fn validate_predicates_in_ggp(
+    ggp: &GroupGraphPattern,
+    schema: &Schema,
+) -> Result<(), DarqError> {
+    for pattern in &ggp.patterns {
         if let TermOrVariable::Iri(iri) = &pattern.predicate {
             if !schema.is_known_predicate(iri) {
                 return Err(DarqError::UnknownPredicate(iri.clone()));
             }
+        }
+    }
+    for filter in &ggp.filters {
+        match filter {
+            Filter::NotExists(inner) => validate_predicates_in_ggp(inner, schema)?,
         }
     }
     Ok(())

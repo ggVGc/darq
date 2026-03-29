@@ -28,6 +28,12 @@ pub struct Variable(pub String); // name without ? or $
 #[derive(Debug, Clone)]
 pub struct GroupGraphPattern {
     pub patterns: Vec<TriplePattern>,
+    pub filters: Vec<Filter>,
+}
+
+#[derive(Debug, Clone)]
+pub enum Filter {
+    NotExists(GroupGraphPattern),
 }
 
 #[derive(Debug, Clone)]
