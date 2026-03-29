@@ -416,10 +416,49 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         }
     }
 
-    // NOT EXISTS filters → correlated subqueries.
+    // NOT EXISTS filters: try decorrelation for anonymous-subject patterns,
+    // fall back to correlated subqueries otherwise.
+    let mut decorrelated_groups: HashMap<String, Vec<DecorrelatedAntiJoin>> = HashMap::new();
+    let mut correlated_filters: Vec<(usize, &NotExistsFilter)> = Vec::new();
+
     for (fi, filter) in plan.filters.iter().enumerate() {
+        if let Some(aj) = try_decorrelate_not_exists(filter, schema, id_column, &join_bindings) {
+            decorrelated_groups
+                .entry(aj.outer_variable.clone())
+                .or_default()
+                .push(aj);
+        } else {
+            correlated_filters.push((fi, filter));
+        }
+    }
+
+    // Emit combined NOT IN clauses for decorrelated groups.
+    for anti_joins in decorrelated_groups.values() {
+        let outer_expr = anti_joins[0].outer_expr.to_sql();
+        let subqueries: Vec<String> = anti_joins
+            .iter()
+            .map(|aj| {
+                if aj.is_array {
+                    format!(
+                        "SELECT _elem FROM \"{}\", unnest(\"{}\") AS _elem WHERE _elem IS NOT NULL",
+                        aj.table_name, aj.field_column
+                    )
+                } else {
+                    format!(
+                        "SELECT \"{}\" FROM \"{}\" WHERE \"{}\" IS NOT NULL",
+                        aj.field_column, aj.table_name, aj.field_column
+                    )
+                }
+            })
+            .collect();
+        let combined = subqueries.join(" UNION ALL ");
+        where_parts.push(format!("{} NOT IN ({})", outer_expr, combined));
+    }
+
+    // Emit correlated NOT EXISTS for non-decorrelatable filters.
+    for (fi, filter) in &correlated_filters {
         let subquery = generate_not_exists_subquery(
-            filter, fi, schema, subject_column, id_column, &join_bindings,
+            filter, *fi, schema, subject_column, id_column, &join_bindings,
         )?;
         where_parts.push(format!("NOT EXISTS ({})", subquery));
     }
@@ -572,6 +611,90 @@ pub(crate) fn sql_literal(term: &Term) -> String {
             Literal::Date(s) => format!("'{}'", s.replace('\'', "''")),
             Literal::DateTime(s) => format!("'{}'", s.replace('\'', "''")),
         },
+    }
+}
+
+/// Information for a decorrelated NOT IN anti-join.
+struct DecorrelatedAntiJoin {
+    /// The outer variable being excluded (e.g., "dobj").
+    outer_variable: String,
+    /// The SQL expression for the outer variable from join_bindings.
+    outer_expr: SqlExpr,
+    /// The inner table to scan.
+    table_name: String,
+    /// The field column containing the referenced IDs.
+    field_column: String,
+    /// Whether the field is an array (ReferenceArray) or scalar (Reference).
+    is_array: bool,
+}
+
+/// Try to decorrelate a NOT EXISTS filter into a NOT IN anti-join.
+///
+/// A filter is decorrelatable when:
+/// 1. It has exactly one inner Resource pattern.
+/// 2. The inner subject is a variable NOT in outer bindings (anonymous/fresh).
+/// 3. There is exactly one field constraint whose value is a variable in outer bindings.
+/// 4. The type is known (Some).
+fn try_decorrelate_not_exists(
+    filter: &NotExistsFilter,
+    schema: &Schema,
+    _id_column: &str,
+    outer_bindings: &HashMap<String, SqlExpr>,
+) -> Option<DecorrelatedAntiJoin> {
+    if filter.inner_patterns.len() != 1 {
+        return None;
+    }
+
+    match &filter.inner_patterns[0] {
+        QueryPattern::Resource {
+            subject,
+            type_iri: Some(ti),
+            constraints,
+            ..
+        } => {
+            // Subject must NOT be in outer bindings (anonymous/uncorrelated).
+            match subject {
+                Subject::Variable(v) if !outer_bindings.contains_key(v) => {}
+                _ => return None,
+            }
+
+            // Must have exactly one constraint with a correlated variable.
+            if constraints.len() != 1 {
+                return None;
+            }
+            let c = &constraints[0];
+            let outer_var = match &c.value {
+                Value::Variable(v) if outer_bindings.contains_key(v) => v.clone(),
+                _ => return None,
+            };
+
+            let outer_expr = outer_bindings.get(&outer_var)?.clone();
+            let table_name = schema
+                .table_name(ti)
+                .unwrap_or_else(|| iri_local_name(ti))
+                .to_string();
+
+            let is_array = schema
+                .fields_for_type(ti)
+                .and_then(|fields| fields.iter().find(|f| f.name == c.field_name))
+                .map(|f| {
+                    matches!(
+                        f.field_type,
+                        crate::schema::FieldType::StringArray
+                            | crate::schema::FieldType::ReferenceArray(_)
+                    )
+                })
+                .unwrap_or(false);
+
+            Some(DecorrelatedAntiJoin {
+                outer_variable: outer_var,
+                outer_expr,
+                table_name,
+                field_column: c.field_name.clone(),
+                is_array,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -1689,14 +1812,194 @@ mod tests {
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
-        // The inner subquery should correlate ?name with the outer binding
+        // Inner subject ?x is not in outer bindings → decorrelated to NOT IN
         assert_eq!(
             sql,
             "SELECT \"p0\".\"name\" AS \"name\"\n\
              FROM \"Person\" AS \"p0\"\n\
              WHERE \"p0\".\"name\" IS NOT NULL AND \
-             NOT EXISTS (SELECT 1 FROM \"Person\" AS \"_ne0_0\" \
-             WHERE \"_ne0_0\".\"name\" = \"p0\".\"name\")"
+             \"p0\".\"name\" NOT IN (\
+             SELECT \"name\" FROM \"Person\" WHERE \"name\" IS NOT NULL)"
+        );
+    }
+
+    #[test]
+    fn test_not_exists_decorrelated_array() {
+        // Anonymous subject with StringArray field → decorrelated NOT IN with unnest.
+        let schema = schema_with_array();
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("s".into()),
+                type_iri: Some(Iri::new("http://example.org/Instrument")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![NotExistsFilter {
+                inner_patterns: vec![QueryPattern::Resource {
+                    subject: Subject::Variable("__anon_0".into()),
+                    type_iri: Some(Iri::new("http://example.org/Instrument")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "tags".into(),
+                        value: Value::Variable("s".into()),
+                    }],
+                    type_variable: None,
+                }],
+            }],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &schema, "_subject", "_id").unwrap();
+        assert!(
+            sql.contains("\"p0\".\"_id\" NOT IN (SELECT _elem FROM \"Instrument\", unnest(\"tags\") AS _elem WHERE _elem IS NOT NULL)"),
+            "Should decorrelate array NOT EXISTS to NOT IN with unnest: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_not_exists_decorrelated_combined() {
+        // Two decorrelatable filters on the same outer variable → single NOT IN with UNION ALL.
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("dobj".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![
+                NotExistsFilter {
+                    inner_patterns: vec![QueryPattern::Resource {
+                        subject: Subject::Variable("__anon_0".into()),
+                        type_iri: Some(Iri::new("http://example.org/Person")),
+                        constraints: vec![FieldConstraint {
+                            field_name: "age".into(),
+                            value: Value::Variable("dobj".into()),
+                        }],
+                        type_variable: None,
+                    }],
+                },
+                NotExistsFilter {
+                    inner_patterns: vec![QueryPattern::Resource {
+                        subject: Subject::Variable("__anon_1".into()),
+                        type_iri: Some(Iri::new("http://example.org/Person")),
+                        constraints: vec![FieldConstraint {
+                            field_name: "name".into(),
+                            value: Value::Variable("dobj".into()),
+                        }],
+                        type_variable: None,
+                    }],
+                },
+            ],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
+        // Both filters target "dobj" → combined into one NOT IN
+        assert!(
+            sql.contains("UNION ALL"),
+            "Should combine two decorrelatable filters with UNION ALL: {}",
+            sql
+        );
+        assert!(
+            sql.contains("NOT IN"),
+            "Should use NOT IN for decorrelated filters: {}",
+            sql
+        );
+        // Should NOT have any NOT EXISTS
+        assert!(
+            !sql.contains("NOT EXISTS"),
+            "Should not have correlated NOT EXISTS: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_not_exists_correlated_subject_not_decorrelated() {
+        // Correlated subject (?p in both outer and inner) → must fall back to NOT EXISTS.
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![NotExistsFilter {
+                inner_patterns: vec![QueryPattern::Resource {
+                    subject: Subject::Variable("p".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![FieldConstraint {
+                        field_name: "age".into(),
+                        value: Value::Bound(Term::Literal(Literal::Integer(30))),
+                    }],
+                    type_variable: None,
+                }],
+            }],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "Correlated subject should use NOT EXISTS: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_not_exists_multi_constraint_not_decorrelated() {
+        // Anonymous subject but two constraints → must fall back to NOT EXISTS.
+        let plan = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("p".into()),
+                type_iri: Some(Iri::new("http://example.org/Person")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            filters: vec![NotExistsFilter {
+                inner_patterns: vec![QueryPattern::Resource {
+                    subject: Subject::Variable("__anon_0".into()),
+                    type_iri: Some(Iri::new("http://example.org/Person")),
+                    constraints: vec![
+                        FieldConstraint {
+                            field_name: "age".into(),
+                            value: Value::Variable("p".into()),
+                        },
+                        FieldConstraint {
+                            field_name: "name".into(),
+                            value: Value::Bound(Term::Literal(Literal::String("Bob".into()))),
+                        },
+                    ],
+                    type_variable: None,
+                }],
+            }],
+            select: SelectClause::Variables(vec![Variable("name".into())]),
+            modifier: empty_modifier(),
+            values: None,
+        };
+
+        let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "Multiple constraints should fall back to NOT EXISTS: {}",
+            sql
         );
     }
 

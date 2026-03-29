@@ -2,7 +2,7 @@ pub mod store;
 
 pub use store::{ResourceInstance, ResourceStore};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{Binding, Engine};
 use crate::error::DarqError;
@@ -187,14 +187,86 @@ fn evaluate_plan(plan: &QueryPlan, store: &ResourceStore, schema: &Schema) -> Ve
         solutions = join_with_values(solutions, values);
     }
 
-    // Apply NOT EXISTS filters
+    // Apply NOT EXISTS filters.
+    // Try decorrelated hash anti-join for anonymous-subject patterns first.
     for filter in &plan.filters {
-        solutions.retain(|existing| {
-            !inner_pattern_matches(existing, &filter.inner_patterns, store, schema)
-        });
+        if let Some((outer_var, excluded)) =
+            try_decorrelate_memory(filter, store, schema, &solutions)
+        {
+            solutions.retain(|existing| {
+                match existing.get(&outer_var) {
+                    Some(term) => !excluded.contains(term),
+                    None => true,
+                }
+            });
+        } else {
+            solutions.retain(|existing| {
+                !inner_pattern_matches(existing, &filter.inner_patterns, store, schema)
+            });
+        }
     }
 
     solutions
+}
+
+/// Try to decorrelate a NOT EXISTS filter into a HashSet anti-join.
+///
+/// Returns `Some((outer_var, excluded_set))` when the inner pattern has an
+/// anonymous subject (not bound in outer solutions) and a single field
+/// constraint correlated with an outer variable.
+fn try_decorrelate_memory(
+    filter: &crate::ir::NotExistsFilter,
+    store: &ResourceStore,
+    _schema: &Schema,
+    solutions: &[Binding],
+) -> Option<(String, HashSet<Term>)> {
+    if filter.inner_patterns.len() != 1 {
+        return None;
+    }
+
+    match &filter.inner_patterns[0] {
+        QueryPattern::Resource {
+            subject,
+            type_iri,
+            constraints,
+            ..
+        } => {
+            // Subject must be a variable not bound in any outer solution.
+            let subject_var = match subject {
+                Subject::Variable(v) => v,
+                _ => return None,
+            };
+            if solutions.iter().any(|s| s.contains_key(subject_var)) {
+                return None;
+            }
+
+            // Must have exactly one constraint with a variable value.
+            if constraints.len() != 1 {
+                return None;
+            }
+            let c = &constraints[0];
+            let outer_var = match &c.value {
+                Value::Variable(v) => v.clone(),
+                _ => return None,
+            };
+
+            // Collect all values from the inner field into a HashSet.
+            let instances: Box<dyn Iterator<Item = &ResourceInstance>> = match type_iri {
+                Some(ti) => Box::new(store.instances_of(ti).iter()),
+                None => Box::new(store.all_instances()),
+            };
+
+            let mut excluded = HashSet::new();
+            for instance in instances {
+                if let Some(value) = instance.fields.get(c.field_name.as_str()) {
+                    excluded.insert(value.clone());
+                }
+            }
+
+            Some((outer_var, excluded))
+        }
+        _ => None,
+    }
 }
 
 /// Check if inner NOT EXISTS patterns produce any matches starting from an outer binding.
