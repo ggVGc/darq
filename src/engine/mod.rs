@@ -27,10 +27,13 @@ pub struct QueryResult {
 /// Trait for query plan evaluation backends.
 ///
 /// Implementations must apply `plan.modifier` (DISTINCT, ORDER BY, LIMIT,
-/// OFFSET) before returning.  The [`apply_modifiers`] helper provides a
-/// ready-made in-memory implementation.
+/// OFFSET) before returning.  The [`apply_modifiers`] helper in
+/// [`memory`] provides a ready-made in-memory implementation.
+///
+/// When multiple plans are provided (ambiguous-type alternatives), the engine
+/// must union their results and apply modifiers on the combined set.
 pub trait Engine {
-    fn evaluate_plan(&self, plan: &QueryPlan, schema: &Schema) -> Result<Vec<Binding>, DarqError>;
+    fn evaluate_plans(&self, plans: &[QueryPlan], schema: &Schema) -> Result<Vec<Binding>, DarqError>;
 }
 
 /// Execute a SPARQL SELECT query using the given engine and schema.
@@ -54,80 +57,31 @@ pub fn execute(
     // 5. Lower to resource-level IR (may produce multiple plans for ambiguous types)
     let plans = crate::lower::lower(&query, schema)?;
 
-    if plans.len() == 1 {
-        // Single plan — fast path, same as before.
-        let plan = &plans[0];
-        let bindings = engine.evaluate_plan(plan, schema)?;
-        let mut result = project(bindings, plan)?;
+    // 6. Evaluate plan(s) — engine handles union for multiple plans
+    let bindings = engine.evaluate_plans(&plans, schema)?;
 
-        if plan.modifier.distinct {
-            let mut seen = HashSet::new();
-            result.rows.retain(|row| seen.insert(row.clone()));
+    // 7. Project to selected variables
+    let mut result = project(bindings, &plans[0])?;
 
-            if let Some(offset) = plan.modifier.offset {
-                if offset < result.rows.len() {
-                    result.rows = result.rows.into_iter().skip(offset).collect();
-                } else {
-                    result.rows.clear();
-                }
-            }
-            if let Some(limit) = plan.modifier.limit {
-                result.rows.truncate(limit);
-            }
-        }
+    // 8. Apply DISTINCT after projection so deduplication uses only selected
+    //    variables. OFFSET and LIMIT follow DISTINCT per the SPARQL spec.
+    if plans[0].modifier.distinct {
+        let mut seen = HashSet::new();
+        result.rows.retain(|row| seen.insert(row.clone()));
 
-        Ok(result)
-    } else {
-        // Multiple plans — evaluate each without LIMIT/OFFSET, union results.
-        let modifier = plans[0].modifier.clone();
-
-        let mut all_bindings = Vec::new();
-        for plan in &plans {
-            let mut eval_plan = plan.clone();
-            eval_plan.modifier = SolutionModifier::default();
-            let bindings = engine.evaluate_plan(&eval_plan, schema)?;
-            all_bindings.extend(bindings);
-        }
-
-        // Sort combined bindings by ORDER BY before projection.
-        if !modifier.order_by.is_empty() {
-            all_bindings.sort_by(|a, b| {
-                for cond in &modifier.order_by {
-                    let va = a.get(&cond.variable.0);
-                    let vb = b.get(&cond.variable.0);
-                    let ord = va.cmp(&vb);
-                    let ord = match cond.direction {
-                        OrderDirection::Ascending => ord,
-                        OrderDirection::Descending => ord.reverse(),
-                    };
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-        }
-
-        let mut result = project(all_bindings, &plans[0])?;
-
-        // Apply DISTINCT, OFFSET, LIMIT on the combined result.
-        if modifier.distinct {
-            let mut seen = HashSet::new();
-            result.rows.retain(|row| seen.insert(row.clone()));
-        }
-        if let Some(offset) = modifier.offset {
+        if let Some(offset) = plans[0].modifier.offset {
             if offset < result.rows.len() {
                 result.rows = result.rows.into_iter().skip(offset).collect();
             } else {
                 result.rows.clear();
             }
         }
-        if let Some(limit) = modifier.limit {
+        if let Some(limit) = plans[0].modifier.limit {
             result.rows.truncate(limit);
         }
-
-        Ok(result)
     }
+
+    Ok(result)
 }
 
 /// Validate that all concrete predicates in the query are known to the schema.

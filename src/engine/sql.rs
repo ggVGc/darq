@@ -5,8 +5,6 @@ use crate::error::DarqError;
 use crate::ir::{QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::{FieldDescriptor, FieldType, Schema};
-use crate::sparql::ast::OrderDirection;
-use crate::sparql::ast::SolutionModifier;
 use crate::sql::sql_literal;
 
 /// Maximum number of values in a single SQL IN clause.
@@ -69,101 +67,37 @@ impl<'a, E: SqlExecutor> SqlEngine<'a, E> {
     }
 }
 
-/// Apply ORDER BY and, when DISTINCT is not active, OFFSET and LIMIT.
-///
-/// DISTINCT, OFFSET, and LIMIT are applied post-projection by `execute()`
-/// when DISTINCT is requested, so this helper skips them in that case.
-fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
-    if !modifier.order_by.is_empty() {
-        bindings.sort_by(|a, b| {
-            for cond in &modifier.order_by {
-                let va = a.get(&cond.variable.0);
-                let vb = b.get(&cond.variable.0);
-                let ord = va.cmp(&vb);
-                let ord = match cond.direction {
-                    OrderDirection::Ascending => ord,
-                    OrderDirection::Descending => ord.reverse(),
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
-
-    if !modifier.distinct {
-        if let Some(offset) = modifier.offset {
-            if offset < bindings.len() {
-                bindings = bindings.into_iter().skip(offset).collect();
-            } else {
-                bindings.clear();
-            }
-        }
-
-        if let Some(limit) = modifier.limit {
-            bindings.truncate(limit);
-        }
-    }
-
-    bindings
-}
-
 impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
-    fn evaluate_plan(
+    fn evaluate_plans(
         &self,
-        plan: &QueryPlan,
+        plans: &[QueryPlan],
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
-        // If all patterns are Resource (no FieldScan), use a single combined SQL query
-        // so the database handles JOINs, ORDER BY, LIMIT, etc.
-        let all_resource = plan
-            .patterns
-            .iter()
-            .all(|p| matches!(p, QueryPattern::Resource { .. }));
+        let all_resource = plans.iter().all(|plan| {
+            plan.patterns
+                .iter()
+                .all(|p| matches!(p, QueryPattern::Resource { .. }))
+        });
+
+        if plans.len() == 1 {
+            if all_resource {
+                return self.eval_combined(&plans[0], schema);
+            }
+            return self.eval_pipelined(&plans[0], schema);
+        }
+
+        // Multiple plans: union results.
         if all_resource {
-            return self.eval_combined(plan, schema);
+            return self.eval_combined_union(plans, schema);
         }
 
-        // Pipelined approach for plans containing FieldScan patterns.
-        let mut solutions: Vec<Binding> = vec![HashMap::new()];
-
-        for pattern in &plan.patterns {
-            solutions = match pattern {
-                QueryPattern::Resource {
-                    subject,
-                    type_iri,
-                    constraints,
-                    type_variable,
-                } => self.eval_resource(
-                    subject,
-                    type_iri,
-                    constraints,
-                    type_variable,
-                    &solutions,
-                    schema,
-                )?,
-                QueryPattern::FieldScan {
-                    subject,
-                    predicate_var,
-                    object,
-                    type_iri,
-                } => self.eval_field_scan(
-                    subject,
-                    predicate_var,
-                    object,
-                    type_iri,
-                    &solutions,
-                    schema,
-                )?,
-            };
+        // Fallback: evaluate each plan without modifiers, union, apply modifiers.
+        let modifier = plans[0].modifier.clone();
+        let mut all = Vec::new();
+        for plan in plans {
+            all.extend(self.eval_pipelined_no_modifiers(plan, schema)?);
         }
-
-        if let Some(ref values) = plan.values {
-            solutions = super::memory::join_with_values(solutions, values);
-        }
-
-        Ok(apply_modifiers(solutions, &plan.modifier))
+        Ok(super::memory::apply_modifiers(all, &modifier))
     }
 }
 
@@ -207,6 +141,89 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
         let type_map = build_variable_type_map(plan, schema);
+
+        let mut bindings = Vec::new();
+        for row in &result.rows {
+            let mut binding = Binding::new();
+            for (col_idx, col_name) in result.columns.iter().enumerate() {
+                if let Some(Some(raw)) = row.get(col_idx) {
+                    let term = match type_map.get(col_name.as_str()) {
+                        Some(ft) => parse_sql_value(raw, ft),
+                        None => Term::Literal(Literal::String(raw.clone())),
+                    };
+                    binding.insert(col_name.clone(), term);
+                }
+            }
+            bindings.push(binding);
+        }
+        Ok(bindings)
+    }
+
+    /// Pipelined evaluation for plans containing FieldScan patterns.
+    fn eval_pipelined(
+        &self,
+        plan: &QueryPlan,
+        schema: &Schema,
+    ) -> Result<Vec<Binding>, DarqError> {
+        let solutions = self.eval_pipelined_no_modifiers(plan, schema)?;
+        Ok(super::memory::apply_modifiers(solutions, &plan.modifier))
+    }
+
+    /// Pipelined evaluation without applying modifiers (for multi-plan union).
+    fn eval_pipelined_no_modifiers(
+        &self,
+        plan: &QueryPlan,
+        schema: &Schema,
+    ) -> Result<Vec<Binding>, DarqError> {
+        let mut solutions: Vec<Binding> = vec![HashMap::new()];
+
+        for pattern in &plan.patterns {
+            solutions = match pattern {
+                QueryPattern::Resource {
+                    subject,
+                    type_iri,
+                    constraints,
+                    type_variable,
+                } => self.eval_resource(
+                    subject,
+                    type_iri,
+                    constraints,
+                    type_variable,
+                    &solutions,
+                    schema,
+                )?,
+                QueryPattern::FieldScan {
+                    subject,
+                    predicate_var,
+                    object,
+                    type_iri,
+                } => self.eval_field_scan(
+                    subject,
+                    predicate_var,
+                    object,
+                    type_iri,
+                    &solutions,
+                    schema,
+                )?,
+            };
+        }
+
+        if let Some(ref values) = plan.values {
+            solutions = super::memory::join_with_values(solutions, values);
+        }
+
+        Ok(solutions)
+    }
+
+    /// Evaluate multiple Resource-only plans using a single UNION ALL SQL query.
+    fn eval_combined_union(
+        &self,
+        plans: &[QueryPlan],
+        schema: &Schema,
+    ) -> Result<Vec<Binding>, DarqError> {
+        let sql = crate::sql::to_union_sql(plans, schema, &self.subject_column, &self.id_column)?;
+        let result = self.executor.execute_sql(&sql)?;
+        let type_map = build_variable_type_map(&plans[0], schema);
 
         let mut bindings = Vec::new();
         for row in &result.rows {
@@ -1310,7 +1327,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
         assert_eq!(bindings.len(), 1);
         assert_eq!(
             bindings[0].get("name"),
@@ -1357,7 +1374,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
         assert_eq!(bindings.len(), 1);
 
         let queries = executor.executed_queries();
@@ -1409,7 +1426,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         // Should have 3 rows: rdf:type + name + age
         assert_eq!(bindings.len(), 3);
@@ -1478,7 +1495,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         // All bindings should have ?s bound to alice
         for b in &bindings {
@@ -1562,7 +1579,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         // 2 subjects x 3 fields (rdf:type + name + age) = 6 bindings
         assert_eq!(bindings.len(), 6);
@@ -1626,7 +1643,7 @@ mod tests {
             values: None,
         };
 
-        let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         let queries = executor.executed_queries();
 
@@ -1713,7 +1730,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
         assert_eq!(bindings.len(), 2);
 
         // Verify SQL uses unnest
@@ -1757,7 +1774,7 @@ mod tests {
             values: None,
         };
 
-        let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         let queries = executor.executed_queries();
         assert_eq!(queries.len(), 1);
@@ -1818,7 +1835,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         // rdf:type(1) + model(1) + tags(2 unnested) = 4
         assert_eq!(bindings.len(), 4);
@@ -1871,7 +1888,7 @@ mod tests {
             values: None,
         };
 
-        let _bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
 
         let queries = executor.executed_queries();
         let tags_query = queries.iter().find(|q| q.contains("tags")).unwrap();
@@ -1956,7 +1973,7 @@ mod tests {
             values: None,
         };
 
-        let bindings = engine.evaluate_plan(&plan, &schema).unwrap();
+        let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
         assert_eq!(bindings.len(), 1);
         assert_eq!(
             bindings[0].get("age"),

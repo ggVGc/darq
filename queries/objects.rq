@@ -1,7 +1,11 @@
 prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
-prefix terms: <http://purl.org/dc/terms/>
-select ?dobj where {
-	?dobj terms:hasPart ?part .
+prefix prov: <http://www.w3.org/ns/prov#>
+prefix xsd: <http://www.w3.org/2001/XMLSchema#>
+prefix geo: <http://www.opengis.net/ont/geosparql#>
+select ?dobj
+where {
+	?dobj cpmeta:wasSubmittedBy ?subm .
+        ?subm prov:endedAtTime ?submTime .
 	FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj}
 }
-limit 10
+limit 1

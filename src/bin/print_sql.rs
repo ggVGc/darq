@@ -48,11 +48,16 @@ fn main() {
         }
     };
 
-    for (i, plan) in plans.iter().enumerate() {
-        if plans.len() > 1 {
-            println!("-- Alternative {}", i + 1);
+    if plans.len() == 1 {
+        match sql::to_sql(&plans[0], &schema, "_subject", "_subject") {
+            Ok(sql) => println!("{}", sql),
+            Err(e) => {
+                eprintln!("SQL translation error: {}", e);
+                process::exit(1);
+            }
         }
-        match sql::to_sql(plan, &schema, "_subject", "_subject") {
+    } else {
+        match sql::to_union_sql(&plans, &schema, "_subject", "_subject") {
             Ok(sql) => println!("{}", sql),
             Err(e) => {
                 eprintln!("SQL translation error: {}", e);

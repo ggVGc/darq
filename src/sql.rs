@@ -485,6 +485,67 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
     Ok(sql)
 }
 
+/// Translate multiple resource-level query plans into a single SQL string
+/// using UNION ALL, letting the database handle the combined result set.
+///
+/// Each plan becomes a subquery; modifiers (ORDER BY, LIMIT, OFFSET) are
+/// applied on the outer query. DISTINCT is omitted from SQL — it is handled
+/// post-projection by `execute()`.
+pub fn to_union_sql(
+    plans: &[QueryPlan],
+    schema: &Schema,
+    subject_column: &str,
+    id_column: &str,
+) -> Result<String, DarqError> {
+    use crate::sparql::ast::SolutionModifier;
+
+    let modifier = &plans[0].modifier;
+
+    // Generate inner SQL for each plan (no modifiers, all variables).
+    let mut subqueries = Vec::new();
+    for plan in plans {
+        let inner_plan = QueryPlan {
+            patterns: plan.patterns.clone(),
+            filters: plan.filters.clone(),
+            select: SelectClause::Star,
+            modifier: SolutionModifier::default(),
+            values: plan.values.clone(),
+        };
+        subqueries.push(to_sql(&inner_plan, schema, subject_column, id_column)?);
+    }
+
+    let union_body = subqueries.join("\nUNION ALL\n");
+    let mut sql = format!("SELECT DISTINCT * FROM (\n{}\n) AS \"_combined\"", union_body);
+
+    if !modifier.order_by.is_empty() {
+        let order_parts: Vec<String> = modifier
+            .order_by
+            .iter()
+            .map(|oc| {
+                let dir = match oc.direction {
+                    OrderDirection::Ascending => "ASC",
+                    OrderDirection::Descending => "DESC",
+                };
+                format!("\"{}\" {}", oc.variable.0, dir)
+            })
+            .collect();
+        sql.push_str(&format!("\nORDER BY {}", order_parts.join(", ")));
+    }
+
+    // DISTINCT is handled post-projection by execute(). LIMIT/OFFSET are
+    // applied in SQL only when DISTINCT is not active (same as to_sql).
+    if !modifier.distinct {
+        if let Some(limit) = modifier.limit {
+            sql.push_str(&format!("\nLIMIT {}", limit));
+        }
+        if let Some(offset) = modifier.offset {
+            sql.push_str(&format!("\nOFFSET {}", offset));
+        }
+    }
+
+    Ok(sql)
+}
+
 /// Extract the local name from an IRI (the part after the last `#` or `/`).
 /// Used as fallback when a type is not registered in the schema.
 fn iri_local_name(iri: &Iri) -> &str {
@@ -1647,5 +1708,55 @@ mod tests {
     #[test]
     fn test_iri_path_table_name() {
         assert_eq!(iri_local_name(&Iri::new("http://example.org/Person")), "Person");
+    }
+
+    #[test]
+    fn test_union_sql_combines_plans() {
+        let plan_a = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("x".into()),
+                type_iri: Some(Iri::new("http://example.org/Alpha")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("x".into())]),
+            modifier: SolutionModifier {
+                limit: Some(10),
+                ..SolutionModifier::default()
+            },
+            filters: vec![],
+            values: None,
+        };
+        let plan_b = QueryPlan {
+            patterns: vec![QueryPattern::Resource {
+                subject: Subject::Variable("x".into()),
+                type_iri: Some(Iri::new("http://example.org/Beta")),
+                constraints: vec![FieldConstraint {
+                    field_name: "name".into(),
+                    value: Value::Variable("name".into()),
+                }],
+                type_variable: None,
+            }],
+            select: SelectClause::Variables(vec![Variable("x".into())]),
+            modifier: SolutionModifier {
+                limit: Some(10),
+                ..SolutionModifier::default()
+            },
+            filters: vec![],
+            values: None,
+        };
+
+        let sql = to_union_sql(&[plan_a, plan_b], &Schema::new(), "_subject", "_subject").unwrap();
+        // Should contain UNION ALL wrapping two subqueries
+        assert!(sql.contains("UNION ALL"), "expected UNION ALL in:\n{}", sql);
+        assert!(sql.contains("\"Alpha\""), "expected Alpha table in:\n{}", sql);
+        assert!(sql.contains("\"Beta\""), "expected Beta table in:\n{}", sql);
+        // LIMIT should be on the outer query, not duplicated in subqueries
+        assert!(sql.contains("LIMIT 10"), "expected LIMIT 10 in:\n{}", sql);
+        // Only one LIMIT — subqueries should not have it
+        assert_eq!(sql.matches("LIMIT").count(), 1, "expected exactly one LIMIT in:\n{}", sql);
     }
 }

@@ -23,9 +23,18 @@ impl<'a> InMemoryEngine<'a> {
 }
 
 impl Engine for InMemoryEngine<'_> {
-    fn evaluate_plan(&self, plan: &QueryPlan, schema: &Schema) -> Result<Vec<Binding>, DarqError> {
-        let bindings = evaluate_plan(plan, self.store, schema);
-        Ok(apply_modifiers(bindings, &plan.modifier))
+    fn evaluate_plans(&self, plans: &[QueryPlan], schema: &Schema) -> Result<Vec<Binding>, DarqError> {
+        if plans.len() == 1 {
+            let bindings = evaluate_plan(&plans[0], self.store, schema);
+            return Ok(apply_modifiers(bindings, &plans[0].modifier));
+        }
+        // Multiple plans: evaluate each without modifiers, union, then apply modifiers.
+        let modifier = plans[0].modifier.clone();
+        let mut all = Vec::new();
+        for plan in plans {
+            all.extend(evaluate_plan(plan, self.store, schema));
+        }
+        Ok(apply_modifiers(all, &modifier))
     }
 }
 
@@ -33,7 +42,7 @@ impl Engine for InMemoryEngine<'_> {
 ///
 /// DISTINCT, OFFSET, and LIMIT are applied post-projection by `execute()`
 /// when DISTINCT is requested, so this helper skips them in that case.
-fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
+pub fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
     if !modifier.order_by.is_empty() {
         bindings.sort_by(|a, b| {
             for cond in &modifier.order_by {

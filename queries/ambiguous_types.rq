@@ -1,0 +1,6 @@
+prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
+prefix terms: <http://purl.org/dc/terms/>
+select ?dobj where {
+	?dobj terms:hasPart ?part .
+}
+limit 10
