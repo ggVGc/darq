@@ -1,6 +1,7 @@
 prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
 select ?dobj where {
 	?dobj a <http://meta.icos-cp.eu/tables/ct_static_objects> .
+	?spec cpmeta:hasDataLevel ?level.
 	FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj}
 }
 limit 10

@@ -17,6 +17,11 @@ pub enum DarqError {
     },
     /// SELECT references variables not bound by any WHERE pattern.
     UnboundVariables(Vec<String>),
+    /// The WHERE clause contains pattern groups that share no variables,
+    /// which would produce a cartesian product.
+    DisconnectedPatterns {
+        groups: Vec<Vec<String>>,
+    },
     /// An error occurred while executing a SQL query.
     SqlError(String),
 }
@@ -34,6 +39,20 @@ impl std::fmt::Display for DarqError {
             DarqError::UnboundVariables(vars) => {
                 let names: Vec<String> = vars.iter().map(|v| format!("?{}", v)).collect();
                 write!(f, "unbound variables in SELECT: {}", names.join(", "))
+            }
+            DarqError::DisconnectedPatterns { groups } => {
+                let parts: Vec<String> = groups
+                    .iter()
+                    .map(|g| {
+                        let vars: Vec<String> = g.iter().map(|v| format!("?{}", v)).collect();
+                        format!("{{{}}}", vars.join(", "))
+                    })
+                    .collect();
+                write!(
+                    f,
+                    "disconnected pattern groups share no variables: {}",
+                    parts.join(" and ")
+                )
             }
             DarqError::SqlError(msg) => write!(f, "SQL error: {}", msg),
         }

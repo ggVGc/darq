@@ -16,6 +16,8 @@ pub enum FieldType {
     DateTime,
     /// IRI reference to one of the listed resource types.
     Reference(Vec<Iri>),
+    /// Array of ID references to one of the listed resource types.
+    ReferenceArray(Vec<Iri>),
 }
 
 /// Describes one field on a Resource: its predicate IRI, Rust field name, and value type.
@@ -158,6 +160,19 @@ impl Schema {
         self.types.keys()
     }
 
+    /// Return the target types for a specific type's field (Reference or ReferenceArray).
+    /// Returns None if the field is not a reference type or is unknown.
+    pub fn field_range_for_type(&self, type_iri: &Iri, predicate: &Iri) -> Option<&[Iri]> {
+        self.types.get(type_iri).and_then(|info| {
+            info.fields.iter().find(|fd| fd.predicate == *predicate).and_then(|fd| {
+                match &fd.field_type {
+                    FieldType::Reference(iris) | FieldType::ReferenceArray(iris) => Some(iris.as_slice()),
+                    _ => None,
+                }
+            })
+        })
+    }
+
     /// Return the resource types that a reference-typed predicate can point to.
     /// Collects targets from all types that declare this predicate as a Reference.
     /// Returns an empty vec for literal fields or unknown predicates.
@@ -166,8 +181,11 @@ impl Schema {
         for info in self.types.values() {
             for fd in &info.fields {
                 if fd.predicate == *predicate {
-                    if let FieldType::Reference(ref iris) = fd.field_type {
-                        targets.extend(iris.iter().cloned());
+                    match &fd.field_type {
+                        FieldType::Reference(iris) | FieldType::ReferenceArray(iris) => {
+                            targets.extend(iris.iter().cloned());
+                        }
+                        _ => {}
                     }
                 }
             }

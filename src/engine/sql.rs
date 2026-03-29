@@ -1149,6 +1149,7 @@ fn parse_sql_value(raw: &str, field_type: &FieldType) -> Term {
         FieldType::Reference(_) => Term::Iri(Iri::new(raw)),
         // Values arrive already unnested from SQL, so treat as plain string.
         FieldType::StringArray => Term::Literal(Literal::String(raw.to_string())),
+        FieldType::ReferenceArray(_) => Term::Iri(Iri::new(raw)),
     }
 }
 

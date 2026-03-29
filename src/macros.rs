@@ -40,6 +40,14 @@ macro_rules! ref_to {
     };
 }
 
+/// Create a `FieldType::ReferenceArray` from one or more IRI expressions.
+#[macro_export]
+macro_rules! ref_arr_to {
+    ($($iri:expr),+) => {
+        $crate::schema::FieldType::ReferenceArray(vec![$($crate::rdf::Iri::new($iri)),+])
+    };
+}
+
 /// Define a SQL-backed `Resource` implementation from a declarative schema.
 ///
 /// ```rust,ignore

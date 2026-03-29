@@ -173,7 +173,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                         .map(|fs| {
                             fs.iter().any(|f| {
                                 f.name == c.field_name
-                                    && matches!(f.field_type, crate::schema::FieldType::StringArray)
+                                    && matches!(f.field_type, crate::schema::FieldType::StringArray | crate::schema::FieldType::ReferenceArray(_))
                             })
                         })
                         .unwrap_or(false);
@@ -590,7 +590,7 @@ fn generate_not_exists_subquery(
                         .map(|fs| {
                             fs.iter().any(|f| {
                                 f.name == c.field_name
-                                    && matches!(f.field_type, crate::schema::FieldType::StringArray)
+                                    && matches!(f.field_type, crate::schema::FieldType::StringArray | crate::schema::FieldType::ReferenceArray(_))
                             })
                         })
                         .unwrap_or(false);

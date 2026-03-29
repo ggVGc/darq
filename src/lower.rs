@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
 use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
@@ -11,7 +11,19 @@ use crate::sparql::ast::*;
 pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<QueryPlan, DarqError> {
     let patterns = lower_bgp(&query.where_pattern, schema)?;
     let values = query.values.as_ref().map(lower_values_clause);
-    let filters = lower_filters(&query.where_pattern.filters, schema)?;
+
+    // Collect known variable types from the main BGP for propagation into filters.
+    let mut outer_var_types: HashMap<String, Iri> = HashMap::new();
+    for pattern in &patterns {
+        if let QueryPattern::Resource { subject: crate::ir::Subject::Variable(name), type_iri: Some(ti), .. } = pattern {
+            outer_var_types.insert(name.clone(), ti.clone());
+        }
+    }
+
+    let filters = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
+
+    check_pattern_connectivity(&patterns, &filters, values.as_ref())?;
+
     Ok(QueryPlan {
         patterns,
         filters,
@@ -19,6 +31,166 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<QueryPlan, DarqErro
         modifier: query.modifier.clone(),
         values,
     })
+}
+
+/// Collect variables from a single QueryPattern, excluding anonymous variables.
+fn pattern_variables(pattern: &QueryPattern) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    let mut add = |name: &str| {
+        if !name.starts_with("__anon_") {
+            vars.insert(name.to_string());
+        }
+    };
+    match pattern {
+        QueryPattern::Resource {
+            subject,
+            constraints,
+            type_variable,
+            ..
+        } => {
+            if let Subject::Variable(v) = subject {
+                add(v);
+            }
+            if let Some(tv) = type_variable {
+                add(tv);
+            }
+            for c in constraints {
+                if let Value::Variable(v) = &c.value {
+                    add(v);
+                }
+            }
+        }
+        QueryPattern::FieldScan {
+            subject,
+            predicate_var,
+            object,
+            ..
+        } => {
+            if let Subject::Variable(v) = subject {
+                add(v);
+            }
+            add(predicate_var);
+            if let Value::Variable(v) = object {
+                add(v);
+            }
+        }
+    }
+    vars
+}
+
+/// Check that all patterns form a single connected variable graph.
+/// Patterns that share no variables with any other pattern would produce
+/// a cartesian product, which is almost certainly a query error.
+fn check_pattern_connectivity(
+    patterns: &[QueryPattern],
+    filters: &[NotExistsFilter],
+    values: Option<&InlineData>,
+) -> Result<(), DarqError> {
+    // Collect variable sets per pattern, skipping patterns with no variables
+    // (fully-bound patterns like `<s> <p> <o>` are boolean checks).
+    let var_sets: Vec<HashSet<String>> = patterns
+        .iter()
+        .map(pattern_variables)
+        .filter(|vs| !vs.is_empty())
+        .collect();
+
+    if var_sets.len() <= 1 {
+        return Ok(());
+    }
+
+    // Collect additional "connecting" variables from filters and VALUES.
+    // Filter inner patterns reference outer variables, creating connections.
+    let mut extra_vars: HashSet<String> = HashSet::new();
+    for filter in filters {
+        for inner_pattern in &filter.inner_patterns {
+            for v in pattern_variables(inner_pattern) {
+                extra_vars.insert(v);
+            }
+        }
+    }
+    if let Some(vd) = values {
+        for v in &vd.variables {
+            if !v.starts_with("__anon_") {
+                extra_vars.insert(v.clone());
+            }
+        }
+    }
+
+    // Union-find to group patterns by shared variables.
+    let n = var_sets.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+
+    // Map variable -> first pattern index that uses it.
+    let mut var_to_pattern: HashMap<&str, usize> = HashMap::new();
+    for (i, vs) in var_sets.iter().enumerate() {
+        for v in vs {
+            if let Some(&prev) = var_to_pattern.get(v.as_str()) {
+                union(&mut parent, prev, i);
+            } else {
+                var_to_pattern.insert(v, i);
+            }
+        }
+    }
+
+    // Filters/VALUES variables connect patterns indirectly:
+    // if variable X appears in pattern A and in a filter, and variable Y
+    // appears in pattern B and the same filter, then A and B are connected
+    // through the filter. We handle this by merging all patterns that share
+    // any variable present in extra_vars.
+    // Simpler approach: collect all variables from filters/VALUES as one bag,
+    // then merge all patterns that contain any of those variables.
+    let mut first_with_extra: Option<usize> = None;
+    for (i, vs) in var_sets.iter().enumerate() {
+        if vs.iter().any(|v| extra_vars.contains(v)) {
+            if let Some(prev) = first_with_extra {
+                union(&mut parent, prev, i);
+            } else {
+                first_with_extra = Some(i);
+            }
+        }
+    }
+
+    // Check if all patterns are in the same component.
+    let root = find(&mut parent, 0);
+    let all_connected = (1..n).all(|i| find(&mut parent, i) == root);
+
+    if all_connected {
+        return Ok(());
+    }
+
+    // Build groups for error message.
+    let mut components: HashMap<usize, Vec<String>> = HashMap::new();
+    for (i, vs) in var_sets.iter().enumerate() {
+        let r = find(&mut parent, i);
+        let entry = components.entry(r).or_default();
+        for v in vs {
+            if !entry.contains(v) {
+                entry.push(v.clone());
+            }
+        }
+    }
+    let mut groups: Vec<Vec<String>> = components.into_values().collect();
+    for g in &mut groups {
+        g.sort();
+    }
+    groups.sort();
+
+    Err(DarqError::DisconnectedPatterns { groups })
 }
 
 fn lower_values_clause(vc: &ValuesClause) -> InlineData {
@@ -43,10 +215,12 @@ fn data_block_value_to_term(val: &DataBlockValue) -> Option<Term> {
 }
 
 /// Lower FILTER NOT EXISTS clauses into NotExistsFilters.
-/// When the inner pattern has an ambiguous type, produce one filter per candidate type.
+/// When the inner pattern has an ambiguous type, produce one filter per candidate type,
+/// narrowing candidates using known types from the outer query.
 fn lower_filters(
     filters: &[Filter],
     schema: &Schema,
+    outer_var_types: &HashMap<String, Iri>,
 ) -> Result<Vec<NotExistsFilter>, DarqError> {
     let mut result = Vec::new();
     for filter in filters {
@@ -59,7 +233,10 @@ fn lower_filters(
                     Err(DarqError::AmbiguousType { ref subject, ref candidates })
                         if candidates.len() > 1 =>
                     {
-                        for candidate in candidates {
+                        let narrowed = narrow_candidates_by_outer_types(
+                            candidates, ggp, schema, outer_var_types,
+                        );
+                        for candidate in &narrowed {
                             let augmented = augment_with_type(ggp, subject, candidate);
                             let patterns = lower_bgp(&augmented, schema)?;
                             result.push(NotExistsFilter { inner_patterns: patterns });
@@ -71,6 +248,35 @@ fn lower_filters(
         }
     }
     Ok(result)
+}
+
+/// Narrow ambiguous subject type candidates using known types of variables
+/// from the outer query. For each candidate type, check whether its field
+/// definitions are compatible with the known types of correlated variables.
+fn narrow_candidates_by_outer_types(
+    candidates: &[Iri],
+    ggp: &GroupGraphPattern,
+    schema: &Schema,
+    outer_var_types: &HashMap<String, Iri>,
+) -> Vec<Iri> {
+    let mut narrowed = candidates.to_vec();
+
+    for tp in &ggp.patterns {
+        if let TermOrVariable::Iri(pred_iri) = &tp.predicate {
+            if let TermOrVariable::Variable(Variable(obj_name)) = &tp.object {
+                if let Some(obj_type) = outer_var_types.get(obj_name) {
+                    narrowed.retain(|candidate| {
+                        match schema.field_range_for_type(candidate, pred_iri) {
+                            Some(range) => range.contains(obj_type),
+                            None => true, // No range info → can't narrow → keep
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    narrowed
 }
 
 /// Prepend `?subject a <type_iri>` to a GGP to disambiguate the subject's type.
@@ -1080,5 +1286,125 @@ mod tests {
             }
             _ => panic!("expected Resource pattern for ?child"),
         }
+    }
+
+    #[test]
+    fn test_filter_not_exists_narrows_by_outer_variable_type() {
+        // Three types share predicate "nextVersionOf":
+        //   Alpha  → nextVersionOf: ReferenceArray([Alpha])
+        //   Beta   → nextVersionOf: ReferenceArray([Beta])
+        //   Gamma  → nextVersionOf: Reference([Alpha])
+        // Alpha also has a unique predicate "spec".
+        // Query: ?x spec ?s . FILTER NOT EXISTS { [] nextVersionOf ?x }
+        // Since ?x is constrained to Alpha (via spec), only Alpha and Gamma
+        // (whose nextVersionOf targets Alpha) should produce NOT EXISTS filters.
+        // Beta should be eliminated.
+
+        struct Alpha;
+        impl Resource for Alpha {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Alpha") }
+            fn subject_iri(&self) -> Iri { unimplemented!() }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/spec"),
+                        name: "spec",
+                        field_type: FieldType::String,
+                        indexed: false,
+                    },
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/nextVersionOf"),
+                        name: "next_version_of",
+                        field_type: FieldType::ReferenceArray(vec![Iri::new("http://example.org/Alpha")]),
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> { unimplemented!() }
+        }
+
+        struct Beta;
+        impl Resource for Beta {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Beta") }
+            fn subject_iri(&self) -> Iri { unimplemented!() }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/nextVersionOf"),
+                        name: "next_version_of",
+                        field_type: FieldType::ReferenceArray(vec![Iri::new("http://example.org/Beta")]),
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> { unimplemented!() }
+        }
+
+        struct Gamma;
+        impl Resource for Gamma {
+            fn rdf_type() -> Iri { Iri::new("http://example.org/Gamma") }
+            fn subject_iri(&self) -> Iri { unimplemented!() }
+            fn field_descriptors() -> Vec<FieldDescriptor> {
+                vec![
+                    FieldDescriptor {
+                        predicate: Iri::new("http://example.org/nextVersionOf"),
+                        name: "next_version_of",
+                        field_type: FieldType::Reference(vec![Iri::new("http://example.org/Alpha")]),
+                        indexed: false,
+                    },
+                ]
+            }
+            fn field_values(&self) -> Vec<Term> { unimplemented!() }
+        }
+
+        let mut schema = Schema::new();
+        schema.register::<Alpha>();
+        schema.register::<Beta>();
+        schema.register::<Gamma>();
+
+        let query = crate::sparql::ast::SelectQuery {
+            prefixes: vec![],
+            base: None,
+            select: SelectClause::Variables(vec![Variable("x".into())]),
+            where_pattern: GroupGraphPattern {
+                patterns: vec![
+                    TriplePattern {
+                        subject: TermOrVariable::Variable(Variable("x".into())),
+                        predicate: TermOrVariable::Iri(Iri::new("http://example.org/spec")),
+                        object: TermOrVariable::Variable(Variable("s".into())),
+                    },
+                ],
+                filters: vec![
+                    Filter::NotExists(GroupGraphPattern {
+                        patterns: vec![
+                            TriplePattern {
+                                subject: TermOrVariable::Variable(Variable("_anon0".into())),
+                                predicate: TermOrVariable::Iri(Iri::new("http://example.org/nextVersionOf")),
+                                object: TermOrVariable::Variable(Variable("x".into())),
+                            },
+                        ],
+                        filters: vec![],
+                    }),
+                ],
+            },
+            modifier: SolutionModifier::default(),
+            values: None,
+        };
+
+        let plan = lower(&query, &schema).unwrap();
+
+        // Should have 2 NOT EXISTS filters (Alpha and Gamma), not 3.
+        assert_eq!(plan.filters.len(), 2, "expected 2 filters (Alpha + Gamma), got {}", plan.filters.len());
+
+        // Verify the filter types are Alpha and Gamma (not Beta).
+        let filter_types: Vec<_> = plan.filters.iter().map(|f| {
+            match &f.inner_patterns[0] {
+                QueryPattern::Resource { type_iri, .. } => type_iri.as_ref().unwrap().0.clone(),
+                _ => panic!("expected Resource pattern"),
+            }
+        }).collect();
+        assert!(filter_types.contains(&"http://example.org/Alpha".to_string()));
+        assert!(filter_types.contains(&"http://example.org/Gamma".to_string()));
+        assert!(!filter_types.contains(&"http://example.org/Beta".to_string()));
     }
 }
