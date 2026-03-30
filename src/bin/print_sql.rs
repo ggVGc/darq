@@ -20,18 +20,13 @@ fn main() {
         }
     };
 
-    let mut query = match sparql::parser::parse(&input) {
+    let query = match sparql::parser::parse(&input) {
         Ok(q) => q,
         Err(e) => {
             eprintln!("Parse error: {}", e);
             process::exit(1);
         }
     };
-
-    if let Err(e) = sparql::expand_prefixes(&mut query) {
-        eprintln!("Prefix expansion error: {}", e);
-        process::exit(1);
-    }
 
     if let Err(e) = sparql::validate_select_variables(&query) {
         eprintln!("Validation error: {}", e);

@@ -1,9 +1,10 @@
 use crate::rdf::Iri;
 
+pub use spargebra::term::Variable;
+pub use spargebra::term::GroundTerm;
+
 #[derive(Debug, Clone)]
 pub struct SelectQuery {
-    pub prefixes: Vec<PrefixDecl>,
-    pub base: Option<Iri>,
     pub select: SelectClause,
     pub where_pattern: GroupGraphPattern,
     pub modifier: SolutionModifier,
@@ -11,19 +12,10 @@ pub struct SelectQuery {
 }
 
 #[derive(Debug, Clone)]
-pub struct PrefixDecl {
-    pub prefix: String, // e.g. "foaf" (without the colon)
-    pub iri: Iri,
-}
-
-#[derive(Debug, Clone)]
 pub enum SelectClause {
     Variables(Vec<Variable>),
     Star,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Variable(pub String); // name without ? or $
 
 #[derive(Debug, Clone)]
 pub struct GroupGraphPattern {
@@ -47,16 +39,7 @@ pub struct TriplePattern {
 pub enum TermOrVariable {
     Variable(Variable),
     Iri(Iri),
-    PrefixedName { prefix: String, local: String },
-    RdfType, // the 'a' keyword
-    Literal(AstLiteral),
-}
-
-#[derive(Debug, Clone)]
-pub enum AstLiteral {
-    String(String),
-    Integer(i64),
-    Boolean(bool),
+    Literal(spargebra::term::Literal),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -79,19 +62,11 @@ pub enum OrderDirection {
     Descending,
 }
 
-/// A single data value in a VALUES block.
-#[derive(Debug, Clone)]
-pub enum DataBlockValue {
-    Iri(Iri),
-    PrefixedName { prefix: String, local: String },
-    Literal(AstLiteral),
-    Undef,
-}
-
 /// A VALUES clause: list of variables and rows of values.
 /// Each inner Vec in `bindings` has the same length as `variables`.
+/// None entries represent UNDEF.
 #[derive(Debug, Clone)]
 pub struct ValuesClause {
     pub variables: Vec<Variable>,
-    pub bindings: Vec<Vec<DataBlockValue>>,
+    pub bindings: Vec<Vec<Option<GroundTerm>>>,
 }

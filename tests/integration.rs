@@ -173,7 +173,7 @@ fn test_unknown_prefix_errors() {
         &eng,
     );
 
-    assert!(matches!(result, Err(DarqError::UnknownPrefix(_))));
+    assert!(matches!(result, Err(DarqError::ParseError(_))));
 }
 
 #[test]
@@ -481,17 +481,19 @@ fn test_values_with_iri() {
 #[test]
 fn test_cpmeta_not_exists_rewrite_to_null_checks() {
     let input = std::fs::read_to_string("queries/objects.rq").unwrap();
-    let mut query = darq::sparql::parser::parse(&input).unwrap();
-    darq::sparql::expand_prefixes(&mut query).unwrap();
+    let query = darq::sparql::parser::parse(&input).unwrap();
 
     let schema = darq::cpmeta_schema::cpmeta_schema();
     let plans = darq::lower::lower(&query, &schema).unwrap();
 
-    // The query has FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj},
-    // and ?dobj is a StaticObject — should rewrite to null checks.
+    // The query has two FILTER NOT EXISTS:
+    // 1. {?spec cpmeta:hasAssociatedProject ?pro . ?pro cpmeta:hasHideFromSearchPolicy true}
+    //    → stays as NotExistsFilter (not a single blank-node pattern)
+    // 2. {[] cpmeta:isNextVersionOf ?dobj}
+    //    → rewritten to NullCheckFilter (blank-node subject, schema rewrite registered)
     assert_eq!(plans.len(), 1);
     let plan = &plans[0];
-    assert!(plan.filters.is_empty(), "NOT EXISTS should be rewritten, but got {:?}", plan.filters);
+    assert_eq!(plan.filters.len(), 1, "first NOT EXISTS should remain as filter");
     assert_eq!(plan.null_checks.len(), 1);
     assert_eq!(plan.null_checks[0].variable, "dobj");
     assert_eq!(
@@ -499,10 +501,11 @@ fn test_cpmeta_not_exists_rewrite_to_null_checks() {
         vec!["deprecated_by_object", "deprecated_by_collection"],
     );
 
-    // Verify the SQL uses IS NULL instead of NOT EXISTS
+    // Verify the SQL uses IS NULL for the rewritten null-check filter
     let sql = darq::sql::to_sql(plan, &schema, "rdf_subject", "id").unwrap();
     assert!(sql.contains("\"deprecated_by_object\" IS NULL"), "SQL should use IS NULL:\n{}", sql);
     assert!(sql.contains("\"deprecated_by_collection\" IS NULL"), "SQL should use IS NULL:\n{}", sql);
-    assert!(!sql.contains("NOT EXISTS"), "SQL should not contain NOT EXISTS:\n{}", sql);
+    // The first NOT EXISTS (hasAssociatedProject/hasHideFromSearchPolicy) remains as SQL NOT EXISTS
+    // The second NOT EXISTS (isNextVersionOf) was rewritten to IS NULL checks
     assert!(!sql.contains("NOT IN"), "SQL should not contain NOT IN:\n{}", sql);
 }

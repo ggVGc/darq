@@ -46,8 +46,8 @@ pub fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) 
     if !modifier.order_by.is_empty() {
         bindings.sort_by(|a, b| {
             for cond in &modifier.order_by {
-                let va = a.get(&cond.variable.0);
-                let vb = b.get(&cond.variable.0);
+                let va = a.get(cond.variable.as_str());
+                let vb = b.get(cond.variable.as_str());
                 let ord = va.cmp(&vb);
                 let ord = match cond.direction {
                     OrderDirection::Ascending => ord,

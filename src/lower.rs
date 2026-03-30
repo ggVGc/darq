@@ -224,23 +224,20 @@ fn check_pattern_connectivity(
 }
 
 fn lower_values_clause(vc: &ValuesClause) -> InlineData {
-    let variables = vc.variables.iter().map(|v| v.0.clone()).collect();
+    let variables = vc.variables.iter().map(|v| v.as_str().to_owned()).collect();
     let rows = vc
         .bindings
         .iter()
-        .map(|row| row.iter().map(data_block_value_to_term).collect())
+        .map(|row| row.iter().map(ground_term_to_term).collect())
         .collect();
     InlineData { variables, rows }
 }
 
-fn data_block_value_to_term(val: &DataBlockValue) -> Option<Term> {
+fn ground_term_to_term(val: &Option<GroundTerm>) -> Option<Term> {
     match val {
-        DataBlockValue::Iri(iri) => Some(Term::Iri(iri.clone())),
-        DataBlockValue::Literal(lit) => Some(ast_lit_to_term(lit)),
-        DataBlockValue::Undef => None,
-        DataBlockValue::PrefixedName { .. } => {
-            unreachable!("prefixed names should be expanded before lowering")
-        }
+        None => None,
+        Some(GroundTerm::NamedNode(nn)) => Some(Term::Iri(Iri::new(nn.as_str().to_owned()))),
+        Some(GroundTerm::Literal(lit)) => Some(sparql_lit_to_term(lit)),
     }
 }
 
@@ -301,7 +298,7 @@ fn try_not_exists_rewrite(
 
     // Subject must be anonymous (blank node / [])
     match &tp.subject {
-        TermOrVariable::Variable(Variable(name)) if name.starts_with("__anon_") => {}
+        TermOrVariable::Variable(v) if v.as_str().starts_with("__anon_") => {}
         _ => return None,
     }
 
@@ -313,7 +310,7 @@ fn try_not_exists_rewrite(
 
     // Object must be a variable with a known type in the outer query
     let obj_name = match &tp.object {
-        TermOrVariable::Variable(Variable(name)) => name,
+        TermOrVariable::Variable(v) => v.as_str(),
         _ => return None,
     };
 
@@ -321,7 +318,7 @@ fn try_not_exists_rewrite(
     let null_fields = schema.not_exists_rewrite(pred_iri, obj_type)?;
 
     Some(NullCheckFilter {
-        variable: obj_name.clone(),
+        variable: obj_name.to_owned(),
         field_names: null_fields.to_vec(),
     })
 }
@@ -339,8 +336,8 @@ fn narrow_candidates_by_outer_types(
 
     for tp in &ggp.patterns {
         if let TermOrVariable::Iri(pred_iri) = &tp.predicate {
-            if let TermOrVariable::Variable(Variable(obj_name)) = &tp.object {
-                if let Some(obj_type) = outer_var_types.get(obj_name) {
+            if let TermOrVariable::Variable(obj_var) = &tp.object {
+                if let Some(obj_type) = outer_var_types.get(obj_var.as_str()) {
                     narrowed.retain(|candidate| {
                         match schema.field_range_for_type(candidate, pred_iri) {
                             Some(range) => range.contains(obj_type),
@@ -358,8 +355,8 @@ fn narrow_candidates_by_outer_types(
 /// Prepend `?subject a <type_iri>` to a GGP to disambiguate the subject's type.
 fn augment_with_type(ggp: &GroupGraphPattern, subject_name: &str, type_iri: &Iri) -> GroupGraphPattern {
     let mut patterns = vec![TriplePattern {
-        subject: TermOrVariable::Variable(Variable(subject_name.to_string())),
-        predicate: TermOrVariable::RdfType,
+        subject: TermOrVariable::Variable(Variable::new_unchecked(subject_name)),
+        predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
         object: TermOrVariable::Iri(type_iri.clone()),
     }];
     patterns.extend(ggp.patterns.clone());
@@ -394,12 +391,12 @@ fn collect_reference_constraints(
 ) -> HashMap<String, Vec<Iri>> {
     let mut constraints: HashMap<String, Vec<Iri>> = HashMap::new();
     for tp in patterns {
-        if let (TermOrVariable::Iri(pred_iri), TermOrVariable::Variable(Variable(obj_name))) =
+        if let (TermOrVariable::Iri(pred_iri), TermOrVariable::Variable(obj_var)) =
             (&tp.predicate, &tp.object)
         {
             let range = schema.range_types(pred_iri);
             if !range.is_empty() {
-                let entry = constraints.entry(obj_name.clone()).or_default();
+                let entry = constraints.entry(obj_var.as_str().to_owned()).or_default();
                 if entry.is_empty() {
                     *entry = range;
                 } else {
@@ -432,7 +429,7 @@ enum PredicateKind {
 enum ObjectInfo {
     Variable(String),
     Iri(Iri),
-    Literal(AstLiteral),
+    Literal(spargebra::term::Literal),
 }
 
 /// Group AST triple patterns by subject, preserving first-appearance order.
@@ -462,32 +459,26 @@ fn group_by_subject(patterns: &[TriplePattern]) -> Vec<SubjectGroup> {
 
 fn subject_key(tov: &TermOrVariable) -> SubjectKey {
     match tov {
-        TermOrVariable::Variable(Variable(name)) => SubjectKey::Variable(name.clone()),
+        TermOrVariable::Variable(v) => SubjectKey::Variable(v.as_str().to_owned()),
         TermOrVariable::Iri(iri) => SubjectKey::Iri(iri.clone()),
-        TermOrVariable::RdfType => SubjectKey::Iri(Iri::new(RDF_TYPE)),
-        _ => unreachable!("literals and prefixed names cannot appear in subject position"),
+        TermOrVariable::Literal(_) => unreachable!("literals cannot appear in subject position"),
     }
 }
 
 fn predicate_kind(tov: &TermOrVariable) -> PredicateKind {
     match tov {
-        TermOrVariable::RdfType => PredicateKind::RdfType,
         TermOrVariable::Iri(iri) if iri.0 == RDF_TYPE => PredicateKind::RdfType,
         TermOrVariable::Iri(iri) => PredicateKind::Concrete(iri.clone()),
-        TermOrVariable::Variable(Variable(name)) => PredicateKind::Variable(name.clone()),
-        _ => unreachable!("literals and prefixed names cannot appear in predicate position"),
+        TermOrVariable::Variable(v) => PredicateKind::Variable(v.as_str().to_owned()),
+        TermOrVariable::Literal(_) => unreachable!("literals cannot appear in predicate position"),
     }
 }
 
 fn object_info(tov: &TermOrVariable) -> ObjectInfo {
     match tov {
-        TermOrVariable::Variable(Variable(name)) => ObjectInfo::Variable(name.clone()),
+        TermOrVariable::Variable(v) => ObjectInfo::Variable(v.as_str().to_owned()),
         TermOrVariable::Iri(iri) => ObjectInfo::Iri(iri.clone()),
-        TermOrVariable::RdfType => ObjectInfo::Iri(Iri::new(RDF_TYPE)),
         TermOrVariable::Literal(lit) => ObjectInfo::Literal(lit.clone()),
-        TermOrVariable::PrefixedName { .. } => {
-            unreachable!("prefixed names should be expanded before lowering")
-        }
     }
 }
 
@@ -656,15 +647,25 @@ fn to_ir_value(obj: &ObjectInfo) -> Value {
     match obj {
         ObjectInfo::Variable(name) => Value::Variable(name.clone()),
         ObjectInfo::Iri(iri) => Value::Bound(Term::Iri(iri.clone())),
-        ObjectInfo::Literal(lit) => Value::Bound(ast_lit_to_term(lit)),
+        ObjectInfo::Literal(lit) => Value::Bound(sparql_lit_to_term(lit)),
     }
 }
 
-fn ast_lit_to_term(lit: &AstLiteral) -> Term {
-    match lit {
-        AstLiteral::String(s) => Term::Literal(Literal::String(s.clone())),
-        AstLiteral::Integer(n) => Term::Literal(Literal::Integer(*n)),
-        AstLiteral::Boolean(b) => Term::Literal(Literal::Boolean(*b)),
+fn sparql_lit_to_term(lit: &spargebra::term::Literal) -> Term {
+    let datatype = lit.datatype().as_str();
+    let value = lit.value();
+    match datatype {
+        "http://www.w3.org/2001/XMLSchema#integer" => {
+            value.parse::<i64>()
+                .map(|n| Term::Literal(Literal::Integer(n)))
+                .unwrap_or_else(|_| Term::Literal(Literal::String(value.to_owned())))
+        }
+        "http://www.w3.org/2001/XMLSchema#boolean" => match value {
+            "true" | "1" => Term::Literal(Literal::Boolean(true)),
+            "false" | "0" => Term::Literal(Literal::Boolean(false)),
+            _ => Term::Literal(Literal::String(value.to_owned())),
+        },
+        _ => Term::Literal(Literal::String(value.to_owned())),
     }
 }
 
@@ -725,19 +726,19 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
-                    predicate: TermOrVariable::RdfType,
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
+                    predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
                     object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Variable(Variable("name".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("name")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
-                    object: TermOrVariable::Variable(Variable("age".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("age")),
                 },
             ],
         filters: vec![],
@@ -772,9 +773,9 @@ mod tests {
         // ?p ex:name ?name (no explicit type — infer Person from predicate)
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("p".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                object: TermOrVariable::Variable(Variable("name".into())),
+                object: TermOrVariable::Variable(Variable::new_unchecked("name")),
             }],
         filters: vec![],
             };
@@ -796,9 +797,9 @@ mod tests {
         // ?s ?p ?o
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("s".into())),
-                predicate: TermOrVariable::Variable(Variable("p".into())),
-                object: TermOrVariable::Variable(Variable("o".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
+                predicate: TermOrVariable::Variable(Variable::new_unchecked("p")),
+                object: TermOrVariable::Variable(Variable::new_unchecked("o")),
             }],
         filters: vec![],
             };
@@ -829,14 +830,14 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("person".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("person")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Variable(Variable("name".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("name")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("person".into())),
-                    predicate: TermOrVariable::Variable(Variable("p".into())),
-                    object: TermOrVariable::Variable(Variable("o".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("person")),
+                    predicate: TermOrVariable::Variable(Variable::new_unchecked("p")),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("o")),
                 },
             ],
         filters: vec![],
@@ -856,14 +857,14 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("s".into())),
-                    predicate: TermOrVariable::RdfType,
-                    object: TermOrVariable::Variable(Variable("type".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
+                    predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("type")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("s".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Variable(Variable("name".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("name")),
                 },
             ],
         filters: vec![],
@@ -894,8 +895,8 @@ mod tests {
         // ?s a ex:Unknown
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("s".into())),
-                predicate: TermOrVariable::RdfType,
+                subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
+                predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Unknown")),
             }],
         filters: vec![],
@@ -914,9 +915,9 @@ mod tests {
         // ?p ex:name "Alice"
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("p".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
+                object: TermOrVariable::Literal(spargebra::term::Literal::new_simple_literal("Alice")),
             }],
         filters: vec![],
             };
@@ -969,7 +970,7 @@ mod tests {
         // ?t ex:owner <http://example.org/person/bob>
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("t".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("t")),
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/owner")),
                 object: TermOrVariable::Iri(Iri::new("http://example.org/person/bob")),
             }],
@@ -999,7 +1000,7 @@ mod tests {
             patterns: vec![TriplePattern {
                 subject: TermOrVariable::Iri(Iri::new("http://example.org/person/alice")),
                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                object: TermOrVariable::Variable(Variable("name".into())),
+                object: TermOrVariable::Variable(Variable::new_unchecked("name")),
             }],
         filters: vec![],
             };
@@ -1029,14 +1030,14 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Variable(Variable("name".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("name")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("q".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("q")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
-                    object: TermOrVariable::Variable(Variable("age".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("age")),
                 },
             ],
         filters: vec![],
@@ -1072,19 +1073,19 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Variable(Variable("name".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("name")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("q".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("q")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
-                    object: TermOrVariable::Variable(Variable("age".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("age")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/age")),
-                    object: TermOrVariable::Variable(Variable("a".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("a")),
                 },
             ],
         filters: vec![],
@@ -1123,8 +1124,8 @@ mod tests {
         // ?p a ex:Person
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("p".into())),
-                predicate: TermOrVariable::RdfType,
+                subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
+                predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
             }],
         filters: vec![],
@@ -1149,9 +1150,9 @@ mod tests {
         // ?s a ?type (no concrete predicates to infer type)
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("s".into())),
-                predicate: TermOrVariable::RdfType,
-                object: TermOrVariable::Variable(Variable("type".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
+                predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
+                object: TermOrVariable::Variable(Variable::new_unchecked("type")),
             }],
         filters: vec![],
             };
@@ -1175,7 +1176,7 @@ mod tests {
         // ?s <rdf:type full IRI> ex:Person — same semantics as `?s a ex:Person`
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("s".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
                 predicate: TermOrVariable::Iri(Iri::new(RDF_TYPE)),
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
             }],
@@ -1202,9 +1203,9 @@ mod tests {
         // ?s ?p "Alice"
         let bgp = GroupGraphPattern {
             patterns: vec![TriplePattern {
-                subject: TermOrVariable::Variable(Variable("s".into())),
-                predicate: TermOrVariable::Variable(Variable("p".into())),
-                object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
+                subject: TermOrVariable::Variable(Variable::new_unchecked("s")),
+                predicate: TermOrVariable::Variable(Variable::new_unchecked("p")),
+                object: TermOrVariable::Literal(spargebra::term::Literal::new_simple_literal("Alice")),
             }],
         filters: vec![],
             };
@@ -1234,14 +1235,14 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Literal(AstLiteral::String("Alice".into())),
+                    object: TermOrVariable::Literal(spargebra::term::Literal::new_simple_literal("Alice")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("p".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("p")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/name")),
-                    object: TermOrVariable::Variable(Variable("name".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("name")),
                 },
             ],
         filters: vec![],
@@ -1338,14 +1339,14 @@ mod tests {
         let bgp = GroupGraphPattern {
             patterns: vec![
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("parent".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("parent")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/hasChild")),
-                    object: TermOrVariable::Variable(Variable("child".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("child")),
                 },
                 TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("child".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("child")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/timestamp")),
-                    object: TermOrVariable::Variable(Variable("ts".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("ts")),
                 },
             ],
         filters: vec![],
@@ -1439,24 +1440,22 @@ mod tests {
         schema.register::<Gamma>();
 
         let query = crate::sparql::ast::SelectQuery {
-            prefixes: vec![],
-            base: None,
-            select: SelectClause::Variables(vec![Variable("x".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("x")]),
             where_pattern: GroupGraphPattern {
                 patterns: vec![
                     TriplePattern {
-                        subject: TermOrVariable::Variable(Variable("x".into())),
+                        subject: TermOrVariable::Variable(Variable::new_unchecked("x")),
                         predicate: TermOrVariable::Iri(Iri::new("http://example.org/spec")),
-                        object: TermOrVariable::Variable(Variable("s".into())),
+                        object: TermOrVariable::Variable(Variable::new_unchecked("s")),
                     },
                 ],
                 filters: vec![
                     Filter::NotExists(GroupGraphPattern {
                         patterns: vec![
                             TriplePattern {
-                                subject: TermOrVariable::Variable(Variable("_anon0".into())),
+                                subject: TermOrVariable::Variable(Variable::new_unchecked("_anon0")),
                                 predicate: TermOrVariable::Iri(Iri::new("http://example.org/nextVersionOf")),
-                                object: TermOrVariable::Variable(Variable("x".into())),
+                                object: TermOrVariable::Variable(Variable::new_unchecked("x")),
                             },
                         ],
                         filters: vec![],
@@ -1530,15 +1529,13 @@ mod tests {
         schema.register::<Sibling>();
 
         let query = crate::sparql::ast::SelectQuery {
-            prefixes: vec![],
-            base: None,
-            select: SelectClause::Variables(vec![Variable("x".into()), Variable("ts".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("x"), Variable::new_unchecked("ts")]),
             where_pattern: GroupGraphPattern {
                 patterns: vec![
                     TriplePattern {
-                        subject: TermOrVariable::Variable(Variable("x".into())),
+                        subject: TermOrVariable::Variable(Variable::new_unchecked("x")),
                         predicate: TermOrVariable::Iri(Iri::new("http://example.org/timestamp")),
-                        object: TermOrVariable::Variable(Variable("ts".into())),
+                        object: TermOrVariable::Variable(Variable::new_unchecked("ts")),
                     },
                 ],
                 filters: vec![],
@@ -1623,20 +1620,18 @@ mod tests {
 
         // Query: ?x ex:link ?l . FILTER NOT EXISTS {[] ex:isNextVersionOf ?x}
         let query = SelectQuery {
-            prefixes: vec![],
-            base: None,
             select: SelectClause::Star,
             where_pattern: GroupGraphPattern {
                 patterns: vec![TriplePattern {
-                    subject: TermOrVariable::Variable(Variable("x".into())),
+                    subject: TermOrVariable::Variable(Variable::new_unchecked("x")),
                     predicate: TermOrVariable::Iri(Iri::new("http://example.org/link")),
-                    object: TermOrVariable::Variable(Variable("l".into())),
+                    object: TermOrVariable::Variable(Variable::new_unchecked("l")),
                 }],
                 filters: vec![Filter::NotExists(GroupGraphPattern {
                     patterns: vec![TriplePattern {
-                        subject: TermOrVariable::Variable(Variable("__anon_0".into())),
+                        subject: TermOrVariable::Variable(Variable::new_unchecked("__anon_0")),
                         predicate: TermOrVariable::Iri(Iri::new("http://example.org/isNextVersionOf")),
-                        object: TermOrVariable::Variable(Variable("x".into())),
+                        object: TermOrVariable::Variable(Variable::new_unchecked("x")),
                     }],
                     filters: vec![],
                 })],

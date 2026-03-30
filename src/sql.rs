@@ -474,7 +474,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
 
     // Resolve selected variables (using select_bindings for output).
     let vars = match &plan.select {
-        SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect::<Vec<_>>(),
+        SelectClause::Variables(vars) => vars.iter().map(|v| v.as_str().to_owned()).collect::<Vec<_>>(),
         SelectClause::Star => plan.collect_variables(),
     };
 
@@ -513,9 +513,9 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                     OrderDirection::Ascending => "ASC",
                     OrderDirection::Descending => "DESC",
                 };
-                match select_bindings.get(&oc.variable.0) {
+                match select_bindings.get(oc.variable.as_str()) {
                     Some(expr) => format!("{} {}", expr.to_sql(), dir),
-                    None => format!("\"{}\" {}", oc.variable.0, dir),
+                    None => format!("\"{}\" {}", oc.variable.as_str(), dir),
                 }
             })
             .collect();
@@ -575,7 +575,7 @@ pub fn to_union_sql(
                     OrderDirection::Ascending => "ASC",
                     OrderDirection::Descending => "DESC",
                 };
-                format!("\"{}\" {}", oc.variable.0, dir)
+                format!("\"{}\" {}", oc.variable.as_str(), dir)
             })
             .collect();
         sql.push_str(&format!("\nORDER BY {}", order_parts.join(", ")));
@@ -903,8 +903,8 @@ mod tests {
                 type_variable: None,
             }],
             select: SelectClause::Variables(vec![
-                Variable("name".into()),
-                Variable("age".into()),
+                Variable::new_unchecked("name"),
+                Variable::new_unchecked("age"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -939,7 +939,7 @@ mod tests {
                 ],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -985,8 +985,8 @@ mod tests {
                 },
             ],
             select: SelectClause::Variables(vec![
-                Variable("pname".into()),
-                Variable("dname".into()),
+                Variable::new_unchecked("pname"),
+                Variable::new_unchecked("dname"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1016,7 +1016,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1078,11 +1078,11 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: SolutionModifier {
                 distinct: true,
                 order_by: vec![OrderCondition {
-                    variable: Variable("name".into()),
+                    variable: Variable::new_unchecked("name"),
                     direction: OrderDirection::Ascending,
                 }],
                 limit: Some(10),
@@ -1115,8 +1115,8 @@ mod tests {
                 type_variable: Some("type".into()),
             }],
             select: SelectClause::Variables(vec![
-                Variable("s".into()),
-                Variable("type".into()),
+                Variable::new_unchecked("s"),
+                Variable::new_unchecked("type"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1151,13 +1151,13 @@ mod tests {
                 type_variable: None,
             }],
             select: SelectClause::Variables(vec![
-                Variable("name".into()),
-                Variable("age".into()),
+                Variable::new_unchecked("name"),
+                Variable::new_unchecked("age"),
             ]),
             modifier: SolutionModifier {
                 distinct: false,
                 order_by: vec![OrderCondition {
-                    variable: Variable("age".into()),
+                    variable: Variable::new_unchecked("age"),
                     direction: OrderDirection::Descending,
                 }],
                 limit: Some(1),
@@ -1193,7 +1193,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("p".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("p")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1221,7 +1221,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("p".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("p")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1256,7 +1256,7 @@ mod tests {
                 ],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("x".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("x")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1287,8 +1287,8 @@ mod tests {
                 type_variable: None,
             }],
             select: SelectClause::Variables(vec![
-                Variable("name".into()),
-                Variable("p".into()),
+                Variable::new_unchecked("name"),
+                Variable::new_unchecked("p"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1355,7 +1355,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("tag".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("tag")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1383,7 +1383,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("s".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("s")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1430,8 +1430,8 @@ mod tests {
                 },
             ],
             select: SelectClause::Variables(vec![
-                Variable("pname".into()),
-                Variable("dname".into()),
+                Variable::new_unchecked("pname"),
+                Variable::new_unchecked("dname"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1476,8 +1476,8 @@ mod tests {
                 },
             ],
             select: SelectClause::Variables(vec![
-                Variable("pet".into()),
-                Variable("dname".into()),
+                Variable::new_unchecked("pet"),
+                Variable::new_unchecked("dname"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1510,7 +1510,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1632,8 +1632,8 @@ mod tests {
                 type_variable: None,
             }],
             select: SelectClause::Variables(vec![
-                Variable("name".into()),
-                Variable("pet".into()),
+                Variable::new_unchecked("name"),
+                Variable::new_unchecked("pet"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1679,8 +1679,8 @@ mod tests {
                 },
             ],
             select: SelectClause::Variables(vec![
-                Variable("pet".into()),
-                Variable("dname".into()),
+                Variable::new_unchecked("pet"),
+                Variable::new_unchecked("dname"),
             ]),
             modifier: empty_modifier(),
             filters: vec![],
@@ -1752,7 +1752,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("pet".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("pet")]),
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
@@ -1795,7 +1795,7 @@ mod tests {
                     type_variable: None,
                 }],
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
             values: None,
@@ -1838,7 +1838,7 @@ mod tests {
                     type_variable: None,
                 }],
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
             values: None,
@@ -1881,7 +1881,7 @@ mod tests {
                     type_variable: None,
                 }],
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
             values: None,
@@ -1932,7 +1932,7 @@ mod tests {
                     }],
                 },
             ],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
             values: None,
@@ -1982,7 +1982,7 @@ mod tests {
                     type_variable: None,
                 }],
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
             values: None,
@@ -2026,7 +2026,7 @@ mod tests {
                     type_variable: None,
                 }],
             }],
-            select: SelectClause::Variables(vec![Variable("name".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
             values: None,
@@ -2062,7 +2062,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("x".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("x")]),
             modifier: SolutionModifier {
                 limit: Some(10),
                 ..SolutionModifier::default()
@@ -2081,7 +2081,7 @@ mod tests {
                 }],
                 type_variable: None,
             }],
-            select: SelectClause::Variables(vec![Variable("x".into())]),
+            select: SelectClause::Variables(vec![Variable::new_unchecked("x")]),
             modifier: SolutionModifier {
                 limit: Some(10),
                 ..SolutionModifier::default()

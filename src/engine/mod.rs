@@ -43,12 +43,9 @@ pub fn execute(
     engine: &dyn Engine,
 ) -> Result<QueryResult, DarqError> {
     // 1. Parse
-    let mut query = parser::parse(query_str)?;
+    let query = parser::parse(query_str)?;
 
-    // 2. Expand prefixes
-    sparql::expand_prefixes(&mut query)?;
-
-    // 3. Validate SELECT variables are bound
+    // 2. Validate SELECT variables are bound
     sparql::validate_select_variables(&query)?;
 
     // 4. Validate predicates against schema
@@ -111,7 +108,7 @@ fn validate_predicates_in_ggp(
 /// Project bindings to the requested variables.
 fn project(bindings: Vec<Binding>, plan: &QueryPlan) -> Result<QueryResult, DarqError> {
     let variables = match &plan.select {
-        SelectClause::Variables(vars) => vars.iter().map(|v| v.0.clone()).collect(),
+        SelectClause::Variables(vars) => vars.iter().map(|v| v.as_str().to_owned()).collect(),
         SelectClause::Star => plan.collect_variables(),
     };
 

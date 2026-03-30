@@ -1,1168 +1,320 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
+use spargebra::term::{NamedNodePattern, TermPattern};
+use spargebra::{Query, SparqlParser};
+
 use crate::error::DarqError;
 use crate::rdf::Iri;
 use super::ast::*;
 
-/// Parser state: wraps the input string with a cursor position.
-struct Parser<'a> {
-    input: &'a str,
-    pos: usize,
-    blank_counter: usize,
-}
+static BLANK_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-impl<'a> Parser<'a> {
-    fn new(input: &'a str) -> Self {
-        Parser { input, pos: 0, blank_counter: 0 }
-    }
-
-    fn remaining(&self) -> &'a str {
-        &self.input[self.pos..]
-    }
-
-    fn is_empty(&self) -> bool {
-        self.pos >= self.input.len()
-    }
-
-    /// Peek at the next character without consuming it.
-    fn peek(&self) -> Option<char> {
-        self.remaining().chars().next()
-    }
-
-    /// Advance past one character.
-    fn advance(&mut self, n: usize) {
-        self.pos += n;
-    }
-
-    /// Skip ASCII whitespace.
-    fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_ascii_whitespace() {
-                self.advance(c.len_utf8());
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Expect and consume at least one whitespace character.
-    fn expect_ws(&mut self) -> Result<(), DarqError> {
-        if self.peek().map_or(false, |c| c.is_ascii_whitespace()) {
-            self.skip_ws();
-            Ok(())
-        } else {
-            Err(self.error("expected whitespace"))
-        }
-    }
-
-    /// Expect and consume a specific character.
-    fn expect_char(&mut self, expected: char) -> Result<(), DarqError> {
-        match self.peek() {
-            Some(c) if c == expected => {
-                self.advance(c.len_utf8());
-                Ok(())
-            }
-            _ => Err(self.error(&format!("expected '{}'", expected))),
-        }
-    }
-
-    /// Try to consume a specific character. Returns true if consumed.
-    fn try_char(&mut self, expected: char) -> bool {
-        if self.peek() == Some(expected) {
-            self.advance(expected.len_utf8());
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Try to consume a case-insensitive keyword followed by a word boundary.
-    /// Returns true if consumed.
-    fn try_keyword(&mut self, keyword: &str) -> bool {
-        let rem = self.remaining();
-        if rem.len() < keyword.len() {
-            return false;
-        }
-        if !rem[..keyword.len()].eq_ignore_ascii_case(keyword) {
-            return false;
-        }
-        // Must be at a word boundary: end of input or followed by non-alphanumeric
-        let after = &rem[keyword.len()..];
-        if let Some(c) = after.chars().next() {
-            if c.is_alphanumeric() || c == '_' {
-                return false;
-            }
-        }
-        self.advance(keyword.len());
-        true
-    }
-
-    /// Expect a case-insensitive keyword (error if not found).
-    fn expect_keyword(&mut self, keyword: &str) -> Result<(), DarqError> {
-        if self.try_keyword(keyword) {
-            Ok(())
-        } else {
-            Err(self.error(&format!("expected '{}'", keyword)))
-        }
-    }
-
-    /// Consume characters while the predicate holds. Returns the consumed slice.
-    fn take_while(&mut self, pred: impl Fn(char) -> bool) -> &'a str {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if pred(c) {
-                self.advance(c.len_utf8());
-            } else {
-                break;
-            }
-        }
-        &self.input[start..self.pos]
-    }
-
-    /// Save the current position for backtracking.
-    fn save(&self) -> usize {
-        self.pos
-    }
-
-    /// Restore a previously saved position.
-    fn restore(&mut self, pos: usize) {
-        self.pos = pos;
-    }
-
-    /// Create an error at the current position.
-    fn error(&self, msg: &str) -> DarqError {
-        let remaining = self.remaining();
-        let context = if remaining.len() > 40 {
-            &remaining[..40]
-        } else {
-            remaining
-        };
-        DarqError::ParseError(format!("{} at: {:?}", msg, context))
-    }
-
-    /// Generate a fresh anonymous variable for blank nodes (`[]`).
-    fn fresh_blank_variable(&mut self) -> Variable {
-        let name = format!("__anon_{}", self.blank_counter);
-        self.blank_counter += 1;
-        Variable(name)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
+/// Parse a SPARQL SELECT query string into our internal AST.
 pub fn parse(input: &str) -> Result<SelectQuery, DarqError> {
-    let mut p = Parser::new(input.trim());
-    let query = parse_select_query(&mut p)?;
-    p.skip_ws();
-    if !p.is_empty() {
-        return Err(p.error("unexpected trailing input"));
-    }
-    Ok(query)
+    BLANK_COUNTER.store(0, Ordering::Relaxed);
+
+    // Detect SELECT * before parsing (spargebra always wraps in Project)
+    let is_select_star = detect_select_star(input);
+
+    let query = SparqlParser::new()
+        .parse_query(input)
+        .map_err(|e| DarqError::ParseError(e.to_string()))?;
+
+    let Query::Select { pattern, .. } = query else {
+        return Err(DarqError::ParseError("only SELECT queries are supported".into()));
+    };
+
+    unwrap_algebra(pattern, is_select_star)
 }
 
-// ---------------------------------------------------------------------------
-// Top-level: SELECT query
-// ---------------------------------------------------------------------------
+fn detect_select_star(input: &str) -> bool {
+    let upper = input.to_ascii_uppercase();
+    if let Some(pos) = upper.find("SELECT") {
+        let rest = &upper[pos + 6..];
+        let trimmed = rest.trim_start();
+        let after_modifier = if trimmed.starts_with("DISTINCT") {
+            trimmed[8..].trim_start()
+        } else if trimmed.starts_with("REDUCED") {
+            trimmed[7..].trim_start()
+        } else {
+            trimmed
+        };
+        after_modifier.starts_with('*')
+    } else {
+        false
+    }
+}
 
-fn parse_select_query(p: &mut Parser) -> Result<SelectQuery, DarqError> {
-    let (base, prefixes) = parse_prologue(p)?;
-    p.skip_ws();
-    let (select, distinct) = parse_select_clause(p)?;
-    p.skip_ws();
-    let where_pattern = parse_where_clause(p)?;
-    p.skip_ws();
-    let mut modifier = parse_solution_modifier(p)?;
-    modifier.distinct = distinct;
-    p.skip_ws();
-    let values = parse_values_clause(p)?;
+/// Peel off the nested algebra wrappers and convert the body to our flat AST.
+fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<SelectQuery, DarqError> {
+    let mut distinct = false;
+    let mut order_by = Vec::new();
+    let mut limit = None;
+    let mut offset = None;
+    let mut select = SelectClause::Star;
+
+    loop {
+        match pattern {
+            GraphPattern::Slice { inner, start, length } => {
+                if start > 0 {
+                    offset = Some(start);
+                }
+                limit = length;
+                pattern = *inner;
+            }
+            GraphPattern::OrderBy { inner, expression } => {
+                order_by = convert_order_expressions(expression)?;
+                pattern = *inner;
+            }
+            GraphPattern::Distinct { inner } => {
+                distinct = true;
+                pattern = *inner;
+            }
+            GraphPattern::Reduced { inner } => {
+                pattern = *inner;
+            }
+            GraphPattern::Project { inner, variables } => {
+                if !is_select_star {
+                    select = SelectClause::Variables(variables);
+                }
+                pattern = *inner;
+            }
+            _ => break,
+        }
+    }
+
+    let (where_pattern, values) = extract_body(pattern)?;
 
     Ok(SelectQuery {
-        prefixes,
-        base,
         select,
         where_pattern,
-        modifier,
+        modifier: SolutionModifier { distinct, order_by, limit, offset },
         values,
     })
 }
 
-// ---------------------------------------------------------------------------
-// Prologue: BASE and PREFIX declarations
-// ---------------------------------------------------------------------------
-
-fn parse_prologue(p: &mut Parser) -> Result<(Option<Iri>, Vec<PrefixDecl>), DarqError> {
-    let mut base = None;
-    let mut prefixes = Vec::new();
-
-    loop {
-        p.skip_ws();
-        let saved = p.save();
-        if p.try_keyword("BASE") {
-            p.expect_ws()?;
-            base = Some(parse_iri_ref(p)?);
-        } else if p.try_keyword("PREFIX") {
-            p.expect_ws()?;
-            let prefix = parse_pname_ns_prefix(p)?;
-            p.skip_ws();
-            let iri = parse_iri_ref(p)?;
-            prefixes.push(PrefixDecl { prefix, iri });
-        } else {
-            p.restore(saved);
-            break;
+fn convert_order_expressions(exprs: Vec<OrderExpression>) -> Result<Vec<OrderCondition>, DarqError> {
+    exprs.into_iter().map(|expr| {
+        match expr {
+            OrderExpression::Asc(Expression::Variable(v)) => Ok(OrderCondition {
+                variable: v,
+                direction: OrderDirection::Ascending,
+            }),
+            OrderExpression::Desc(Expression::Variable(v)) => Ok(OrderCondition {
+                variable: v,
+                direction: OrderDirection::Descending,
+            }),
+            _ => Err(DarqError::ParseError(
+                "only ORDER BY on variables (ASC/DESC) is supported".into(),
+            )),
         }
-    }
-
-    Ok((base, prefixes))
+    }).collect()
 }
 
-/// Parse the prefix part of PNAME_NS: `foo:` returns "foo", `:` returns "".
-fn parse_pname_ns_prefix(p: &mut Parser) -> Result<String, DarqError> {
-    let prefix = p.take_while(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
-    let prefix = prefix.to_string();
-    p.expect_char(':')?;
-    Ok(prefix)
-}
+/// Extract the WHERE body and optional VALUES clause from the inner pattern.
+fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<ValuesClause>), DarqError> {
+    match pattern {
+        GraphPattern::Bgp { patterns } => {
+            let triples = patterns.into_iter().map(convert_triple).collect::<Result<_, _>>()?;
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![] }, None))
+        }
 
-// ---------------------------------------------------------------------------
-// SELECT clause
-// ---------------------------------------------------------------------------
+        GraphPattern::Filter { expr, inner } => {
+            let filters = extract_filters(expr)?;
+            let (mut ggp, values) = extract_body(*inner)?;
+            ggp.filters = filters;
+            Ok((ggp, values))
+        }
 
-fn parse_select_clause(p: &mut Parser) -> Result<(SelectClause, bool), DarqError> {
-    p.expect_keyword("SELECT")?;
-    p.expect_ws()?;
-
-    // Optional DISTINCT / REDUCED
-    let distinct = if p.try_keyword("DISTINCT") {
-        p.expect_ws()?;
-        true
-    } else if p.try_keyword("REDUCED") {
-        p.expect_ws()?;
-        false
-    } else {
-        false
-    };
-
-    // Star or variable list
-    let clause = if p.try_char('*') {
-        SelectClause::Star
-    } else {
-        let mut vars = vec![parse_variable(p)?];
-        loop {
-            let saved = p.save();
-            p.skip_ws();
-            match parse_variable(p) {
-                Ok(v) => vars.push(v),
-                Err(_) => {
-                    p.restore(saved);
-                    break;
+        GraphPattern::Join { left, right } => {
+            if let GraphPattern::Values { variables, bindings } = *right {
+                let (ggp, existing_values) = extract_body(*left)?;
+                if existing_values.is_some() {
+                    return Err(DarqError::ParseError("multiple VALUES clauses not supported".into()));
                 }
+                return Ok((ggp, Some(ValuesClause { variables, bindings })));
             }
-        }
-        SelectClause::Variables(vars)
-    };
-
-    Ok((clause, distinct))
-}
-
-// ---------------------------------------------------------------------------
-// WHERE clause
-// ---------------------------------------------------------------------------
-
-fn parse_where_clause(p: &mut Parser) -> Result<GroupGraphPattern, DarqError> {
-    // WHERE keyword is optional
-    let saved = p.save();
-    if p.try_keyword("WHERE") {
-        p.skip_ws();
-    } else {
-        p.restore(saved);
-    }
-    parse_group_graph_pattern(p)
-}
-
-fn parse_group_graph_pattern(p: &mut Parser) -> Result<GroupGraphPattern, DarqError> {
-    p.expect_char('{')?;
-    let mut patterns = Vec::new();
-    let mut filters = Vec::new();
-
-    loop {
-        p.skip_ws();
-        // Try FILTER
-        let saved = p.save();
-        if p.try_keyword("FILTER") {
-            p.skip_ws();
-            filters.push(parse_filter(p)?);
-            p.skip_ws();
-            p.try_char('.');
-            continue;
-        }
-        p.restore(saved);
-
-        // Try triples
-        let saved = p.save();
-        match parse_triples_same_subject(p) {
-            Ok(pats) => {
-                patterns.extend(pats);
-                p.skip_ws();
-                p.try_char('.');
+            if let GraphPattern::Values { variables, bindings } = *left {
+                let (ggp, existing_values) = extract_body(*right)?;
+                if existing_values.is_some() {
+                    return Err(DarqError::ParseError("multiple VALUES clauses not supported".into()));
+                }
+                return Ok((ggp, Some(ValuesClause { variables, bindings })));
             }
-            Err(_) => {
-                p.restore(saved);
-                break;
+            let (left_ggp, left_values) = extract_body(*left)?;
+            let (right_ggp, right_values) = extract_body(*right)?;
+            if left_values.is_some() && right_values.is_some() {
+                return Err(DarqError::ParseError("multiple VALUES clauses not supported".into()));
             }
+            let mut patterns = left_ggp.patterns;
+            patterns.extend(right_ggp.patterns);
+            let mut filters = left_ggp.filters;
+            filters.extend(right_ggp.filters);
+            Ok((GroupGraphPattern { patterns, filters }, left_values.or(right_values)))
         }
-    }
 
-    p.skip_ws();
-    p.expect_char('}')?;
-    Ok(GroupGraphPattern { patterns, filters })
-}
-
-fn parse_filter(p: &mut Parser) -> Result<Filter, DarqError> {
-    p.expect_keyword("NOT")?;
-    p.expect_ws()?;
-    p.expect_keyword("EXISTS")?;
-    p.skip_ws();
-    let inner = parse_group_graph_pattern(p)?;
-    Ok(Filter::NotExists(inner))
-}
-
-// ---------------------------------------------------------------------------
-// Triples block
-// ---------------------------------------------------------------------------
-
-/// Parse subject + property-list, desugaring ';' and ',' into flat triple patterns.
-fn parse_triples_same_subject(p: &mut Parser) -> Result<Vec<TriplePattern>, DarqError> {
-    let subject = parse_term_or_variable(p)?;
-    p.expect_ws()?;
-    let pred_obj_pairs = parse_property_list_not_empty(p)?;
-
-    let mut patterns = Vec::new();
-    for (predicate, objects) in pred_obj_pairs {
-        for object in objects {
-            patterns.push(TriplePattern {
-                subject: subject.clone(),
-                predicate: predicate.clone(),
-                object,
-            });
+        GraphPattern::Values { variables, bindings } => {
+            Ok((GroupGraphPattern { patterns: vec![], filters: vec![] }, Some(ValuesClause { variables, bindings })))
         }
-    }
 
-    Ok(patterns)
-}
-
-/// Parse: Verb ObjectList (';' Verb ObjectList)*
-fn parse_property_list_not_empty(
-    p: &mut Parser,
-) -> Result<Vec<(TermOrVariable, Vec<TermOrVariable>)>, DarqError> {
-    let first_pred = parse_verb(p)?;
-    p.expect_ws()?;
-    let first_objs = parse_object_list(p)?;
-
-    let mut pairs = vec![(first_pred, first_objs)];
-
-    loop {
-        let saved = p.save();
-        p.skip_ws();
-        if !p.try_char(';') {
-            p.restore(saved);
-            break;
-        }
-        p.skip_ws();
-        // After ';', there might be another verb or just end (trailing ';' is valid)
-        match parse_verb(p) {
-            Ok(pred) => {
-                p.expect_ws()?;
-                let objs = parse_object_list(p)?;
-                pairs.push((pred, objs));
-            }
-            Err(_) => break,
-        }
-    }
-
-    Ok(pairs)
-}
-
-/// Parse: Object (',' Object)*
-fn parse_object_list(p: &mut Parser) -> Result<Vec<TermOrVariable>, DarqError> {
-    let mut objects = vec![parse_term_or_variable(p)?];
-
-    loop {
-        let saved = p.save();
-        p.skip_ws();
-        if !p.try_char(',') {
-            p.restore(saved);
-            break;
-        }
-        p.skip_ws();
-        objects.push(parse_term_or_variable(p)?);
-    }
-
-    Ok(objects)
-}
-
-/// Verb: VarOrIRIref | 'a'
-fn parse_verb(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
-    // Try 'a' keyword first (must be followed by whitespace, not part of a prefixed name)
-    if let Some(tov) = try_rdf_type_keyword(p) {
-        return Ok(tov);
-    }
-    // Try variable
-    if let Some(c) = p.peek() {
-        if c == '?' || c == '$' {
-            return Ok(TermOrVariable::Variable(parse_variable(p)?));
-        }
-    }
-    // Try IRI ref
-    if p.peek() == Some('<') {
-        return Ok(TermOrVariable::Iri(parse_iri_ref(p)?));
-    }
-    // Try prefixed name
-    parse_prefixed_name(p)
-}
-
-/// Try to parse the 'a' keyword (rdf:type shorthand).
-fn try_rdf_type_keyword(p: &mut Parser) -> Option<TermOrVariable> {
-    let saved = p.save();
-    if p.peek() != Some('a') {
-        return None;
-    }
-    p.advance(1);
-    // 'a' must be followed by whitespace or end of input (not part of a longer token)
-    match p.peek() {
-        None => Some(TermOrVariable::RdfType),
-        Some(c) if c.is_ascii_whitespace() => Some(TermOrVariable::RdfType),
-        _ => {
-            p.restore(saved);
-            None
-        }
+        ref other => Err(DarqError::ParseError(format!(
+            "unsupported graph pattern: {}",
+            pattern_name(other),
+        ))),
     }
 }
 
-// ---------------------------------------------------------------------------
-// VALUES clause
-// ---------------------------------------------------------------------------
-
-fn parse_values_clause(p: &mut Parser) -> Result<Option<ValuesClause>, DarqError> {
-    let saved = p.save();
-    if p.try_keyword("VALUES") {
-        p.skip_ws();
-        Ok(Some(parse_data_block(p)?))
-    } else {
-        p.restore(saved);
-        Ok(None)
+fn pattern_name(gp: &GraphPattern) -> &'static str {
+    match gp {
+        GraphPattern::Bgp { .. } => "Bgp",
+        GraphPattern::Path { .. } => "Path (property paths)",
+        GraphPattern::Join { .. } => "Join",
+        GraphPattern::LeftJoin { .. } => "LeftJoin (OPTIONAL)",
+        GraphPattern::Filter { .. } => "Filter",
+        GraphPattern::Union { .. } => "Union",
+        GraphPattern::Graph { .. } => "Graph",
+        GraphPattern::Extend { .. } => "Extend (BIND)",
+        GraphPattern::Minus { .. } => "Minus",
+        GraphPattern::Values { .. } => "Values",
+        GraphPattern::OrderBy { .. } => "OrderBy",
+        GraphPattern::Project { .. } => "Project",
+        GraphPattern::Distinct { .. } => "Distinct",
+        GraphPattern::Reduced { .. } => "Reduced",
+        GraphPattern::Slice { .. } => "Slice",
+        GraphPattern::Group { .. } => "Group (GROUP BY)",
+        GraphPattern::Service { .. } => "Service",
     }
 }
 
-fn parse_data_block(p: &mut Parser) -> Result<ValuesClause, DarqError> {
-    // Single-variable form: VALUES ?x { ... }
-    // Multi-variable form:  VALUES (?x ?y) { ... }
-    if p.peek() == Some('(') {
-        parse_inline_data_full(p)
-    } else {
-        parse_inline_data_one_var(p)
-    }
-}
-
-/// Parse `Var '{' DataBlockValue* '}'`
-fn parse_inline_data_one_var(p: &mut Parser) -> Result<ValuesClause, DarqError> {
-    let var = parse_variable(p)?;
-    p.skip_ws();
-    p.expect_char('{')?;
-
-    let mut bindings = Vec::new();
-    loop {
-        p.skip_ws();
-        if p.try_char('}') {
-            break;
-        }
-        let val = parse_data_block_value(p)?;
-        bindings.push(vec![val]);
-    }
-
-    Ok(ValuesClause {
-        variables: vec![var],
-        bindings,
-    })
-}
-
-/// Parse `'(' Var* ')' '{' ( '(' DataBlockValue* ')' )* '}'`
-fn parse_inline_data_full(p: &mut Parser) -> Result<ValuesClause, DarqError> {
-    p.expect_char('(')?;
-    let mut variables = Vec::new();
-    loop {
-        p.skip_ws();
-        if p.try_char(')') {
-            break;
-        }
-        variables.push(parse_variable(p)?);
-    }
-
-    p.skip_ws();
-    p.expect_char('{')?;
-
-    let num_vars = variables.len();
-    let mut bindings = Vec::new();
-    loop {
-        p.skip_ws();
-        if p.try_char('}') {
-            break;
-        }
-        p.expect_char('(')?;
-        let mut row = Vec::new();
-        for _ in 0..num_vars {
-            p.skip_ws();
-            row.push(parse_data_block_value(p)?);
-        }
-        p.skip_ws();
-        p.expect_char(')')?;
-        bindings.push(row);
-    }
-
-    Ok(ValuesClause {
-        variables,
-        bindings,
-    })
-}
-
-/// Parse a single data block value: IRI, prefixed name, literal, or UNDEF.
-fn parse_data_block_value(p: &mut Parser) -> Result<DataBlockValue, DarqError> {
-    // UNDEF keyword
-    let saved = p.save();
-    if p.try_keyword("UNDEF") {
-        return Ok(DataBlockValue::Undef);
-    }
-    p.restore(saved);
-
-    // IRI ref: <...>
-    if p.peek() == Some('<') {
-        return Ok(DataBlockValue::Iri(parse_iri_ref(p)?));
-    }
-
-    // String literal: "..." or '...'
-    if let Some(c) = p.peek() {
-        if c == '"' || c == '\'' {
-            return Ok(DataBlockValue::Literal(parse_string_literal(p)?));
-        }
-    }
-
-    // Boolean literal: true/false
-    let saved = p.save();
-    if p.try_keyword("true") {
-        return Ok(DataBlockValue::Literal(AstLiteral::Boolean(true)));
-    }
-    p.restore(saved);
-    if p.try_keyword("false") {
-        return Ok(DataBlockValue::Literal(AstLiteral::Boolean(false)));
-    }
-    p.restore(saved);
-
-    // Integer literal (possibly negative)
-    if let Some(c) = p.peek() {
-        if c.is_ascii_digit() || c == '-' {
-            return Ok(DataBlockValue::Literal(parse_integer_literal(p)?));
-        }
-    }
-
-    // Prefixed name: prefix:local
-    let pn = parse_prefixed_name(p)?;
-    match pn {
-        TermOrVariable::PrefixedName { prefix, local } => {
-            Ok(DataBlockValue::PrefixedName { prefix, local })
-        }
-        _ => unreachable!(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Solution modifiers
-// ---------------------------------------------------------------------------
-
-fn parse_solution_modifier(p: &mut Parser) -> Result<SolutionModifier, DarqError> {
-    let mut modifier = SolutionModifier::default();
-
-    // ORDER BY
-    p.skip_ws();
-    let saved = p.save();
-    if p.try_keyword("ORDER") {
-        p.expect_ws()?;
-        p.expect_keyword("BY")?;
-        p.expect_ws()?;
-        modifier.order_by = parse_order_conditions(p)?;
-    } else {
-        p.restore(saved);
-    }
-
-    // LIMIT and OFFSET can appear in either order
-    for _ in 0..2 {
-        p.skip_ws();
-        let saved = p.save();
-        if modifier.limit.is_none() && p.try_keyword("LIMIT") {
-            p.expect_ws()?;
-            modifier.limit = Some(parse_usize(p)?);
-        } else {
-            p.restore(saved);
-            let saved = p.save();
-            if modifier.offset.is_none() && p.try_keyword("OFFSET") {
-                p.expect_ws()?;
-                modifier.offset = Some(parse_usize(p)?);
+fn extract_filters(expr: Expression) -> Result<Vec<Filter>, DarqError> {
+    match expr {
+        Expression::Not(inner) => {
+            if let Expression::Exists(gp) = *inner {
+                let (ggp, _) = extract_body(*gp)?;
+                Ok(vec![Filter::NotExists(ggp)])
             } else {
-                p.restore(saved);
+                Err(DarqError::ParseError("only FILTER NOT EXISTS is supported".into()))
             }
         }
-    }
-
-    Ok(modifier)
-}
-
-fn parse_order_conditions(p: &mut Parser) -> Result<Vec<OrderCondition>, DarqError> {
-    let mut conditions = vec![parse_order_condition(p)?];
-    loop {
-        let saved = p.save();
-        p.skip_ws();
-        match parse_order_condition(p) {
-            Ok(cond) => conditions.push(cond),
-            Err(_) => {
-                p.restore(saved);
-                break;
-            }
+        Expression::And(left, right) => {
+            let mut filters = extract_filters(*left)?;
+            filters.extend(extract_filters(*right)?);
+            Ok(filters)
         }
+        _ => Err(DarqError::ParseError(
+            "only FILTER NOT EXISTS is supported".into(),
+        )),
     }
-    Ok(conditions)
 }
 
-fn parse_order_condition(p: &mut Parser) -> Result<OrderCondition, DarqError> {
-    // ASC(?var) or DESC(?var)
-    let saved = p.save();
-    if p.try_keyword("ASC") {
-        p.skip_ws();
-        p.expect_char('(')?;
-        p.skip_ws();
-        let var = parse_variable(p)?;
-        p.skip_ws();
-        p.expect_char(')')?;
-        return Ok(OrderCondition {
-            variable: var,
-            direction: OrderDirection::Ascending,
-        });
-    }
-    p.restore(saved);
-
-    let saved = p.save();
-    if p.try_keyword("DESC") {
-        p.skip_ws();
-        p.expect_char('(')?;
-        p.skip_ws();
-        let var = parse_variable(p)?;
-        p.skip_ws();
-        p.expect_char(')')?;
-        return Ok(OrderCondition {
-            variable: var,
-            direction: OrderDirection::Descending,
-        });
-    }
-    p.restore(saved);
-
-    // Bare ?var (defaults to ascending)
-    let var = parse_variable(p)?;
-    Ok(OrderCondition {
-        variable: var,
-        direction: OrderDirection::Ascending,
+fn convert_triple(tp: spargebra::term::TriplePattern) -> Result<TriplePattern, DarqError> {
+    Ok(TriplePattern {
+        subject: convert_term_pattern(tp.subject)?,
+        predicate: convert_named_node_pattern(tp.predicate),
+        object: convert_term_pattern(tp.object)?,
     })
 }
 
-fn parse_usize(p: &mut Parser) -> Result<usize, DarqError> {
-    let digits = p.take_while(|c| c.is_ascii_digit());
-    if digits.is_empty() {
-        return Err(p.error("expected integer"));
-    }
-    digits
-        .parse()
-        .map_err(|_| p.error("invalid integer"))
-}
-
-// ---------------------------------------------------------------------------
-// Terms and variables
-// ---------------------------------------------------------------------------
-
-fn parse_term_or_variable(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
-    // Blank node: []
-    if p.peek() == Some('[') {
-        let saved = p.save();
-        p.advance(1);
-        p.skip_ws();
-        if p.try_char(']') {
-            return Ok(TermOrVariable::Variable(p.fresh_blank_variable()));
-        }
-        p.restore(saved);
-    }
-    // Variable: ?x or $x
-    if let Some(c) = p.peek() {
-        if c == '?' || c == '$' {
-            return Ok(TermOrVariable::Variable(parse_variable(p)?));
-        }
-    }
-    // 'a' keyword
-    if let Some(tov) = try_rdf_type_keyword(p) {
-        return Ok(tov);
-    }
-    // IRI ref: <...>
-    if p.peek() == Some('<') {
-        return Ok(TermOrVariable::Iri(parse_iri_ref(p)?));
-    }
-    // String literal: "..." or '...'
-    if let Some(c) = p.peek() {
-        if c == '"' || c == '\'' {
-            return Ok(TermOrVariable::Literal(parse_string_literal(p)?));
-        }
-    }
-    // Boolean literal: true/false
-    let saved = p.save();
-    if p.try_keyword("true") {
-        return Ok(TermOrVariable::Literal(AstLiteral::Boolean(true)));
-    }
-    p.restore(saved);
-    if p.try_keyword("false") {
-        return Ok(TermOrVariable::Literal(AstLiteral::Boolean(false)));
-    }
-    p.restore(saved);
-    // Integer literal (possibly negative)
-    if let Some(c) = p.peek() {
-        if c.is_ascii_digit() || c == '-' {
-            return Ok(TermOrVariable::Literal(parse_integer_literal(p)?));
-        }
-    }
-    // Prefixed name: prefix:local
-    parse_prefixed_name(p)
-}
-
-fn parse_variable(p: &mut Parser) -> Result<Variable, DarqError> {
-    let c = p.peek().ok_or_else(|| p.error("expected variable"))?;
-    if c != '?' && c != '$' {
-        return Err(p.error("expected '?' or '$'"));
-    }
-    p.advance(1);
-    let name = p.take_while(|c| c.is_alphanumeric() || c == '_');
-    if name.is_empty() {
-        return Err(p.error("expected variable name"));
-    }
-    Ok(Variable(name.to_string()))
-}
-
-/// Parse `<...>` IRI reference.
-fn parse_iri_ref(p: &mut Parser) -> Result<Iri, DarqError> {
-    p.expect_char('<')?;
-    let iri_str = p.take_while(|c| c != '>');
-    p.expect_char('>')?;
-    Ok(Iri::new(iri_str))
-}
-
-/// Parse prefixed name like `foaf:name` or `ex:` or `:localName`.
-fn parse_prefixed_name(p: &mut Parser) -> Result<TermOrVariable, DarqError> {
-    let prefix = p.take_while(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
-    let prefix = prefix.to_string();
-    p.expect_char(':')?;
-    let local = p.take_while(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.');
-    let local = local.to_string();
-    Ok(TermOrVariable::PrefixedName { prefix, local })
-}
-
-// ---------------------------------------------------------------------------
-// Literals
-// ---------------------------------------------------------------------------
-
-fn parse_string_literal(p: &mut Parser) -> Result<AstLiteral, DarqError> {
-    let quote = p.peek().ok_or_else(|| p.error("expected string literal"))?;
-
-    // Check for long strings (""" or ''')
-    let rem = p.remaining();
-    let long_delim = if quote == '"' { "\"\"\"" } else { "'''" };
-    if rem.starts_with(long_delim) {
-        let s = parse_long_string(p, quote)?;
-        return Ok(AstLiteral::String(s));
-    }
-
-    // Short string
-    p.advance(1); // consume opening quote
-    let mut result = String::new();
-    loop {
-        let c = p.peek().ok_or_else(|| p.error("unterminated string"))?;
-        if c == quote {
-            p.advance(1);
-            return Ok(AstLiteral::String(result));
-        }
-        if c == '\\' {
-            p.advance(1);
-            let esc = p.peek().ok_or_else(|| p.error("unterminated escape"))?;
-            p.advance(esc.len_utf8());
-            result.push(match esc {
-                't' => '\t',
-                'n' => '\n',
-                'r' => '\r',
-                '\\' | '"' | '\'' => esc,
-                _ => return Err(p.error(&format!("invalid escape: \\{}", esc))),
-            });
-        } else if c == '\n' || c == '\r' {
-            return Err(p.error("newline in short string"));
-        } else {
-            p.advance(c.len_utf8());
-            result.push(c);
+fn convert_term_pattern(tp: TermPattern) -> Result<TermOrVariable, DarqError> {
+    match tp {
+        TermPattern::Variable(v) => Ok(TermOrVariable::Variable(v)),
+        TermPattern::NamedNode(nn) => Ok(TermOrVariable::Iri(Iri::new(nn.into_string()))),
+        TermPattern::Literal(lit) => Ok(TermOrVariable::Literal(lit)),
+        TermPattern::BlankNode(_bn) => {
+            let n = BLANK_COUNTER.fetch_add(1, Ordering::Relaxed);
+            Ok(TermOrVariable::Variable(Variable::new_unchecked(format!("__anon_{}", n))))
         }
     }
 }
 
-fn parse_long_string(p: &mut Parser, quote: char) -> Result<String, DarqError> {
-    // Skip opening triple-quote
-    p.advance(3);
-    let close = if quote == '"' { "\"\"\"" } else { "'''" };
-
-    let mut result = String::new();
-    loop {
-        if p.remaining().starts_with(close) {
-            p.advance(3);
-            return Ok(result);
-        }
-        let c = p.peek().ok_or_else(|| p.error("unterminated long string"))?;
-        if c == '\\' {
-            p.advance(1);
-            let esc = p.peek().ok_or_else(|| p.error("unterminated escape"))?;
-            p.advance(esc.len_utf8());
-            result.push(match esc {
-                't' => '\t',
-                'n' => '\n',
-                'r' => '\r',
-                '\\' | '"' | '\'' => esc,
-                _ => return Err(p.error(&format!("invalid escape: \\{}", esc))),
-            });
-        } else {
-            p.advance(c.len_utf8());
-            result.push(c);
-        }
+fn convert_named_node_pattern(nnp: NamedNodePattern) -> TermOrVariable {
+    match nnp {
+        NamedNodePattern::NamedNode(nn) => TermOrVariable::Iri(Iri::new(nn.into_string())),
+        NamedNodePattern::Variable(v) => TermOrVariable::Variable(v),
     }
 }
-
-fn parse_integer_literal(p: &mut Parser) -> Result<AstLiteral, DarqError> {
-    let neg = p.try_char('-');
-    let digits = p.take_while(|c| c.is_ascii_digit());
-    if digits.is_empty() {
-        return Err(p.error("expected digits"));
-    }
-    let n: i64 = digits
-        .parse()
-        .map_err(|_| p.error("invalid integer"))?;
-    Ok(AstLiteral::Integer(if neg { -n } else { n }))
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_simple_select_star() {
-        let q = parse("SELECT * WHERE { ?s ?p ?o }").unwrap();
-        assert!(matches!(q.select, SelectClause::Star));
+    fn test_parse_simple_select() {
+        let q = parse("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").unwrap();
+        assert!(matches!(q.select, SelectClause::Variables(ref vars) if vars.len() == 3));
         assert_eq!(q.where_pattern.patterns.len(), 1);
     }
 
     #[test]
-    fn test_select_variables() {
-        let q = parse("SELECT ?name ?age WHERE { ?s ?p ?o }").unwrap();
-        match &q.select {
-            SelectClause::Variables(vars) => {
-                assert_eq!(vars.len(), 2);
-                assert_eq!(vars[0].0, "name");
-                assert_eq!(vars[1].0, "age");
-            }
-            _ => panic!("expected Variables"),
+    fn test_parse_select_star() {
+        let q = parse("SELECT * WHERE { ?s ?p ?o }").unwrap();
+        assert!(matches!(q.select, SelectClause::Star));
+    }
+
+    #[test]
+    fn test_parse_with_prefix() {
+        let q = parse("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ex:name ?o }").unwrap();
+        match &q.where_pattern.patterns[0].predicate {
+            TermOrVariable::Iri(iri) => assert_eq!(iri.0, "http://example.org/name"),
+            other => panic!("expected Iri, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_prefix_and_prefixed_names() {
-        let q = parse(
-            "PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ex:name ?o }",
-        )
-        .unwrap();
-        assert_eq!(q.prefixes.len(), 1);
-        assert_eq!(q.prefixes[0].prefix, "ex");
-        assert_eq!(q.prefixes[0].iri.0, "http://example.org/");
-
-        let pred = &q.where_pattern.patterns[0].predicate;
-        match pred {
-            TermOrVariable::PrefixedName { prefix, local } => {
-                assert_eq!(prefix, "ex");
-                assert_eq!(local, "name");
-            }
-            _ => panic!("expected PrefixedName"),
+    fn test_parse_rdf_type() {
+        let q = parse("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s a ex:Person }").unwrap();
+        match &q.where_pattern.patterns[0].predicate {
+            TermOrVariable::Iri(iri) => assert_eq!(iri.0, "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            other => panic!("expected rdf:type IRI, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_rdf_type_keyword() {
-        let q = parse("SELECT * WHERE { ?s a ?type }").unwrap();
-        assert!(matches!(
-            q.where_pattern.patterns[0].predicate,
-            TermOrVariable::RdfType
-        ));
+    fn test_parse_filter_not_exists() {
+        let q = parse("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ex:name ?o . FILTER NOT EXISTS { ?s ex:age ?a } }").unwrap();
+        assert_eq!(q.where_pattern.filters.len(), 1);
+        match &q.where_pattern.filters[0] {
+            Filter::NotExists(ggp) => assert_eq!(ggp.patterns.len(), 1),
+        }
     }
 
     #[test]
-    fn test_multiple_triple_patterns() {
-        let q = parse(
-            "SELECT * WHERE { ?s a ?type . ?s <http://example.org/name> ?name }",
-        )
-        .unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 2);
-    }
-
-    #[test]
-    fn test_semicolon_shorthand() {
-        let q = parse(
-            "SELECT * WHERE { ?s a ?type ; <http://example.org/name> ?name }",
-        )
-        .unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 2);
-        let s1 = &q.where_pattern.patterns[0].subject;
-        let s2 = &q.where_pattern.patterns[1].subject;
-        assert!(matches!(s1, TermOrVariable::Variable(Variable(v)) if v == "s"));
-        assert!(matches!(s2, TermOrVariable::Variable(Variable(v)) if v == "s"));
-    }
-
-    #[test]
-    fn test_comma_shorthand() {
-        let q = parse(
-            "SELECT * WHERE { ?s <http://example.org/knows> ?a , ?b }",
-        )
-        .unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 2);
-    }
-
-    #[test]
-    fn test_solution_modifiers() {
-        let q = parse(
-            "SELECT * WHERE { ?s ?p ?o } ORDER BY ?s DESC(?o) LIMIT 10 OFFSET 5",
-        )
-        .unwrap();
-        assert_eq!(q.modifier.order_by.len(), 2);
-        assert!(matches!(
-            q.modifier.order_by[0].direction,
-            OrderDirection::Ascending
-        ));
-        assert!(matches!(
-            q.modifier.order_by[1].direction,
-            OrderDirection::Descending
-        ));
+    fn test_parse_order_by_limit_offset() {
+        let q = parse("SELECT ?s WHERE { ?s <http://ex.org/p> ?o } ORDER BY ?s LIMIT 10 OFFSET 5").unwrap();
+        assert!(!q.modifier.distinct);
+        assert_eq!(q.modifier.order_by.len(), 1);
         assert_eq!(q.modifier.limit, Some(10));
         assert_eq!(q.modifier.offset, Some(5));
     }
 
     #[test]
-    fn test_distinct() {
-        let q = parse("SELECT DISTINCT ?s WHERE { ?s ?p ?o }").unwrap();
+    fn test_parse_distinct() {
+        let q = parse("SELECT DISTINCT ?s WHERE { ?s <http://ex.org/p> ?o }").unwrap();
         assert!(q.modifier.distinct);
     }
 
     #[test]
-    fn test_string_literal() {
-        let q = parse(r#"SELECT * WHERE { ?s ?p "hello" }"#).unwrap();
-        match &q.where_pattern.patterns[0].object {
-            TermOrVariable::Literal(AstLiteral::String(s)) => assert_eq!(s, "hello"),
-            other => panic!("expected string literal, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_integer_literal() {
-        let q = parse("SELECT * WHERE { ?s ?p 42 }").unwrap();
-        match &q.where_pattern.patterns[0].object {
-            TermOrVariable::Literal(AstLiteral::Integer(n)) => assert_eq!(*n, 42),
-            other => panic!("expected integer literal, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_boolean_literal() {
-        let q = parse("SELECT * WHERE { ?s ?p true }").unwrap();
-        match &q.where_pattern.patterns[0].object {
-            TermOrVariable::Literal(AstLiteral::Boolean(b)) => assert!(*b),
-            other => panic!("expected boolean literal, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_trailing_dot() {
-        let q = parse("SELECT * WHERE { ?s ?p ?o . }").unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 1);
-    }
-
-    #[test]
-    fn test_optional_where_keyword() {
-        let q = parse("SELECT * { ?s ?p ?o }").unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 1);
-    }
-
-    #[test]
-    fn test_full_query() {
-        let query = r#"
-            PREFIX ex: <http://example.org/>
-
-            SELECT ?name ?age
-            WHERE {
-                ?person a ex:Person .
-                ?person ex:name ?name .
-                ?person ex:age ?age .
-            }
-            ORDER BY ?name
-            LIMIT 10
-        "#;
-        let q = parse(query).unwrap();
-        assert_eq!(q.prefixes.len(), 1);
-        assert_eq!(q.where_pattern.patterns.len(), 3);
-        assert_eq!(q.modifier.order_by.len(), 1);
-        assert_eq!(q.modifier.limit, Some(10));
-        match &q.select {
-            SelectClause::Variables(vars) => {
-                assert_eq!(vars.len(), 2);
-                assert_eq!(vars[0].0, "name");
-                assert_eq!(vars[1].0, "age");
-            }
-            _ => panic!("expected Variables"),
-        }
-    }
-
-    #[test]
-    fn test_no_values_clause() {
-        let q = parse("SELECT * WHERE { ?s ?p ?o }").unwrap();
-        assert!(q.values.is_none());
-    }
-
-    #[test]
-    fn test_values_single_var() {
-        let q = parse("SELECT ?x WHERE { ?x ?p ?o } VALUES ?x { 1 2 3 }").unwrap();
-        let vc = q.values.as_ref().unwrap();
+    fn test_parse_values() {
+        let q = parse("SELECT * WHERE { ?s <http://ex.org/p> ?o } VALUES ?s { <http://ex.org/a> <http://ex.org/b> }").unwrap();
+        assert!(q.values.is_some());
+        let vc = q.values.unwrap();
         assert_eq!(vc.variables.len(), 1);
-        assert_eq!(vc.variables[0].0, "x");
-        assert_eq!(vc.bindings.len(), 3);
-        assert!(matches!(&vc.bindings[0][0], DataBlockValue::Literal(AstLiteral::Integer(1))));
-        assert!(matches!(&vc.bindings[1][0], DataBlockValue::Literal(AstLiteral::Integer(2))));
-        assert!(matches!(&vc.bindings[2][0], DataBlockValue::Literal(AstLiteral::Integer(3))));
-    }
-
-    #[test]
-    fn test_values_multi_var() {
-        let q = parse(r#"SELECT * WHERE { ?s ?p ?o } VALUES (?x ?y) { (1 "a") (2 "b") }"#).unwrap();
-        let vc = q.values.as_ref().unwrap();
-        assert_eq!(vc.variables.len(), 2);
-        assert_eq!(vc.variables[0].0, "x");
-        assert_eq!(vc.variables[1].0, "y");
         assert_eq!(vc.bindings.len(), 2);
     }
 
     #[test]
-    fn test_values_undef() {
-        let q = parse(r#"SELECT * WHERE { ?s ?p ?o } VALUES (?x ?y) { (1 UNDEF) }"#).unwrap();
-        let vc = q.values.as_ref().unwrap();
-        assert!(matches!(&vc.bindings[0][0], DataBlockValue::Literal(AstLiteral::Integer(1))));
-        assert!(matches!(&vc.bindings[0][1], DataBlockValue::Undef));
-    }
-
-    #[test]
-    fn test_values_with_iri() {
-        let q = parse("SELECT * WHERE { ?s ?p ?o } VALUES ?x { <http://example.org/a> }").unwrap();
-        let vc = q.values.as_ref().unwrap();
-        assert!(matches!(&vc.bindings[0][0], DataBlockValue::Iri(iri) if iri.0 == "http://example.org/a"));
-    }
-
-    #[test]
-    fn test_values_with_prefixed_name() {
-        let q = parse("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o } VALUES ?x { ex:Alice }").unwrap();
-        let vc = q.values.as_ref().unwrap();
-        assert!(matches!(&vc.bindings[0][0], DataBlockValue::PrefixedName { prefix, local } if prefix == "ex" && local == "Alice"));
-    }
-
-    #[test]
-    fn test_values_empty() {
-        let q = parse("SELECT * WHERE { ?s ?p ?o } VALUES ?x { }").unwrap();
-        let vc = q.values.as_ref().unwrap();
-        assert_eq!(vc.variables.len(), 1);
-        assert!(vc.bindings.is_empty());
-    }
-
-    #[test]
-    fn test_blank_node_subject() {
-        let q = parse("SELECT * WHERE { [] ?p ?o }").unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 1);
+    fn test_parse_blank_node() {
+        let q = parse("PREFIX ex: <http://example.org/> SELECT * WHERE { [] ex:name ?o }").unwrap();
         match &q.where_pattern.patterns[0].subject {
-            TermOrVariable::Variable(Variable(name)) => {
-                assert!(name.starts_with("__anon_"));
-            }
+            TermOrVariable::Variable(v) => assert!(v.as_str().starts_with("__anon_")),
             other => panic!("expected anonymous variable, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_filter_not_exists() {
-        let q = parse(
-            "SELECT * WHERE { ?s ?p ?o . FILTER NOT EXISTS { ?x <http://example.org/r> ?s } }",
-        )
-        .unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 1);
-        assert_eq!(q.where_pattern.filters.len(), 1);
-        match &q.where_pattern.filters[0] {
-            Filter::NotExists(inner) => {
-                assert_eq!(inner.patterns.len(), 1);
-                assert!(matches!(
-                    &inner.patterns[0].subject,
-                    TermOrVariable::Variable(Variable(v)) if v == "x"
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn test_filter_not_exists_with_blank_node() {
-        let q = parse(
-            "SELECT * WHERE { ?dobj ?p ?o . FILTER NOT EXISTS { [] <http://example.org/next> ?dobj } }",
-        )
-        .unwrap();
-        assert_eq!(q.where_pattern.patterns.len(), 1);
-        assert_eq!(q.where_pattern.filters.len(), 1);
-        match &q.where_pattern.filters[0] {
-            Filter::NotExists(inner) => {
-                assert_eq!(inner.patterns.len(), 1);
-                // Subject is anonymous
-                match &inner.patterns[0].subject {
-                    TermOrVariable::Variable(Variable(name)) => {
-                        assert!(name.starts_with("__anon_"));
-                    }
-                    other => panic!("expected anonymous variable, got {:?}", other),
-                }
-                // Object is ?dobj (shared with outer)
-                assert!(matches!(
-                    &inner.patterns[0].object,
-                    TermOrVariable::Variable(Variable(v)) if v == "dobj"
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn test_filter_not_exists_no_dot_before() {
-        // FILTER can appear without a dot before it
-        let q = parse(
-            "SELECT * WHERE { ?s ?p ?o FILTER NOT EXISTS { ?x <http://example.org/r> ?s } }",
-        );
-        // This should fail because there's no dot between the triple and FILTER
-        // and `FILTER` is not a valid verb/object — but the parser might handle
-        // it if FILTER appears after the property list. Let's check:
-        // Actually, the triples_same_subject will consume `?s ?p ?o` then the
-        // loop tries to read `.` — doesn't find it, breaks, then tries FILTER.
-        // Wait, the loop in parse_group_graph_pattern tries triples_same_subject
-        // first. It consumes `?s ?p ?o`, then the dot check. No dot found after `?o`,
-        // so it doesn't consume a dot. Then the loop continues, tries FILTER keyword.
-        assert!(q.is_ok());
+    fn test_unknown_prefix_is_parse_error() {
+        let result = parse("SELECT ?x WHERE { ?s foaf:name ?x }");
+        assert!(result.is_err());
     }
 }
