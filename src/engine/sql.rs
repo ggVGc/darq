@@ -6,6 +6,9 @@ use crate::ir::{QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::{FieldDescriptor, FieldType, Schema};
 use crate::sql::sql_literal;
+use crate::sql_util::{
+    build_ref_left_joins, is_array_field, is_ref_field, resolve_table_name,
+};
 
 /// Maximum number of values in a single SQL IN clause.
 const MAX_IN_CLAUSE_SIZE: usize = 500;
@@ -272,7 +275,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
 
         for ti in &type_iris {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
-            let table = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
+            let table = resolve_table_name(schema, ti);
 
             // Check if any constraint targets a StringArray field with a variable
             let subj_col = self.quoted_subject_col();
@@ -305,45 +308,21 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                 {
                     let fd = fields.iter().find(|f| f.name == c.field_name).unwrap();
                     if let FieldType::Reference(ref targets) = fd.field_type {
-                        let fk_expr = format!("{}\"{}\"", col_prefix, c.field_name);
-                        if targets.len() == 1 {
-                            let target_table = schema
-                                .table_name(&targets[0])
-                                .unwrap_or_else(|| iri_local_name(&targets[0]));
-                            let alias = format!("_ref{}", ref_idx);
-                            ref_idx += 1;
-                            ref_joins.push(format!(
-                                " LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
-                                target_table, alias, alias, self.id_column, fk_expr
-                            ));
-                            select_cols.push(format!(
-                                "\"{}\".\"{}\" AS \"{}\"",
-                                alias, self.subject_column, c.field_name
-                            ));
-                        } else if targets.len() > 1 {
-                            let mut coalesce_parts = Vec::new();
-                            for target_type in targets {
-                                let target_table = schema
-                                    .table_name(target_type)
-                                    .unwrap_or_else(|| iri_local_name(target_type));
-                                let alias = format!("_ref{}", ref_idx);
-                                ref_idx += 1;
-                                ref_joins.push(format!(
-                                    " LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
-                                    target_table, alias, alias, self.id_column, fk_expr
-                                ));
-                                coalesce_parts.push(format!(
-                                    "\"{}\".\"{}\"",
-                                    alias, self.subject_column
-                                ));
+                        if targets.is_empty() {
+                            select_cols.push(format!("{}\"{}\"", col_prefix, c.field_name));
+                        } else {
+                            let fk_expr = format!("{}\"{}\"", col_prefix, c.field_name);
+                            let result = build_ref_left_joins(
+                                schema, targets, &fk_expr, &self.id_column,
+                                &self.subject_column, "_ref", ref_idx,
+                            );
+                            ref_idx += result.join_clauses.len();
+                            for jc in result.join_clauses {
+                                ref_joins.push(format!(" {}", jc));
                             }
                             select_cols.push(format!(
-                                "COALESCE({}) AS \"{}\"",
-                                coalesce_parts.join(", "),
-                                c.field_name
+                                "{} AS \"{}\"", result.select_expr, c.field_name
                             ));
-                        } else {
-                            select_cols.push(format!("{}\"{}\"", col_prefix, c.field_name));
                         }
                     }
                 } else {
@@ -464,60 +443,17 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                     };
                     let subj_term = Term::Iri(Iri::new(subj_str));
 
-                    // Find which existing solutions this row matches
-                    let default_refs: Vec<&Binding> =
-                        group.solutions.iter().collect();
-                    let matching: &[&Binding] = match &solutions_by_subject {
-                        Some(map) => map
-                            .get(subj_str)
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]),
-                        None => &default_refs,
-                    };
+                    let matching = find_matching_solutions(
+                        subj_str, group.solutions, &solutions_by_subject,
+                    );
+                    let type_term = Term::Iri((*ti).clone());
 
-                    for &existing in matching {
-                        let mut binding: Binding = existing.clone();
-                        let mut ok = true;
-
-                        if let Subject::Variable(v) = subject {
-                            if !try_bind(v, &subj_term, &mut binding) {
-                                ok = false;
-                            }
-                        }
-
-                        if ok {
-                            if let Some(tv) = type_variable {
-                                let term = Term::Iri((*ti).clone());
-                                if !try_bind(tv, &term, &mut binding) {
-                                    ok = false;
-                                }
-                            }
-                        }
-
-                        if ok {
-                            for c in constraints {
-                                if let Value::Variable(v) = &c.value {
-                                    if let Some(Some(raw)) = col_map.get(c.field_name.as_str()) {
-                                        let fd = fields.iter().find(|f| f.name == c.field_name);
-                                        let term = match fd {
-                                            Some(fd) => parse_sql_value(raw, &fd.field_type),
-                                            None => {
-                                                Term::Literal(Literal::String(raw.clone()))
-                                            }
-                                        };
-                                        if !try_bind(v, &term, &mut binding) {
-                                            ok = false;
-                                            break;
-                                        }
-                                    } else {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if ok {
+                    let row_data = ResourceRowData { col_map: &col_map, fields, constraints };
+                    for existing in &matching {
+                        if let Some(binding) = match_resource_row(
+                            existing, subject, &subj_term,
+                            type_variable, Some(&type_term), &row_data,
+                        ) {
                             all_bindings.push(binding);
                         }
                     }
@@ -556,7 +492,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
 
         for ti in &type_iris {
             let fields = schema.fields_for_type(ti).unwrap_or(&[]);
-            let table = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
+            let table = resolve_table_name(schema, ti);
 
             let subj_col = self.quoted_subject_col();
             let subject_groups = group_by_subject(solutions, subject_var);
@@ -696,38 +632,15 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
                                     None => continue,
                                 };
                                 let subj_term = Term::Iri(Iri::new(subj_str));
-
-                                let default_refs: Vec<&Binding> =
-                                    group.solutions.iter().collect();
-                                let matching: &[&Binding] = match &solutions_by_subject {
-                                    Some(map) => map
-                                        .get(subj_str)
-                                        .map(|v| v.as_slice())
-                                        .unwrap_or(&[]),
-                                    None => &default_refs,
-                                };
-
-                                for &existing in matching {
-                                    let mut binding: Binding = existing.clone();
-                                    let mut ok = true;
-
-                                    if let Subject::Variable(v) = subject {
-                                        if !try_bind(v, &subj_term, &mut binding) {
-                                            ok = false;
-                                        }
-                                    }
-                                    if ok && !try_bind(predicate_var, &pred_term, &mut binding) {
-                                        ok = false;
-                                    }
-                                    if ok {
-                                        if let Value::Variable(v) = object {
-                                            if !try_bind(v, &obj_term, &mut binding) {
-                                                ok = false;
-                                            }
-                                        }
-                                    }
-                                    if ok {
-                                        all_bindings.push(binding);
+                                let matching = find_matching_solutions(
+                                    subj_str, group.solutions, &solutions_by_subject,
+                                );
+                                for existing in &matching {
+                                    if let Some(b) = match_field_scan_row(
+                                        existing, subject, &subj_term,
+                                        predicate_var, &pred_term, object, &obj_term,
+                                    ) {
+                                        all_bindings.push(b);
                                     }
                                 }
                             }
@@ -861,37 +774,18 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         let (field_select, extra_from) = if is_array {
             (format!("unnest(\"{}\") AS \"{}\"", fd.name, fd.name), String::new())
         } else if let FieldType::Reference(ref targets) = fd.field_type {
-            if targets.len() == 1 {
-                let target_table = schema
-                    .table_name(&targets[0])
-                    .unwrap_or_else(|| iri_local_name(&targets[0]));
-                (
-                    format!("\"_rref\".\"{}\" AS \"{}\"", self.subject_column, fd.name),
-                    format!(
-                        " LEFT JOIN \"{}\" AS \"_rref\" ON \"_rref\".\"{}\" = \"{}\".\"{}\"",
-                        target_table, self.id_column, table, fd.name
-                    ),
-                )
-            } else if targets.len() > 1 {
-                let mut coalesce_parts = Vec::new();
-                let mut joins = String::new();
-                for (idx, target_type) in targets.iter().enumerate() {
-                    let target_table = schema
-                        .table_name(target_type)
-                        .unwrap_or_else(|| iri_local_name(target_type));
-                    let alias = format!("_rref{}", idx);
-                    joins.push_str(&format!(
-                        " LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = \"{}\".\"{}\"",
-                        target_table, alias, alias, self.id_column, table, fd.name
-                    ));
-                    coalesce_parts.push(format!("\"{}\".\"{}\"", alias, self.subject_column));
-                }
-                (
-                    format!("COALESCE({}) AS \"{}\"", coalesce_parts.join(", "), fd.name),
-                    joins,
-                )
-            } else {
+            if targets.is_empty() {
                 (format!("\"{}\"", fd.name), String::new())
+            } else {
+                let fk_expr = format!("\"{}\".\"{}\"", table, fd.name);
+                let result = build_ref_left_joins(
+                    schema, targets, &fk_expr, &self.id_column,
+                    &self.subject_column, "_rref", 0,
+                );
+                let joins = result.join_clauses.iter()
+                    .map(|j| format!(" {}", j))
+                    .collect::<String>();
+                (format!("{} AS \"{}\"", result.select_expr, fd.name), joins)
             }
         } else {
             (format!("\"{}\"", fd.name), String::new())
@@ -923,47 +817,122 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
 
             let subj_term = Term::Iri(Iri::new(subj_str));
             let obj_term = parse_sql_value(obj_str, &fd.field_type);
+            let matching = find_matching_solutions(subj_str, solutions, &solutions_by_subject);
 
-            let default_refs: Vec<&Binding> = solutions.iter().collect();
-            let matching: &[&Binding] = match &solutions_by_subject {
-                Some(map) => map.get(subj_str).map(|v| v.as_slice()).unwrap_or(&[]),
-                None => &default_refs,
-            };
-
-            for &existing in matching {
-                let mut binding: Binding = existing.clone();
-                let mut ok = true;
-
-                if let Subject::Variable(v) = subject {
-                    if !try_bind(v, &subj_term, &mut binding) {
-                        ok = false;
-                    }
-                }
-                if ok && !try_bind(predicate_var, pred_term, &mut binding) {
-                    ok = false;
-                }
-                if ok {
-                    match object {
-                        Value::Variable(v) => {
-                            if !try_bind(v, &obj_term, &mut binding) {
-                                ok = false;
-                            }
-                        }
-                        Value::Bound(expected) => {
-                            if *expected != obj_term {
-                                ok = false;
-                            }
-                        }
-                    }
-                }
-                if ok {
-                    bindings.push(binding);
+            for existing in &matching {
+                if let Some(b) = match_field_scan_row(
+                    existing, subject, &subj_term,
+                    predicate_var, pred_term, object, &obj_term,
+                ) {
+                    bindings.push(b);
                 }
             }
         }
 
         Ok(bindings)
     }
+}
+
+/// Find matching existing solutions for a given subject IRI string.
+fn find_matching_solutions<'a>(
+    subj_str: &str,
+    solutions: &'a [Binding],
+    solutions_by_subject: &Option<HashMap<&str, Vec<&'a Binding>>>,
+) -> Vec<&'a Binding> {
+    match solutions_by_subject {
+        Some(map) => map
+            .get(subj_str)
+            .map(|v| v.to_vec())
+            .unwrap_or_default(),
+        None => solutions.iter().collect(),
+    }
+}
+
+/// Try to bind a FieldScan row (subject, predicate, object) against an existing solution.
+/// Returns Some(binding) on success, None on conflict.
+fn match_field_scan_row(
+    existing: &Binding,
+    subject: &Subject,
+    subject_term: &Term,
+    predicate_var: &str,
+    pred_term: &Term,
+    object: &Value,
+    obj_term: &Term,
+) -> Option<Binding> {
+    let mut binding = existing.clone();
+
+    if let Subject::Variable(v) = subject
+        && !try_bind(v, subject_term, &mut binding)
+    {
+        return None;
+    }
+    if !try_bind(predicate_var, pred_term, &mut binding) {
+        return None;
+    }
+    match object {
+        Value::Variable(v) => {
+            if !try_bind(v, obj_term, &mut binding) {
+                return None;
+            }
+        }
+        Value::Bound(expected) => {
+            if *expected != *obj_term {
+                return None;
+            }
+        }
+    }
+    Some(binding)
+}
+
+/// Column data for a resource row, used in `match_resource_row`.
+struct ResourceRowData<'a> {
+    col_map: &'a HashMap<&'a str, &'a Option<String>>,
+    fields: &'a [FieldDescriptor],
+    constraints: &'a [crate::ir::FieldConstraint],
+}
+
+/// Try to bind a Resource row (subject, type_variable, field constraints) against an existing solution.
+/// Returns Some(binding) on success, None on conflict.
+fn match_resource_row(
+    existing: &Binding,
+    subject: &Subject,
+    subject_term: &Term,
+    type_variable: &Option<String>,
+    type_term: Option<&Term>,
+    row: &ResourceRowData<'_>,
+) -> Option<Binding> {
+    let mut binding = existing.clone();
+
+    if let Subject::Variable(v) = subject
+        && !try_bind(v, subject_term, &mut binding)
+    {
+        return None;
+    }
+
+    if let (Some(tv), Some(term)) = (type_variable.as_deref(), type_term)
+        && !try_bind(tv, term, &mut binding)
+    {
+        return None;
+    }
+
+    for c in row.constraints {
+        if let Value::Variable(v) = &c.value {
+            if let Some(Some(raw)) = row.col_map.get(c.field_name.as_str()) {
+                let fd = row.fields.iter().find(|f| f.name == c.field_name);
+                let term = match fd {
+                    Some(fd) => parse_sql_value(raw, &fd.field_type),
+                    None => Term::Literal(Literal::String(raw.clone())),
+                };
+                if !try_bind(v, &term, &mut binding) {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+
+    Some(binding)
 }
 
 /// A group of solutions that share the same subject values (or all have unbound subjects).
@@ -1073,18 +1042,6 @@ fn try_bind(var: &str, term: &Term, binding: &mut Binding) -> bool {
     }
 }
 
-/// Extract the local name from an IRI (the part after the last `#` or `/`).
-/// Used as fallback when a type is not registered in the schema.
-fn iri_local_name(iri: &Iri) -> &str {
-    let s = &iri.0;
-    if let Some(pos) = s.rfind('#') {
-        &s[pos + 1..]
-    } else if let Some(pos) = s.rfind('/') {
-        &s[pos + 1..]
-    } else {
-        s
-    }
-}
 
 /// Build a mapping from SPARQL variable name to its SQL field type.
 ///
@@ -1127,19 +1084,6 @@ fn build_variable_type_map(plan: &QueryPlan, schema: &Schema) -> HashMap<String,
     map
 }
 
-/// Check if a field is an array type.
-fn is_array_field(fields: &[FieldDescriptor], name: &str) -> bool {
-    fields
-        .iter()
-        .any(|f| f.name == name && matches!(f.field_type, FieldType::StringArray))
-}
-
-/// Check if a field is a Reference type.
-fn is_ref_field(fields: &[FieldDescriptor], name: &str) -> bool {
-    fields
-        .iter()
-        .any(|f| f.name == name && matches!(f.field_type, FieldType::Reference(_)))
-}
 
 /// Convert a SQL string value to a typed Term based on schema field type info.
 fn parse_sql_value(raw: &str, field_type: &FieldType) -> Term {

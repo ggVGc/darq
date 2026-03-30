@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
 use crate::error::DarqError;
-use crate::ir::{NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{FieldConstraint, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term};
 use crate::schema::Schema;
 use crate::sparql::ast::{OrderDirection, SelectClause};
+use crate::sql_util::{
+    assemble_from_join, build_ref_left_joins, field_comparison_sql, is_array_field,
+    resolve_table_name,
+};
 
 /// How a SPARQL variable maps to a SQL expression.
 #[derive(Clone)]
@@ -31,398 +35,278 @@ impl SqlExpr {
     }
 }
 
-/// Translate a resource-level query plan into a SQL string.
-///
-/// Assumes one table per resource type, named after the local part of the
-/// type IRI (e.g. `http://example.org/Person` → `"Person"`), with a
-/// `subject_column` for the resource IRI, an `id_column` for the primary key
-/// used in joins, and one column per field.
-///
-/// When `id_column` differs from `subject_column`, joins use the id column
-/// (matching foreign-key references) while SELECT output uses the subject
-/// column (returning full IRIs).
-pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column: &str) -> Result<String, DarqError> {
-    // select_bindings: used for SELECT output and ORDER BY (returns full IRIs for subjects).
-    // join_bindings:   used for JOIN/WHERE conditions (uses id for subjects).
-    let mut select_bindings: HashMap<String, SqlExpr> = HashMap::new();
-    let mut join_bindings: HashMap<String, SqlExpr> = HashMap::new();
-    let mut from_parts: Vec<String> = Vec::new();
-    let mut where_parts: Vec<String> = Vec::new();
-    // Track reference-typed field variables that may need LEFT JOIN resolution
-    // to return full IRIs instead of raw foreign key IDs.
-    // Key: variable name, Value: (pattern_idx, field_column, target_type_iris)
-    let mut ref_field_bindings: HashMap<String, (usize, String, Vec<Iri>)> = HashMap::new();
+/// Schema and column-name context shared across all pattern processing.
+struct SqlContext<'a> {
+    schema: &'a Schema,
+    subject_column: &'a str,
+    id_column: &'a str,
+}
 
-    for (i, pattern) in plan.patterns.iter().enumerate() {
-        let alias = format!("p{}", i);
+/// Mutable state accumulated while translating a query plan to SQL.
+struct SqlBuildState {
+    /// Used for SELECT output and ORDER BY (returns full IRIs for subjects).
+    select_bindings: HashMap<String, SqlExpr>,
+    /// Used for JOIN/WHERE conditions (uses id for subjects).
+    join_bindings: HashMap<String, SqlExpr>,
+    from_parts: Vec<String>,
+    where_parts: Vec<String>,
+    /// Reference-typed field variables that may need LEFT JOIN resolution.
+    /// Key: variable name, Value: (pattern_idx, field_column, target_type_iris)
+    ref_field_bindings: HashMap<String, (usize, String, Vec<Iri>)>,
+}
 
-        match pattern {
-            QueryPattern::Resource {
-                subject,
-                type_iri,
-                constraints,
-                type_variable,
-            } => {
-                let mut join_conds: Vec<String> = Vec::new();
-
-                // Determine the table source.
-                let source = if let Some(ti) = type_iri {
-                    let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
-                    format!("\"{}\"", tbl)
-                } else {
-                    // No concrete type — UNION ALL over all registered types.
-                    let parts: Vec<String> = schema
-                        .known_types()
-                        .map(|ti| {
-                            let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
-                            format!(
-                                "SELECT \"{}\", \"{}\", '{}' AS \"_type\" FROM \"{}\"",
-                                subject_column,
-                                id_column,
-                                ti.0,
-                                tbl
-                            )
-                        })
-                        .collect();
-                    if parts.is_empty() {
-                        format!("(SELECT NULL AS \"{}\", NULL AS \"{}\", NULL AS \"_type\" WHERE FALSE)", subject_column, id_column)
-                    } else {
-                        format!("({})", parts.join(" UNION ALL "))
-                    }
-                };
-
-                // Subject binding.
-                match subject {
-                    Subject::Variable(v) => {
-                        if let Some(existing) = join_bindings.get(v) {
-                            join_conds.push(format!(
-                                "\"{}\".\"{}\" = {}",
-                                alias,
-                                id_column,
-                                existing.to_sql()
-                            ));
-                            // Override select binding: use the subject column
-                            // from this pattern (canonical IRI).
-                            select_bindings.insert(
-                                v.clone(),
-                                SqlExpr::Column {
-                                    pattern_idx: i,
-                                    column: subject_column.to_string(),
-                                },
-                            );
-                            // No longer needs LEFT JOIN resolution — the subject
-                            // pattern provides the full IRI directly.
-                            ref_field_bindings.remove(v);
-                        } else {
-                            select_bindings.insert(
-                                v.clone(),
-                                SqlExpr::Column {
-                                    pattern_idx: i,
-                                    column: subject_column.to_string(),
-                                },
-                            );
-                            join_bindings.insert(
-                                v.clone(),
-                                SqlExpr::Column {
-                                    pattern_idx: i,
-                                    column: id_column.to_string(),
-                                },
-                            );
-                        }
-                    }
-                    Subject::Bound(iri) => {
-                        where_parts.push(format!(
-                            "\"{}\".\"{}\" = '{}'",
-                            alias, subject_column, iri.0
-                        ));
-                    }
-                }
-
-                // Type variable binding.
-                if let Some(tv) = type_variable {
-                    if let Some(ti) = type_iri {
-                        // Known type — bind to a constant.
-                        let constant = SqlExpr::Constant(format!("'{}'", ti.0));
-                        select_bindings.insert(tv.clone(), constant.clone());
-                        join_bindings.insert(tv.clone(), constant);
-                    } else {
-                        // Unknown type — bind to the _type column from the UNION.
-                        if let Some(existing) = join_bindings.get(tv) {
-                            join_conds.push(format!(
-                                "\"{}\".\"_type\" = {}",
-                                alias,
-                                existing.to_sql()
-                            ));
-                        } else {
-                            let expr = SqlExpr::Column {
-                                pattern_idx: i,
-                                column: "_type".into(),
-                            };
-                            select_bindings.insert(tv.clone(), expr.clone());
-                            join_bindings.insert(tv.clone(), expr);
-                        }
-                    }
-                }
-
-                // Field constraint bindings.
-                let fields = type_iri
-                    .as_ref()
-                    .and_then(|ti| schema.fields_for_type(ti));
-                for c in constraints {
-                    let is_array = fields
-                        .map(|fs| {
-                            fs.iter().any(|f| {
-                                f.name == c.field_name
-                                    && matches!(f.field_type, crate::schema::FieldType::StringArray | crate::schema::FieldType::ReferenceArray(_))
-                            })
-                        })
-                        .unwrap_or(false);
-
-                    match &c.value {
-                        Value::Variable(v) => {
-                            if let Some(existing) = join_bindings.get(v) {
-                                if is_array {
-                                    join_conds.push(format!(
-                                        "{} = ANY(\"{}\".\"{}\")",
-                                        existing.to_sql(),
-                                        alias,
-                                        c.field_name,
-                                    ));
-                                } else {
-                                    join_conds.push(format!(
-                                        "\"{}\".\"{}\" = {}",
-                                        alias,
-                                        c.field_name,
-                                        existing.to_sql()
-                                    ));
-                                }
-                            } else if is_array {
-                                let expr = SqlExpr::Unnest {
-                                    pattern_idx: i,
-                                    column: c.field_name.clone(),
-                                };
-                                select_bindings.insert(v.clone(), expr.clone());
-                                join_bindings.insert(v.clone(), expr);
-                            } else {
-                                let expr = SqlExpr::Column {
-                                    pattern_idx: i,
-                                    column: c.field_name.clone(),
-                                };
-                                select_bindings.insert(v.clone(), expr.clone());
-                                join_bindings.insert(v.clone(), expr);
-                                // SPARQL basic graph pattern: the triple must exist.
-                                join_conds.push(format!(
-                                    "\"{}\".\"{}\" IS NOT NULL",
-                                    alias, c.field_name
-                                ));
-                                // Track Reference fields for LEFT JOIN IRI resolution.
-                                if let Some(fd) = fields.and_then(|fs| fs.iter().find(|f| f.name == c.field_name)) {
-                                    if let crate::schema::FieldType::Reference(ref targets) = fd.field_type {
-                                        if !targets.is_empty() {
-                                            ref_field_bindings.insert(
-                                                v.clone(),
-                                                (i, c.field_name.clone(), targets.clone()),
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Value::Bound(term) => {
-                            if is_array {
-                                where_parts.push(format!(
-                                    "{} = ANY(\"{}\".\"{}\")",
-                                    sql_literal(term), alias, c.field_name
-                                ));
-                            } else {
-                                where_parts.push(format!(
-                                    "\"{}\".\"{}\" = {}",
-                                    alias, c.field_name, sql_literal(term)
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                // Assemble FROM / JOIN.
-                if from_parts.is_empty() {
-                    from_parts.push(format!("{} AS \"{}\"", source, alias));
-                    where_parts.extend(join_conds);
-                } else if join_conds.is_empty() {
-                    from_parts.push(format!("CROSS JOIN {} AS \"{}\"", source, alias));
-                } else {
-                    from_parts.push(format!(
-                        "INNER JOIN {} AS \"{}\" ON {}",
-                        source,
-                        alias,
-                        join_conds.join(" AND ")
-                    ));
-                }
-            }
-
-            QueryPattern::FieldScan { .. } => {
-                return Err(DarqError::ParseError(
-                    "FieldScan patterns are not yet supported in SQL translation".into(),
-                ));
-            }
+impl SqlBuildState {
+    fn new() -> Self {
+        Self {
+            select_bindings: HashMap::new(),
+            join_bindings: HashMap::new(),
+            from_parts: Vec::new(),
+            where_parts: Vec::new(),
+            ref_field_bindings: HashMap::new(),
         }
     }
+}
 
-    // Add LEFT JOINs for reference field variables that were never resolved
-    // by appearing as a subject in a later pattern.  This ensures SELECT
-    // returns the full IRI (from the referenced table's subject column)
-    // instead of the raw foreign-key ID.
-    let mut ref_alias_counter = 0usize;
-    for (var_name, (pattern_idx, field_col, target_types)) in &ref_field_bindings {
-        let field_expr = format!("\"p{}\".\"{}\"", pattern_idx, field_col);
+/// Process a single Resource pattern, updating the SQL build state.
+fn process_resource_pattern(
+    i: usize,
+    subject: &Subject,
+    type_iri: &Option<Iri>,
+    constraints: &[FieldConstraint],
+    type_variable: &Option<String>,
+    ctx: &SqlContext<'_>,
+    st: &mut SqlBuildState,
+) {
+    let (schema, subject_column, id_column) = (ctx.schema, ctx.subject_column, ctx.id_column);
+    let alias = format!("p{}", i);
+    let mut join_conds: Vec<String> = Vec::new();
 
-        if target_types.len() == 1 {
-            let target_type = &target_types[0];
-            let target_table = schema
-                .table_name(target_type)
-                .unwrap_or_else(|| iri_local_name(target_type));
-            let ref_alias = format!("_ref{}", ref_alias_counter);
-            ref_alias_counter += 1;
-
-            from_parts.push(format!(
-                "LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
-                target_table, ref_alias, ref_alias, id_column, field_expr
-            ));
-            select_bindings.insert(
-                var_name.clone(),
-                SqlExpr::Constant(format!("\"{}\".\"{}\"", ref_alias, subject_column)),
-            );
+    // Determine the table source.
+    let source = if let Some(ti) = type_iri {
+        let tbl = resolve_table_name(schema, ti);
+        format!("\"{}\"", tbl)
+    } else {
+        // No concrete type — UNION ALL over all registered types.
+        let parts: Vec<String> = schema
+            .known_types()
+            .map(|ti| {
+                let tbl = resolve_table_name(schema, ti);
+                format!(
+                    "SELECT \"{}\", \"{}\", '{}' AS \"_type\" FROM \"{}\"",
+                    subject_column, id_column, ti.0, tbl
+                )
+            })
+            .collect();
+        if parts.is_empty() {
+            format!("(SELECT NULL AS \"{}\", NULL AS \"{}\", NULL AS \"_type\" WHERE FALSE)", subject_column, id_column)
         } else {
-            // Multi-target reference: LEFT JOIN each target, COALESCE results.
-            let mut coalesce_parts = Vec::new();
-            for target_type in target_types {
-                let target_table = schema
-                    .table_name(target_type)
-                    .unwrap_or_else(|| iri_local_name(target_type));
-                let ref_alias = format!("_ref{}", ref_alias_counter);
-                ref_alias_counter += 1;
+            format!("({})", parts.join(" UNION ALL "))
+        }
+    };
 
-                from_parts.push(format!(
-                    "LEFT JOIN \"{}\" AS \"{}\" ON \"{}\".\"{}\" = {}",
-                    target_table, ref_alias, ref_alias, id_column, field_expr
+    // Subject binding.
+    match subject {
+        Subject::Variable(v) => {
+            if let Some(existing) = st.join_bindings.get(v) {
+                join_conds.push(format!(
+                    "\"{}\".\"{}\" = {}",
+                    alias, id_column, existing.to_sql()
                 ));
-                coalesce_parts.push(format!("\"{}\".\"{}\"", ref_alias, subject_column));
+                st.select_bindings.insert(
+                    v.clone(),
+                    SqlExpr::Column { pattern_idx: i, column: subject_column.to_string() },
+                );
+                st.ref_field_bindings.remove(v);
+            } else {
+                st.select_bindings.insert(
+                    v.clone(),
+                    SqlExpr::Column { pattern_idx: i, column: subject_column.to_string() },
+                );
+                st.join_bindings.insert(
+                    v.clone(),
+                    SqlExpr::Column { pattern_idx: i, column: id_column.to_string() },
+                );
             }
-            select_bindings.insert(
-                var_name.clone(),
-                SqlExpr::Constant(format!("COALESCE({})", coalesce_parts.join(", "))),
-            );
+        }
+        Subject::Bound(iri) => {
+            st.where_parts.push(format!(
+                "\"{}\".\"{}\" = '{}'",
+                alias, subject_column, iri.0
+            ));
         }
     }
 
-    // VALUES clause: inline data filtering/joining.
-    if let Some(ref values) = plan.values {
-        let values_alias = "_values";
-        let no_undefs = values
+    // Type variable binding.
+    if let Some(tv) = type_variable {
+        if let Some(ti) = type_iri {
+            let constant = SqlExpr::Constant(format!("'{}'", ti.0));
+            st.select_bindings.insert(tv.clone(), constant.clone());
+            st.join_bindings.insert(tv.clone(), constant);
+        } else {
+            if let Some(existing) = st.join_bindings.get(tv) {
+                join_conds.push(format!(
+                    "\"{}\".\"_type\" = {}",
+                    alias, existing.to_sql()
+                ));
+            } else {
+                let expr = SqlExpr::Column { pattern_idx: i, column: "_type".into() };
+                st.select_bindings.insert(tv.clone(), expr.clone());
+                st.join_bindings.insert(tv.clone(), expr);
+            }
+        }
+    }
+
+    // Field constraint bindings.
+    let fields = type_iri.as_ref().and_then(|ti| schema.fields_for_type(ti));
+    let fields_slice = fields.unwrap_or(&[]);
+    for c in constraints {
+        let is_array = is_array_field(fields_slice, &c.field_name);
+
+        match &c.value {
+            Value::Variable(v) => {
+                if let Some(existing) = st.join_bindings.get(v) {
+                    join_conds.push(field_comparison_sql(
+                        &alias, &c.field_name, &existing.to_sql(), is_array,
+                    ));
+                } else if is_array {
+                    let expr = SqlExpr::Unnest { pattern_idx: i, column: c.field_name.clone() };
+                    st.select_bindings.insert(v.clone(), expr.clone());
+                    st.join_bindings.insert(v.clone(), expr);
+                } else {
+                    let expr = SqlExpr::Column { pattern_idx: i, column: c.field_name.clone() };
+                    st.select_bindings.insert(v.clone(), expr.clone());
+                    st.join_bindings.insert(v.clone(), expr);
+                    join_conds.push(format!("\"{}\".\"{}\" IS NOT NULL", alias, c.field_name));
+                    // Track Reference fields for LEFT JOIN IRI resolution.
+                    if let Some(fd) = fields.and_then(|fs| fs.iter().find(|f| f.name == c.field_name))
+                        && let crate::schema::FieldType::Reference(ref targets) = fd.field_type
+                        && !targets.is_empty()
+                    {
+                        st.ref_field_bindings.insert(
+                            v.clone(),
+                            (i, c.field_name.clone(), targets.clone()),
+                        );
+                    }
+                }
+            }
+            Value::Bound(term) => {
+                st.where_parts.push(field_comparison_sql(
+                    &alias, &c.field_name, &sql_literal(term), is_array,
+                ));
+            }
+        }
+    }
+
+    assemble_from_join(&mut st.from_parts, &mut st.where_parts, &source, &alias, join_conds);
+}
+
+/// Add LEFT JOINs for reference field variables not resolved by a subject pattern.
+fn resolve_ref_field_bindings(
+    schema: &Schema,
+    subject_column: &str,
+    id_column: &str,
+    st: &mut SqlBuildState,
+) {
+    let mut ref_alias_counter = 0usize;
+    for (var_name, (pattern_idx, field_col, target_types)) in &st.ref_field_bindings {
+        let field_expr = format!("\"p{}\".\"{}\"", pattern_idx, field_col);
+        let result = build_ref_left_joins(
+            schema, target_types, &field_expr, id_column, subject_column, "_ref", ref_alias_counter,
+        );
+        ref_alias_counter += result.join_clauses.len();
+        st.from_parts.extend(result.join_clauses);
+        st.select_bindings.insert(var_name.clone(), SqlExpr::Constant(result.select_expr));
+    }
+}
+
+/// Process VALUES clause into the SQL build state.
+fn process_values_clause(
+    values: &crate::ir::InlineData,
+    st: &mut SqlBuildState,
+) {
+    let values_alias = "_values";
+    let no_undefs = values.rows.iter().all(|r| r.iter().all(|v| v.is_some()));
+
+    if values.variables.len() == 1 && no_undefs {
+        // Single-variable, no UNDEFs: use IN clause or derived table.
+        let var = &values.variables[0];
+        let in_values: Vec<String> = values
             .rows
             .iter()
-            .all(|r| r.iter().all(|v| v.is_some()));
+            .filter_map(|r| r[0].as_ref().map(sql_literal))
+            .collect();
 
-        if values.variables.len() == 1 && no_undefs {
-            // Single-variable, no UNDEFs: use IN clause or derived table.
-            let var = &values.variables[0];
-            let in_values: Vec<String> = values
-                .rows
-                .iter()
-                .filter_map(|r| r[0].as_ref().map(sql_literal))
-                .collect();
-
-            if let Some(expr) = select_bindings.get(var) {
-                // Variable already bound by a pattern — add WHERE IN filter.
-                where_parts.push(format!(
-                    "{} IN ({})",
-                    expr.to_sql(),
-                    in_values.join(", ")
-                ));
-            } else {
-                // Variable only from VALUES — add as a derived table.
-                let rows_sql: Vec<String> = in_values
-                    .iter()
-                    .map(|v| format!("SELECT {} AS \"{}\"", v, var))
-                    .collect();
-                let derived = format!("({})", rows_sql.join(" UNION ALL "));
-                if from_parts.is_empty() {
-                    from_parts.push(format!("{} AS \"{}\"", derived, values_alias));
-                } else {
-                    from_parts.push(format!(
-                        "CROSS JOIN {} AS \"{}\"",
-                        derived, values_alias
-                    ));
-                }
-                let expr = SqlExpr::Constant(format!(
-                    "\"{}\".\"{}\"",
-                    values_alias, var
-                ));
-                select_bindings.insert(var.clone(), expr.clone());
-                join_bindings.insert(var.clone(), expr);
-            }
+        if let Some(expr) = st.select_bindings.get(var) {
+            st.where_parts.push(format!("{} IN ({})", expr.to_sql(), in_values.join(", ")));
         } else {
-            // Multi-variable or has UNDEFs: derived table with UNION ALL rows.
-            let rows_sql: Vec<String> = values
-                .rows
+            let rows_sql: Vec<String> = in_values
                 .iter()
-                .map(|row| {
-                    let vals: Vec<String> = row
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            let sql_val = match v {
-                                Some(term) => sql_literal(term),
-                                None => "NULL".to_string(),
-                            };
-                            format!("{} AS \"{}\"", sql_val, values.variables[i])
-                        })
-                        .collect();
-                    format!("SELECT {}", vals.join(", "))
-                })
+                .map(|v| format!("SELECT {} AS \"{}\"", v, var))
                 .collect();
             let derived = format!("({})", rows_sql.join(" UNION ALL "));
-
-            let mut join_conds = Vec::new();
-            for var in &values.variables {
-                if let Some(expr) = join_bindings.get(var) {
-                    join_conds.push(format!(
-                        "\"{}\".\"{}\" = {}",
-                        values_alias, var, expr.to_sql()
-                    ));
-                } else {
-                    let expr = SqlExpr::Constant(format!(
-                        "\"{}\".\"{}\"",
-                        values_alias, var
-                    ));
-                    select_bindings.insert(var.clone(), expr.clone());
-                    join_bindings.insert(var.clone(), expr);
-                }
+            if st.from_parts.is_empty() {
+                st.from_parts.push(format!("{} AS \"{}\"", derived, values_alias));
+            } else {
+                st.from_parts.push(format!("CROSS JOIN {} AS \"{}\"", derived, values_alias));
             }
+            let expr = SqlExpr::Constant(format!("\"{}\".\"{}\"", values_alias, var));
+            st.select_bindings.insert(var.clone(), expr.clone());
+            st.join_bindings.insert(var.clone(), expr);
+        }
+    } else {
+        // Multi-variable or has UNDEFs: derived table with UNION ALL rows.
+        let rows_sql: Vec<String> = values
+            .rows
+            .iter()
+            .map(|row| {
+                let vals: Vec<String> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let sql_val = match v {
+                            Some(term) => sql_literal(term),
+                            None => "NULL".to_string(),
+                        };
+                        format!("{} AS \"{}\"", sql_val, values.variables[i])
+                    })
+                    .collect();
+                format!("SELECT {}", vals.join(", "))
+            })
+            .collect();
+        let derived = format!("({})", rows_sql.join(" UNION ALL "));
 
-            if from_parts.is_empty() {
-                from_parts.push(format!("{} AS \"{}\"", derived, values_alias));
-            } else if join_conds.is_empty() {
-                from_parts.push(format!(
-                    "CROSS JOIN {} AS \"{}\"",
-                    derived, values_alias
+        let mut join_conds = Vec::new();
+        for var in &values.variables {
+            if let Some(expr) = st.join_bindings.get(var) {
+                join_conds.push(format!(
+                    "\"{}\".\"{}\" = {}",
+                    values_alias, var, expr.to_sql()
                 ));
             } else {
-                from_parts.push(format!(
-                    "INNER JOIN {} AS \"{}\" ON {}",
-                    derived, values_alias, join_conds.join(" AND ")
-                ));
+                let expr = SqlExpr::Constant(format!("\"{}\".\"{}\"", values_alias, var));
+                st.select_bindings.insert(var.clone(), expr.clone());
+                st.join_bindings.insert(var.clone(), expr);
             }
         }
-    }
 
-    // NOT EXISTS filters: try decorrelation for anonymous-subject patterns,
-    // fall back to correlated subqueries otherwise.
+        assemble_from_join(&mut st.from_parts, &mut st.where_parts, &derived, values_alias, join_conds);
+    }
+}
+
+/// Process NOT EXISTS filters into WHERE clauses.
+fn process_not_exists_filters(
+    filters: &[NotExistsFilter],
+    schema: &Schema,
+    subject_column: &str,
+    id_column: &str,
+    join_bindings: &HashMap<String, SqlExpr>,
+    where_parts: &mut Vec<String>,
+) -> Result<(), DarqError> {
     let mut decorrelated_groups: HashMap<String, Vec<DecorrelatedAntiJoin>> = HashMap::new();
     let mut correlated_filters: Vec<(usize, &NotExistsFilter)> = Vec::new();
 
-    for (fi, filter) in plan.filters.iter().enumerate() {
-        if let Some(aj) = try_decorrelate_not_exists(filter, schema, id_column, &join_bindings) {
+    for (fi, filter) in filters.iter().enumerate() {
+        if let Some(aj) = try_decorrelate_not_exists(filter, schema, id_column, join_bindings) {
             decorrelated_groups
                 .entry(aj.outer_variable.clone())
                 .or_default()
@@ -432,7 +316,6 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         }
     }
 
-    // Emit combined NOT IN clauses for decorrelated groups.
     for anti_joins in decorrelated_groups.values() {
         let outer_expr = anti_joins[0].outer_expr.to_sql();
         let subqueries: Vec<String> = anti_joins
@@ -455,24 +338,21 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         where_parts.push(format!("{} NOT IN ({})", outer_expr, combined));
     }
 
-    // Emit correlated NOT EXISTS for non-decorrelatable filters.
     for (fi, filter) in &correlated_filters {
         let subquery = generate_not_exists_subquery(
-            filter, *fi, schema, subject_column, id_column, &join_bindings,
+            filter, *fi, schema, subject_column, id_column, join_bindings,
         )?;
         where_parts.push(format!("NOT EXISTS ({})", subquery));
     }
 
-    // Null-check filters: emit IS NULL for each field on the variable's table.
-    for nc in &plan.null_checks {
-        if let Some(SqlExpr::Column { pattern_idx, .. }) = join_bindings.get(&nc.variable) {
-            for field in &nc.field_names {
-                where_parts.push(format!("\"p{}\".\"{}\" IS NULL", pattern_idx, field));
-            }
-        }
-    }
+    Ok(())
+}
 
-    // Resolve selected variables (using select_bindings for output).
+/// Assemble the final SQL string from accumulated build state.
+fn assemble_final_sql(
+    plan: &QueryPlan,
+    st: &SqlBuildState,
+) -> String {
     let vars = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.as_str().to_owned()).collect::<Vec<_>>(),
         SelectClause::Star => plan.collect_variables(),
@@ -481,26 +361,20 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
     let select_cols: Vec<String> = vars
         .iter()
         .filter_map(|v| {
-            select_bindings
+            st.select_bindings
                 .get(v)
                 .map(|expr| format!("{} AS \"{}\"", expr.to_sql(), v))
         })
         .collect();
 
-    let distinct = if plan.modifier.distinct {
-        "DISTINCT "
-    } else {
-        ""
-    };
-
+    let distinct = if plan.modifier.distinct { "DISTINCT " } else { "" };
     let mut sql = format!("SELECT {}{}", distinct, select_cols.join(", "));
 
-    if !from_parts.is_empty() {
-        sql.push_str(&format!("\nFROM {}", from_parts.join("\n")));
+    if !st.from_parts.is_empty() {
+        sql.push_str(&format!("\nFROM {}", st.from_parts.join("\n")));
     }
-
-    if !where_parts.is_empty() {
-        sql.push_str(&format!("\nWHERE {}", where_parts.join(" AND ")));
+    if !st.where_parts.is_empty() {
+        sql.push_str(&format!("\nWHERE {}", st.where_parts.join(" AND ")));
     }
 
     if !plan.modifier.order_by.is_empty() {
@@ -513,7 +387,7 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
                     OrderDirection::Ascending => "ASC",
                     OrderDirection::Descending => "DESC",
                 };
-                match select_bindings.get(oc.variable.as_str()) {
+                match st.select_bindings.get(oc.variable.as_str()) {
                     Some(expr) => format!("{} {}", expr.to_sql(), dir),
                     None => format!("\"{}\" {}", oc.variable.as_str(), dir),
                 }
@@ -525,12 +399,63 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
     if let Some(limit) = plan.modifier.limit {
         sql.push_str(&format!("\nLIMIT {}", limit));
     }
-
     if let Some(offset) = plan.modifier.offset {
         sql.push_str(&format!("\nOFFSET {}", offset));
     }
 
-    Ok(sql)
+    sql
+}
+
+/// Translate a resource-level query plan into a SQL string.
+///
+/// Assumes one table per resource type, named after the local part of the
+/// type IRI (e.g. `http://example.org/Person` → `"Person"`), with a
+/// `subject_column` for the resource IRI, an `id_column` for the primary key
+/// used in joins, and one column per field.
+///
+/// When `id_column` differs from `subject_column`, joins use the id column
+/// (matching foreign-key references) while SELECT output uses the subject
+/// column (returning full IRIs).
+pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column: &str) -> Result<String, DarqError> {
+    let ctx = SqlContext { schema, subject_column, id_column };
+    let mut st = SqlBuildState::new();
+
+    for (i, pattern) in plan.patterns.iter().enumerate() {
+        match pattern {
+            QueryPattern::Resource { subject, type_iri, constraints, type_variable } => {
+                process_resource_pattern(
+                    i, subject, type_iri, constraints, type_variable, &ctx, &mut st,
+                );
+            }
+            QueryPattern::FieldScan { .. } => {
+                return Err(DarqError::ParseError(
+                    "FieldScan patterns are not yet supported in SQL translation".into(),
+                ));
+            }
+        }
+    }
+
+    resolve_ref_field_bindings(schema, subject_column, id_column, &mut st);
+
+    if let Some(ref values) = plan.values {
+        process_values_clause(values, &mut st);
+    }
+
+    process_not_exists_filters(
+        &plan.filters, schema, subject_column, id_column,
+        &st.join_bindings, &mut st.where_parts,
+    )?;
+
+    // Null-check filters.
+    for nc in &plan.null_checks {
+        if let Some(SqlExpr::Column { pattern_idx, .. }) = st.join_bindings.get(&nc.variable) {
+            for field in &nc.field_names {
+                st.where_parts.push(format!("\"p{}\".\"{}\" IS NULL", pattern_idx, field));
+            }
+        }
+    }
+
+    Ok(assemble_final_sql(plan, &st))
 }
 
 /// Translate multiple resource-level query plans into a single SQL string
@@ -593,19 +518,6 @@ pub fn to_union_sql(
     }
 
     Ok(sql)
-}
-
-/// Extract the local name from an IRI (the part after the last `#` or `/`).
-/// Used as fallback when a type is not registered in the schema.
-fn iri_local_name(iri: &Iri) -> &str {
-    let s = &iri.0;
-    if let Some(pos) = s.rfind('#') {
-        &s[pos + 1..]
-    } else if let Some(pos) = s.rfind('/') {
-        &s[pos + 1..]
-    } else {
-        s
-    }
 }
 
 /// Convert a Term to a SQL literal string.
@@ -679,10 +591,7 @@ fn try_decorrelate_not_exists(
             };
 
             let outer_expr = outer_bindings.get(&outer_var)?.clone();
-            let table_name = schema
-                .table_name(ti)
-                .unwrap_or_else(|| iri_local_name(ti))
-                .to_string();
+            let table_name = resolve_table_name(schema, ti).to_string();
 
             let is_array = schema
                 .fields_for_type(ti)
@@ -732,7 +641,7 @@ fn generate_not_exists_subquery(
                 ..
             } => {
                 let source = if let Some(ti) = type_iri {
-                    let tbl = schema.table_name(ti).unwrap_or_else(|| iri_local_name(ti));
+                    let tbl = resolve_table_name(schema, ti);
                     format!("\"{}\"", tbl)
                 } else {
                     return Err(DarqError::SqlError(
@@ -778,44 +687,22 @@ fn generate_not_exists_subquery(
                 let fields = type_iri
                     .as_ref()
                     .and_then(|ti| schema.fields_for_type(ti));
+                let fields_slice = fields.unwrap_or(&[]);
 
                 for c in constraints {
-                    let is_array = fields
-                        .map(|fs| {
-                            fs.iter().any(|f| {
-                                f.name == c.field_name
-                                    && matches!(f.field_type, crate::schema::FieldType::StringArray | crate::schema::FieldType::ReferenceArray(_))
-                            })
-                        })
-                        .unwrap_or(false);
+                    let is_array = is_array_field(fields_slice, &c.field_name);
 
                     match &c.value {
                         Value::Variable(v) => {
                             // Check outer bindings first (correlation), then inner
                             if let Some(outer_expr) = outer_bindings.get(v) {
-                                if is_array {
-                                    join_conds.push(format!(
-                                        "{} = ANY(\"{}\".\"{}\")",
-                                        outer_expr.to_sql(), alias, c.field_name,
-                                    ));
-                                } else {
-                                    join_conds.push(format!(
-                                        "\"{}\".\"{}\" = {}",
-                                        alias, c.field_name, outer_expr.to_sql()
-                                    ));
-                                }
+                                join_conds.push(field_comparison_sql(
+                                    &alias, &c.field_name, &outer_expr.to_sql(), is_array,
+                                ));
                             } else if let Some(inner_expr) = inner_bindings.get(v) {
-                                if is_array {
-                                    join_conds.push(format!(
-                                        "{} = ANY(\"{}\".\"{}\")",
-                                        inner_expr.to_sql(), alias, c.field_name,
-                                    ));
-                                } else {
-                                    join_conds.push(format!(
-                                        "\"{}\".\"{}\" = {}",
-                                        alias, c.field_name, inner_expr.to_sql()
-                                    ));
-                                }
+                                join_conds.push(field_comparison_sql(
+                                    &alias, &c.field_name, &inner_expr.to_sql(), is_array,
+                                ));
                             } else {
                                 // New inner binding
                                 let col_ref = format!("\"{}\".\"{}\"", alias, c.field_name);
@@ -826,33 +713,14 @@ fn generate_not_exists_subquery(
                             }
                         }
                         Value::Bound(term) => {
-                            if is_array {
-                                inner_where.push(format!(
-                                    "{} = ANY(\"{}\".\"{}\")",
-                                    sql_literal(term), alias, c.field_name
-                                ));
-                            } else {
-                                inner_where.push(format!(
-                                    "\"{}\".\"{}\" = {}",
-                                    alias, c.field_name, sql_literal(term)
-                                ));
-                            }
+                            inner_where.push(field_comparison_sql(
+                                &alias, &c.field_name, &sql_literal(term), is_array,
+                            ));
                         }
                     }
                 }
 
-                // Build FROM/JOIN for inner query using same pattern as outer.
-                if inner_from.is_empty() {
-                    inner_from.push(format!("{} AS \"{}\"", source, alias));
-                    inner_where.extend(join_conds);
-                } else if join_conds.is_empty() {
-                    inner_from.push(format!("CROSS JOIN {} AS \"{}\"", source, alias));
-                } else {
-                    inner_from.push(format!(
-                        "INNER JOIN {} AS \"{}\" ON {}",
-                        source, alias, join_conds.join(" AND ")
-                    ));
-                }
+                assemble_from_join(&mut inner_from, &mut inner_where, &source, &alias, join_conds);
             }
 
             QueryPattern::FieldScan { .. } => {
@@ -879,6 +747,7 @@ mod tests {
     use crate::ir::{FieldConstraint, QueryPattern, QueryPlan, Subject, Value};
     use crate::rdf::{Iri, Literal, Term};
     use crate::sparql::ast::*;
+    use crate::sql_util::iri_local_name;
 
     fn empty_modifier() -> SolutionModifier {
         SolutionModifier::default()

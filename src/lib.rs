@@ -9,5 +9,6 @@ pub mod rdf;
 pub mod schema;
 pub mod sparql;
 pub mod sql;
+pub(crate) mod sql_util;
 pub mod cpmeta_schema;
 pub mod test_schema;
