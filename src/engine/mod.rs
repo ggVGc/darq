@@ -1,4 +1,3 @@
-pub mod memory;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod sql;
@@ -6,13 +5,11 @@ pub mod sql;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
-use crate::ir::QueryPlan;
+use crate::ir::{InlineData, QueryPlan};
 use crate::rdf::Term;
 use crate::schema::Schema;
 use crate::sparql::ast::*;
 use crate::sparql::{self, parser};
-
-pub use memory::InMemoryEngine;
 
 /// One solution row: a mapping from variable names to bound terms.
 pub type Binding = HashMap<String, Term>;
@@ -27,8 +24,8 @@ pub struct QueryResult {
 /// Trait for query plan evaluation backends.
 ///
 /// Implementations must apply `plan.modifier` (DISTINCT, ORDER BY, LIMIT,
-/// OFFSET) before returning.  The [`apply_modifiers`] helper in
-/// [`memory`] provides a ready-made in-memory implementation.
+/// OFFSET) before returning.  The [`apply_modifiers`] helper in this
+/// module provides a ready-made implementation.
 ///
 /// When multiple plans are provided (ambiguous-type alternatives), the engine
 /// must union their results and apply modifiers on the combined set.
@@ -123,4 +120,82 @@ fn project(bindings: Vec<Binding>, plan: &QueryPlan) -> Result<QueryResult, Darq
         .collect();
 
     Ok(QueryResult { variables, rows })
+}
+
+/// Apply ORDER BY and, when DISTINCT is not active, OFFSET and LIMIT.
+///
+/// DISTINCT, OFFSET, and LIMIT are applied post-projection by `execute()`
+/// when DISTINCT is requested, so this helper skips them in that case.
+pub fn apply_modifiers(mut bindings: Vec<Binding>, modifier: &SolutionModifier) -> Vec<Binding> {
+    if !modifier.order_by.is_empty() {
+        bindings.sort_by(|a, b| {
+            for cond in &modifier.order_by {
+                let va = a.get(cond.variable.as_str());
+                let vb = b.get(cond.variable.as_str());
+                let ord = va.cmp(&vb);
+                let ord = match cond.direction {
+                    OrderDirection::Ascending => ord,
+                    OrderDirection::Descending => ord.reverse(),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if !modifier.distinct {
+        if let Some(offset) = modifier.offset {
+            if offset < bindings.len() {
+                bindings = bindings.into_iter().skip(offset).collect();
+            } else {
+                bindings.clear();
+            }
+        }
+
+        if let Some(limit) = modifier.limit {
+            bindings.truncate(limit);
+        }
+    }
+
+    bindings
+}
+
+/// Join existing solutions with inline VALUES data.
+pub fn join_with_values(solutions: Vec<Binding>, values: &InlineData) -> Vec<Binding> {
+    let mut result = Vec::new();
+
+    for existing in &solutions {
+        for row in &values.rows {
+            let mut compatible = true;
+            let mut new_bindings = Binding::new();
+
+            for (i, var_name) in values.variables.iter().enumerate() {
+                match &row[i] {
+                    None => {
+                        // UNDEF: do not constrain or bind
+                    }
+                    Some(term) => {
+                        if let Some(existing_val) = existing.get(var_name) {
+                            if *existing_val != *term {
+                                compatible = false;
+                                break;
+                            }
+                        } else {
+                            new_bindings.insert(var_name.clone(), term.clone());
+                        }
+                    }
+                }
+            }
+
+            if compatible {
+                let mut merged = existing.clone();
+                merged.extend(new_bindings);
+                result.push(merged);
+            }
+        }
+    }
+
+    result
 }

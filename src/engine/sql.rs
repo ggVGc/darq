@@ -97,7 +97,7 @@ impl<E: SqlExecutor> Engine for SqlEngine<'_, E> {
         for plan in plans {
             all.extend(self.eval_pipelined_no_modifiers(plan, schema)?);
         }
-        Ok(super::memory::apply_modifiers(all, &modifier))
+        Ok(super::apply_modifiers(all, &modifier))
     }
 }
 
@@ -167,7 +167,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
         let solutions = self.eval_pipelined_no_modifiers(plan, schema)?;
-        Ok(super::memory::apply_modifiers(solutions, &plan.modifier))
+        Ok(super::apply_modifiers(solutions, &plan.modifier))
     }
 
     /// Pipelined evaluation without applying modifiers (for multi-plan union).
@@ -210,7 +210,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         }
 
         if let Some(ref values) = plan.values {
-            solutions = super::memory::join_with_values(solutions, values);
+            solutions = super::join_with_values(solutions, values);
         }
 
         Ok(solutions)
