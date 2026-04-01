@@ -107,6 +107,7 @@ fn project(bindings: Vec<Binding>, plan: &QueryPlan) -> Result<QueryResult, Darq
     let variables = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.as_str().to_owned()).collect(),
         SelectClause::Star => plan.collect_variables(),
+        SelectClause::Count { variable } => vec![variable.as_str().to_owned()],
     };
 
     let rows = bindings

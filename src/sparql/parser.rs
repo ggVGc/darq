@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use spargebra::algebra::{Expression, GraphPattern, OrderExpression};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
 use spargebra::term::{NamedNodePattern, TermPattern};
 use spargebra::{Query, SparqlParser};
 
@@ -53,6 +53,7 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
     let mut limit = None;
     let mut offset = None;
     let mut select = SelectClause::Star;
+    let mut aggregate_alias: Option<Variable> = None;
 
     loop {
         match pattern {
@@ -78,6 +79,35 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
                 if !is_select_star {
                     select = SelectClause::Variables(variables);
                 }
+                pattern = *inner;
+            }
+            GraphPattern::Extend { inner, variable, expression } => {
+                if matches!(expression, Expression::Variable(_)) {
+                    aggregate_alias = Some(variable);
+                    pattern = *inner;
+                } else {
+                    return Err(DarqError::ParseError(
+                        "only aggregate aliases are supported in SELECT expressions".into(),
+                    ));
+                }
+            }
+            GraphPattern::Group { inner, variables, aggregates } => {
+                if !variables.is_empty() {
+                    return Err(DarqError::ParseError("GROUP BY is not supported".into()));
+                }
+                let (_, agg) = match aggregates.into_iter().next() {
+                    Some(pair) => pair,
+                    None => return Err(DarqError::ParseError("empty aggregate".into())),
+                };
+                if !matches!(agg, AggregateExpression::CountSolutions { distinct: false }) {
+                    return Err(DarqError::ParseError(
+                        "only COUNT(*) aggregate is supported".into(),
+                    ));
+                }
+                let alias = aggregate_alias.take().unwrap_or_else(|| {
+                    Variable::new_unchecked("count")
+                });
+                select = SelectClause::Count { variable: alias };
                 pattern = *inner;
             }
             _ => break,
@@ -310,6 +340,16 @@ mod tests {
             TermOrVariable::Variable(v) => assert!(v.as_str().starts_with("__anon_")),
             other => panic!("expected anonymous variable, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_count_star() {
+        let q = parse("PREFIX ex: <http://example.org/> SELECT (COUNT(*) AS ?cnt) WHERE { ?s ex:name ?o }").unwrap();
+        match q.select {
+            SelectClause::Count { variable } => assert_eq!(variable.as_str(), "cnt"),
+            other => panic!("expected Count, got {:?}", other),
+        }
+        assert_eq!(q.where_pattern.patterns.len(), 1);
     }
 
     #[test]

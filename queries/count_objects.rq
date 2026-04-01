@@ -1,6 +1,6 @@
 prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
 prefix prov: <http://www.w3.org/ns/prov#>
-select *
+select (count (*) as ?count)
 where {
 	?spec cpmeta:hasDataLevel [] .
 	FILTER NOT EXISTS {?spec cpmeta:hasAssociatedProject ?pro . ?pro cpmeta:hasHideFromSearchPolicy true} .
@@ -8,11 +8,5 @@ where {
 	?dobj cpmeta:hasSizeInBytes [] .
 	?dobj cpmeta:hasName ?fileName .
 	?dobj cpmeta:wasSubmittedBy ?subm .
-	?dobj cpmeta:wasAcquiredBy ?ac .
-        ?ac prov:startedAtTime ?timeStart .
-	?ac prov:endedAtTime ?timeEnd .
-        ?subm prov:endedAtTime ?submTime .
-	FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?dobj}
+	?dobj cpmeta:wasAcquiredBy ?ac
 }
-order by desc(?submTime)
-offset 0 limit 20

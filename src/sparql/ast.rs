@@ -15,6 +15,7 @@ pub struct SelectQuery {
 pub enum SelectClause {
     Variables(Vec<Variable>),
     Star,
+    Count { variable: Variable },
 }
 
 #[derive(Debug, Clone)]

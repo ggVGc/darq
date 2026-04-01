@@ -353,9 +353,21 @@ fn assemble_final_sql(
     plan: &QueryPlan,
     st: &SqlBuildState,
 ) -> String {
+    if let SelectClause::Count { variable } = &plan.select {
+        let mut sql = format!("SELECT COUNT(*) AS \"{}\"", variable.as_str());
+        if !st.from_parts.is_empty() {
+            sql.push_str(&format!("\nFROM {}", st.from_parts.join("\n")));
+        }
+        if !st.where_parts.is_empty() {
+            sql.push_str(&format!("\nWHERE {}", st.where_parts.join(" AND ")));
+        }
+        return sql;
+    }
+
     let vars = match &plan.select {
         SelectClause::Variables(vars) => vars.iter().map(|v| v.as_str().to_owned()).collect::<Vec<_>>(),
         SelectClause::Star => plan.collect_variables(),
+        SelectClause::Count { .. } => unreachable!(),
     };
 
     let select_cols: Vec<String> = vars
@@ -471,6 +483,25 @@ pub fn to_union_sql(
     id_column: &str,
 ) -> Result<String, DarqError> {
     use crate::sparql::ast::SolutionModifier;
+
+    if let SelectClause::Count { ref variable } = plans[0].select {
+        let var = variable.as_str();
+        let mut subqueries = Vec::new();
+        for plan in plans {
+            let inner_plan = QueryPlan {
+                select: plan.select.clone(),
+                modifier: SolutionModifier::default(),
+                ..plan.clone()
+            };
+            subqueries.push(to_sql(&inner_plan, schema, subject_column, id_column)?);
+        }
+        let union_body = subqueries.join("\nUNION ALL\n");
+        return Ok(format!(
+            "SELECT SUM(\"{v}\") AS \"{v}\" FROM (\n{body}\n) AS \"_counted\"",
+            v = var,
+            body = union_body
+        ));
+    }
 
     let modifier = &plans[0].modifier;
 

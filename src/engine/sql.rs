@@ -118,6 +118,28 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
     ) -> Result<Vec<Binding>, DarqError> {
         use crate::sparql::ast::{SelectClause, SolutionModifier};
 
+        if let SelectClause::Count { ref variable } = plan.select {
+            let count_plan = QueryPlan {
+                select: plan.select.clone(),
+                modifier: SolutionModifier::default(),
+                ..plan.clone()
+            };
+            let sql = crate::sql::to_sql(&count_plan, schema, &self.subject_column, &self.id_column)?;
+            let result = self.executor.execute_sql(&sql)?;
+            let var_name = variable.as_str().to_owned();
+            let mut bindings = Vec::new();
+            for row in &result.rows {
+                if let Some(Some(raw)) = row.first() {
+                    if let Ok(n) = raw.parse::<i64>() {
+                        let mut b = Binding::new();
+                        b.insert(var_name.clone(), Term::Literal(Literal::Integer(n)));
+                        bindings.push(b);
+                    }
+                }
+            }
+            return Ok(bindings);
+        }
+
         // Use SelectClause::Star so the SQL returns all variables, not just
         // the projected ones — projection happens later in execute().
         // Keep DISTINCT in the SQL as an optimisation (it deduplicates on
@@ -225,6 +247,25 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         plans: &[QueryPlan],
         schema: &Schema,
     ) -> Result<Vec<Binding>, DarqError> {
+        use crate::sparql::ast::SelectClause;
+
+        if let SelectClause::Count { ref variable } = plans[0].select {
+            let sql = crate::sql::to_union_sql(plans, schema, &self.subject_column, &self.id_column)?;
+            let result = self.executor.execute_sql(&sql)?;
+            let var_name = variable.as_str().to_owned();
+            let mut bindings = Vec::new();
+            for row in &result.rows {
+                if let Some(Some(raw)) = row.first() {
+                    if let Ok(n) = raw.parse::<i64>() {
+                        let mut b = Binding::new();
+                        b.insert(var_name.clone(), Term::Literal(Literal::Integer(n)));
+                        bindings.push(b);
+                    }
+                }
+            }
+            return Ok(bindings);
+        }
+
         let sql = crate::sql::to_union_sql(plans, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
         let type_map = build_variable_type_map(&plans[0], schema);

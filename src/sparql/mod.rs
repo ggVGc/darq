@@ -9,7 +9,7 @@ use ast::{SelectClause, SelectQuery, TermOrVariable};
 /// Check that all variables in the SELECT clause are bound by a WHERE pattern.
 pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
     let select_vars = match &query.select {
-        SelectClause::Star => return Ok(()),
+        SelectClause::Star | SelectClause::Count { .. } => return Ok(()),
         SelectClause::Variables(vars) => vars,
     };
 
