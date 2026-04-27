@@ -32,6 +32,7 @@ pub struct GroupGraphPattern {
     pub filters: Vec<Filter>,
     pub optionals: Vec<OptionalPattern>,
     pub subqueries: Vec<SelectQuery>,
+    pub unions: Vec<(GroupGraphPattern, GroupGraphPattern)>,
 }
 
 #[derive(Debug, Clone)]

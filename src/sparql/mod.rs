@@ -66,6 +66,10 @@ fn collect_ggp_vars<'a>(ggp: &'a ast::GroupGraphPattern, set: &mut HashSet<&'a s
             collect_var(&tp.object, set);
         }
     }
+    for (left, right) in &ggp.unions {
+        collect_ggp_vars(left, set);
+        collect_ggp_vars(right, set);
+    }
 }
 
 fn collect_var<'a>(tov: &'a TermOrVariable, set: &mut HashSet<&'a str>) {

@@ -352,7 +352,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             let triples = patterns.into_iter().map(convert_triple).collect::<Result<_, _>>()?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![], subqueries: vec![] }, None, vec![]))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![], subqueries: vec![], unions: vec![] }, None, vec![]))
         }
 
         GraphPattern::Path { subject, path, object } => {
@@ -360,7 +360,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
             let object_tv = convert_term_pattern(object)?;
             let mut triples = Vec::new();
             desugar_path(subject_tv, &path, object_tv, &mut triples)?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![], subqueries: vec![] }, None, vec![]))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![], subqueries: vec![], unions: vec![] }, None, vec![]))
         }
 
         GraphPattern::Filter { expr, inner } => {
@@ -398,9 +398,11 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
             optionals.extend(right_ggp.optionals);
             let mut subqueries = left_ggp.subqueries;
             subqueries.extend(right_ggp.subqueries);
+            let mut unions = left_ggp.unions;
+            unions.extend(right_ggp.unions);
             let mut binds = left_binds;
             binds.extend(right_binds);
-            Ok((GroupGraphPattern { patterns, filters, optionals, subqueries }, left_values.or(right_values), binds))
+            Ok((GroupGraphPattern { patterns, filters, optionals, subqueries, unions }, left_values.or(right_values), binds))
         }
 
         GraphPattern::LeftJoin { left, right, expression } => {
@@ -416,6 +418,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
             });
             left_ggp.optionals.extend(right_ggp.optionals);
             left_ggp.subqueries.extend(right_ggp.subqueries);
+            left_ggp.unions.extend(right_ggp.unions);
             let mut binds = left_binds;
             binds.extend(right_binds);
             Ok((left_ggp, values, binds))
@@ -429,7 +432,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
         }
 
         GraphPattern::Values { variables, bindings } => {
-            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![], subqueries: vec![] }, Some(ValuesClause { variables, bindings }), vec![]))
+            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![], subqueries: vec![], unions: vec![] }, Some(ValuesClause { variables, bindings }), vec![]))
         }
 
         GraphPattern::Project { inner, variables } => {
@@ -437,7 +440,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
                 let subquery = unwrap_algebra(GraphPattern::Project { inner, variables }, false)?;
                 let ggp = GroupGraphPattern {
                     patterns: vec![], filters: vec![], optionals: vec![],
-                    subqueries: vec![subquery],
+                    subqueries: vec![subquery], unions: vec![],
                 };
                 Ok((ggp, None, vec![]))
             } else {
@@ -447,6 +450,21 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
 
         GraphPattern::Graph { inner, .. } => {
             extract_body(*inner)
+        }
+
+        GraphPattern::Union { left, right } => {
+            let (left_ggp, left_values, left_binds) = extract_body(*left)?;
+            let (right_ggp, right_values, right_binds) = extract_body(*right)?;
+            if left_values.is_some() || right_values.is_some() {
+                return Err(DarqError::ParseError("VALUES inside UNION not supported".into()));
+            }
+            let mut binds = left_binds;
+            binds.extend(right_binds);
+            let ggp = GroupGraphPattern {
+                patterns: vec![], filters: vec![], optionals: vec![],
+                subqueries: vec![], unions: vec![(left_ggp, right_ggp)],
+            };
+            Ok((ggp, None, binds))
         }
 
         ref other => Err(DarqError::ParseError(format!(
