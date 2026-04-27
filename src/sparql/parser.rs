@@ -420,6 +420,10 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
             extract_body(*inner)
         }
 
+        GraphPattern::Graph { inner, .. } => {
+            extract_body(*inner)
+        }
+
         ref other => Err(DarqError::ParseError(format!(
             "unsupported graph pattern: {}",
             pattern_name(other),
