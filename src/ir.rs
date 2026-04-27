@@ -85,6 +85,14 @@ pub struct OptionalGroup {
     pub expr_filters: Vec<FilterExpr>,
 }
 
+/// A subquery plan: a full query plan that produces named bindings
+/// used by the outer query via variable joins.
+#[derive(Debug, Clone)]
+pub struct SubqueryPlan {
+    pub plan: Box<QueryPlan>,
+    pub projected_vars: Vec<String>,
+}
+
 /// A complete resource-level query plan, lowered from SPARQL AST.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
@@ -104,6 +112,8 @@ pub struct QueryPlan {
     pub group_by: Vec<String>,
     /// HAVING expressions.
     pub having: Vec<FilterExpr>,
+    /// Subquery plans.
+    pub subqueries: Vec<SubqueryPlan>,
 }
 
 impl QueryPlan {
@@ -258,6 +268,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         assert_eq!(
@@ -286,6 +297,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         assert_eq!(plan.collect_variables(), vec!["s", "p", "o"]);
@@ -323,6 +335,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         // "p" appears in both patterns but should only appear once
@@ -362,6 +375,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         // Only "name" — bound subject and bound age value are excluded
@@ -383,6 +397,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         assert!(plan.collect_variables().is_empty());

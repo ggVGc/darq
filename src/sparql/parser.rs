@@ -178,6 +178,19 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
     })
 }
 
+fn contains_group(pattern: &GraphPattern) -> bool {
+    match pattern {
+        GraphPattern::Group { .. } => true,
+        GraphPattern::Extend { inner, .. }
+        | GraphPattern::Filter { inner, .. }
+        | GraphPattern::OrderBy { inner, .. }
+        | GraphPattern::Slice { inner, .. }
+        | GraphPattern::Distinct { inner, .. }
+        | GraphPattern::Reduced { inner, .. } => contains_group(inner),
+        _ => false,
+    }
+}
+
 fn substitute_agg_vars_in_filter(expr: FilterExpr, agg_map: &HashMap<String, FilterExpr>) -> FilterExpr {
     match expr {
         FilterExpr::Variable(ref v) => {
@@ -339,7 +352,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             let triples = patterns.into_iter().map(convert_triple).collect::<Result<_, _>>()?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None, vec![]))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![], subqueries: vec![] }, None, vec![]))
         }
 
         GraphPattern::Path { subject, path, object } => {
@@ -347,7 +360,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
             let object_tv = convert_term_pattern(object)?;
             let mut triples = Vec::new();
             desugar_path(subject_tv, &path, object_tv, &mut triples)?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None, vec![]))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![], subqueries: vec![] }, None, vec![]))
         }
 
         GraphPattern::Filter { expr, inner } => {
@@ -383,9 +396,11 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
             filters.extend(right_ggp.filters);
             let mut optionals = left_ggp.optionals;
             optionals.extend(right_ggp.optionals);
+            let mut subqueries = left_ggp.subqueries;
+            subqueries.extend(right_ggp.subqueries);
             let mut binds = left_binds;
             binds.extend(right_binds);
-            Ok((GroupGraphPattern { patterns, filters, optionals }, left_values.or(right_values), binds))
+            Ok((GroupGraphPattern { patterns, filters, optionals, subqueries }, left_values.or(right_values), binds))
         }
 
         GraphPattern::LeftJoin { left, right, expression } => {
@@ -400,6 +415,7 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
                 filters: opt_filters,
             });
             left_ggp.optionals.extend(right_ggp.optionals);
+            left_ggp.subqueries.extend(right_ggp.subqueries);
             let mut binds = left_binds;
             binds.extend(right_binds);
             Ok((left_ggp, values, binds))
@@ -413,11 +429,20 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
         }
 
         GraphPattern::Values { variables, bindings } => {
-            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![] }, Some(ValuesClause { variables, bindings }), vec![]))
+            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![], subqueries: vec![] }, Some(ValuesClause { variables, bindings }), vec![]))
         }
 
-        GraphPattern::Project { inner, .. } => {
-            extract_body(*inner)
+        GraphPattern::Project { inner, variables } => {
+            if contains_group(&inner) {
+                let subquery = unwrap_algebra(GraphPattern::Project { inner, variables }, false)?;
+                let ggp = GroupGraphPattern {
+                    patterns: vec![], filters: vec![], optionals: vec![],
+                    subqueries: vec![subquery],
+                };
+                Ok((ggp, None, vec![]))
+            } else {
+                extract_body(*inner)
+            }
         }
 
         GraphPattern::Graph { inner, .. } => {

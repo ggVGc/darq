@@ -29,6 +29,16 @@ pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
     for v in &query.group_by {
         bound.insert(v.as_str());
     }
+    for sq in &query.where_pattern.subqueries {
+        if let SelectClause::Variables(vars) = &sq.select {
+            for v in vars {
+                bound.insert(v.as_str());
+            }
+        }
+        for (v, _) in &sq.select_expressions {
+            bound.insert(v.as_str());
+        }
+    }
 
     let unbound: Vec<String> = select_vars
         .iter()

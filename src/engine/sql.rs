@@ -174,6 +174,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             binds: plan.binds.clone(),
             group_by: plan.group_by.clone(),
             having: plan.having.clone(),
+            subqueries: plan.subqueries.clone(),
         };
         let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
@@ -1329,6 +1330,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1383,6 +1385,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1442,6 +1445,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1518,6 +1522,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1609,6 +1614,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1680,6 +1686,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1774,6 +1781,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1825,6 +1833,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1893,6 +1902,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1953,6 +1963,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -2046,6 +2057,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();

@@ -31,6 +31,7 @@ pub struct GroupGraphPattern {
     pub patterns: Vec<TriplePattern>,
     pub filters: Vec<Filter>,
     pub optionals: Vec<OptionalPattern>,
+    pub subqueries: Vec<SelectQuery>,
 }
 
 #[derive(Debug, Clone)]

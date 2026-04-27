@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, NullCheckFilter, OptionalGroup, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, NullCheckFilter, OptionalGroup, QueryPattern, QueryPlan, Subject, SubqueryPlan, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::Schema;
 use crate::sparql::ast::*;
@@ -44,9 +44,36 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             binds: query.binds.iter().map(|(v, e)| (v.as_str().to_owned(), e.clone())).collect(),
             group_by: query.group_by.iter().map(|v| v.as_str().to_owned()).collect(),
             having: query.having.clone(),
+            subqueries: lower_subqueries(&query.where_pattern.subqueries, schema)?,
         });
     }
     Ok(plans)
+}
+
+fn lower_subqueries(
+    subqueries: &[crate::sparql::ast::SelectQuery],
+    schema: &Schema,
+) -> Result<Vec<SubqueryPlan>, DarqError> {
+    let mut result = Vec::new();
+    for sq in subqueries {
+        let plans = lower(sq, schema)?;
+        let projected = match &sq.select {
+            crate::sparql::ast::SelectClause::Variables(vars) => {
+                vars.iter().map(|v| v.as_str().to_owned()).collect()
+            }
+            crate::sparql::ast::SelectClause::Star => plans[0].collect_variables(),
+            crate::sparql::ast::SelectClause::Count { variable } => {
+                vec![variable.as_str().to_owned()]
+            }
+        };
+        for plan in plans {
+            result.push(SubqueryPlan {
+                plan: Box::new(plan),
+                projected_vars: projected.clone(),
+            });
+        }
+    }
+    Ok(result)
 }
 
 /// Like [`lower_bgp`] but handles ambiguous types by producing multiple
@@ -304,7 +331,7 @@ fn lower_optionals(
         let ggp = GroupGraphPattern {
             patterns: opt.patterns.clone(),
             filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
         };
         let patterns = match lower_bgp(&ggp, schema) {
             Ok(p) => p,
@@ -411,6 +438,7 @@ fn augment_with_type(ggp: &GroupGraphPattern, subject_name: &str, type_iri: &Iri
         patterns,
         filters: ggp.filters.clone(),
         optionals: ggp.optionals.clone(),
+        subqueries: ggp.subqueries.clone(),
     }
 }
 
@@ -799,7 +827,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -836,7 +864,7 @@ mod tests {
                 object: TermOrVariable::Variable(Variable::new_unchecked("name")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -861,7 +889,7 @@ mod tests {
                 object: TermOrVariable::Variable(Variable::new_unchecked("o")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -901,7 +929,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -929,7 +957,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -962,7 +990,7 @@ mod tests {
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Unknown")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let err = lower_bgp(&bgp, &schema).unwrap_err();
@@ -983,7 +1011,7 @@ mod tests {
                 object: TermOrVariable::Literal(spargebra::term::Literal::new_simple_literal("Alice")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1039,7 +1067,7 @@ mod tests {
                 object: TermOrVariable::Iri(Iri::new("http://example.org/person/bob")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1068,7 +1096,7 @@ mod tests {
                 object: TermOrVariable::Variable(Variable::new_unchecked("name")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1107,7 +1135,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1156,7 +1184,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1197,7 +1225,7 @@ mod tests {
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1224,7 +1252,7 @@ mod tests {
                 object: TermOrVariable::Variable(Variable::new_unchecked("type")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1251,7 +1279,7 @@ mod tests {
                 object: TermOrVariable::Iri(Iri::new("http://example.org/Person")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1279,7 +1307,7 @@ mod tests {
                 object: TermOrVariable::Literal(spargebra::term::Literal::new_simple_literal("Alice")),
             }],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1318,7 +1346,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         let patterns = lower_bgp(&bgp, &schema).unwrap();
@@ -1344,7 +1372,7 @@ mod tests {
     fn test_lower_empty_bgp() {
         let schema = test_schema();
 
-        let bgp = GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![] };
+        let bgp = GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![], subqueries: vec![] };
         let patterns = lower_bgp(&bgp, &schema).unwrap();
         assert!(patterns.is_empty());
     }
@@ -1423,7 +1451,7 @@ mod tests {
                 },
             ],
         filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             };
 
         // The reference constraint from hasChild should disambiguate ?child to Child,
@@ -1533,10 +1561,10 @@ mod tests {
                             },
                         ],
                         filters: vec![],
-                        optionals: vec![],
+                        optionals: vec![], subqueries: vec![],
                     }),
                 ],
-                optionals: vec![],
+                optionals: vec![], subqueries: vec![],
             },
             modifier: SolutionModifier::default(),
             values: None,
@@ -1619,7 +1647,7 @@ mod tests {
                     },
                 ],
                 filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             },
             modifier: SolutionModifier::default(),
             values: None,
@@ -1719,9 +1747,9 @@ mod tests {
                         object: TermOrVariable::Variable(Variable::new_unchecked("x")),
                     }],
                     filters: vec![],
-                    optionals: vec![],
+                    optionals: vec![], subqueries: vec![],
                 })],
-                optionals: vec![],
+                optionals: vec![], subqueries: vec![],
             },
             modifier: SolutionModifier::default(),
             values: None,
@@ -1768,7 +1796,7 @@ mod tests {
                     },
                 ],
                 filters: vec![],
-            optionals: vec![],
+            optionals: vec![], subqueries: vec![],
             },
             modifier: SolutionModifier::default(),
             values: None,

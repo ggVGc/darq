@@ -608,6 +608,27 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         process_values_clause(values, &mut st);
     }
 
+    // Process subqueries as nested SQL in FROM.
+    for (si, subquery) in plan.subqueries.iter().enumerate() {
+        let sub_sql = to_sql(&subquery.plan, schema, subject_column, id_column)?;
+        let sub_alias = format!("_sq{}", si);
+        let join_type = if st.from_parts.is_empty() { "" } else { "INNER JOIN " };
+        let mut join_on = Vec::new();
+        for var in &subquery.projected_vars {
+            let col_ref = SqlExpr::Constant(format!("\"{}\".\"{}\"", sub_alias, var));
+            if let Some(existing) = st.join_bindings.get(var) {
+                join_on.push(format!("\"{}\".\"{}\" = {}", sub_alias, var, existing.to_sql()));
+            }
+            st.select_bindings.insert(var.clone(), col_ref.clone());
+            st.join_bindings.insert(var.clone(), col_ref);
+        }
+        if join_on.is_empty() {
+            st.from_parts.push(format!("{}({}) AS \"{}\"", join_type, sub_sql, sub_alias));
+        } else {
+            st.from_parts.push(format!("{}({}) AS \"{}\" ON {}", join_type, sub_sql, sub_alias, join_on.join(" AND ")));
+        }
+    }
+
     // Process BIND expressions: resolve to SQL and add to bindings.
     for (var_name, expr) in &plan.binds {
         let sql_str = filter_expr_to_sql(expr, &st.select_bindings)?;
@@ -691,6 +712,7 @@ pub fn to_union_sql(
             binds: plan.binds.clone(),
             group_by: plan.group_by.clone(),
             having: plan.having.clone(),
+            subqueries: plan.subqueries.clone(),
         };
         subqueries.push(to_sql(&inner_plan, schema, subject_column, id_column)?);
     }
@@ -1144,6 +1166,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1184,6 +1207,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1238,6 +1262,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1273,6 +1298,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1313,6 +1339,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1356,6 +1383,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1393,6 +1421,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1444,6 +1473,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1482,6 +1512,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1516,6 +1547,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1557,6 +1589,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1596,6 +1629,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1668,6 +1702,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -1702,6 +1737,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -1757,6 +1793,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1809,6 +1846,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1847,6 +1885,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1889,6 +1928,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1983,6 +2023,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -2036,6 +2077,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -2113,6 +2155,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -2161,6 +2204,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2210,6 +2254,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2259,6 +2304,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_id").unwrap();
@@ -2316,6 +2362,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2372,6 +2419,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2422,6 +2470,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2468,6 +2517,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
         let plan_b = QueryPlan {
             patterns: vec![QueryPattern::Resource {
@@ -2493,6 +2543,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_union_sql(&[plan_a, plan_b], &Schema::new(), "_subject", "_subject").unwrap();
@@ -2534,6 +2585,7 @@ mod tests {
             binds: vec![],
             group_by: vec![],
             having: vec![],
+            subqueries: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
