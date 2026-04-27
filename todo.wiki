@@ -1,0 +1,6 @@
+- Suport VALUES
+- Support FILTER NOT EXISTS
+- Suport general filter expression
+- Support BIND(...)
+- When referencing a variable in an order by clause which is not bound, an error should be produced for the query. Currently it results in SQL error, which is too late.
+- Support matching on []
