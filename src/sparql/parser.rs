@@ -66,8 +66,10 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
     let mut select = SelectClause::Star;
     let mut select_expressions: Vec<(Variable, FilterExpr)> = Vec::new();
     let mut group_by_vars: Vec<Variable> = Vec::new();
-    let having_exprs: Vec<FilterExpr> = Vec::new();
+    let mut having_exprs: Vec<FilterExpr> = Vec::new();
     let mut aggregate_aliases: Vec<(Variable, Variable)> = Vec::new();
+    let mut seen_group = false;
+    let mut raw_having: Option<Expression> = None;
 
     loop {
         match pattern {
@@ -89,7 +91,7 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
             GraphPattern::Reduced { inner } => {
                 pattern = *inner;
             }
-            GraphPattern::Project { inner, variables } => {
+            GraphPattern::Project { inner, variables } if !seen_group => {
                 if !is_select_star {
                     select = SelectClause::Variables(variables);
                 }
@@ -106,6 +108,7 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
                 }
             }
             GraphPattern::Group { inner, variables, aggregates } => {
+                seen_group = true;
                 group_by_vars = variables;
 
                 if aggregates.len() == 1 && group_by_vars.is_empty() {
@@ -134,8 +137,31 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
 
                 pattern = *inner;
             }
+            GraphPattern::Filter { expr, inner } if matches!(*inner, GraphPattern::Group { .. }) => {
+                raw_having = Some(expr);
+                pattern = *inner;
+            }
             _ => break,
         }
+    }
+
+    if let Some(having_expr) = raw_having {
+        let agg_map: HashMap<String, FilterExpr> = aggregate_aliases.iter()
+            .flat_map(|(alias, internal)| {
+                select_expressions.iter()
+                    .find(|(a, _)| a == alias)
+                    .map(|(_, expr)| (internal.as_str().to_owned(), expr.clone()))
+            })
+            .collect();
+
+        let raw_filters = extract_filters(having_expr)?;
+        having_exprs = raw_filters
+            .into_iter()
+            .filter_map(|f| match f {
+                Filter::Expression(e) => Some(substitute_agg_vars_in_filter(e, &agg_map)),
+                _ => None,
+            })
+            .collect();
     }
 
     let (where_pattern, values, binds) = extract_body(pattern)?;
@@ -150,6 +176,42 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
         group_by: group_by_vars,
         having: having_exprs,
     })
+}
+
+fn substitute_agg_vars_in_filter(expr: FilterExpr, agg_map: &HashMap<String, FilterExpr>) -> FilterExpr {
+    match expr {
+        FilterExpr::Variable(ref v) => {
+            if let Some(replacement) = agg_map.get(v.as_str()) {
+                return replacement.clone();
+            }
+            expr
+        }
+        FilterExpr::Greater(a, b) => FilterExpr::Greater(
+            Box::new(substitute_agg_vars_in_filter(*a, agg_map)),
+            Box::new(substitute_agg_vars_in_filter(*b, agg_map)),
+        ),
+        FilterExpr::Less(a, b) => FilterExpr::Less(
+            Box::new(substitute_agg_vars_in_filter(*a, agg_map)),
+            Box::new(substitute_agg_vars_in_filter(*b, agg_map)),
+        ),
+        FilterExpr::Equal(a, b) => FilterExpr::Equal(
+            Box::new(substitute_agg_vars_in_filter(*a, agg_map)),
+            Box::new(substitute_agg_vars_in_filter(*b, agg_map)),
+        ),
+        FilterExpr::NotEqual(a, b) => FilterExpr::NotEqual(
+            Box::new(substitute_agg_vars_in_filter(*a, agg_map)),
+            Box::new(substitute_agg_vars_in_filter(*b, agg_map)),
+        ),
+        FilterExpr::GreaterOrEqual(a, b) => FilterExpr::GreaterOrEqual(
+            Box::new(substitute_agg_vars_in_filter(*a, agg_map)),
+            Box::new(substitute_agg_vars_in_filter(*b, agg_map)),
+        ),
+        FilterExpr::LessOrEqual(a, b) => FilterExpr::LessOrEqual(
+            Box::new(substitute_agg_vars_in_filter(*a, agg_map)),
+            Box::new(substitute_agg_vars_in_filter(*b, agg_map)),
+        ),
+        other => other,
+    }
 }
 
 fn convert_aggregate(agg: AggregateExpression) -> Result<FilterExpr, DarqError> {
@@ -352,6 +414,10 @@ fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
 
         GraphPattern::Values { variables, bindings } => {
             Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![] }, Some(ValuesClause { variables, bindings }), vec![]))
+        }
+
+        GraphPattern::Project { inner, .. } => {
+            extract_body(*inner)
         }
 
         ref other => Err(DarqError::ParseError(format!(
