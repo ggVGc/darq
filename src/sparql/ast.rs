@@ -22,6 +22,13 @@ pub enum SelectClause {
 pub struct GroupGraphPattern {
     pub patterns: Vec<TriplePattern>,
     pub filters: Vec<Filter>,
+    pub optionals: Vec<OptionalPattern>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OptionalPattern {
+    pub patterns: Vec<TriplePattern>,
+    pub filters: Vec<Filter>,
 }
 
 #[derive(Debug, Clone)]

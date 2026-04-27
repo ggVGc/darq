@@ -161,6 +161,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             filters: plan.filters.clone(),
             null_checks: plan.null_checks.clone(),
             expr_filters: plan.expr_filters.clone(),
+            optionals: plan.optionals.clone(),
             select: SelectClause::Star,
             modifier,
             values: plan.values.clone(),
@@ -1313,6 +1314,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1362,6 +1364,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1416,6 +1419,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1487,6 +1491,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1573,6 +1578,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1639,6 +1645,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1728,6 +1735,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1774,6 +1782,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1837,6 +1846,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1892,6 +1902,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1979,6 +1990,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 

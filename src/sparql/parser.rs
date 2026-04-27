@@ -212,7 +212,7 @@ fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<Valu
     match pattern {
         GraphPattern::Bgp { patterns } => {
             let triples = patterns.into_iter().map(convert_triple).collect::<Result<_, _>>()?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![] }, None))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None))
         }
 
         GraphPattern::Path { subject, path, object } => {
@@ -220,13 +220,13 @@ fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<Valu
             let object_tv = convert_term_pattern(object)?;
             let mut triples = Vec::new();
             desugar_path(subject_tv, &path, object_tv, &mut triples)?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![] }, None))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None))
         }
 
         GraphPattern::Filter { expr, inner } => {
             let filters = extract_filters(expr)?;
             let (mut ggp, values) = extract_body(*inner)?;
-            ggp.filters = filters;
+            ggp.filters.extend(filters);
             Ok((ggp, values))
         }
 
@@ -254,11 +254,29 @@ fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<Valu
             patterns.extend(right_ggp.patterns);
             let mut filters = left_ggp.filters;
             filters.extend(right_ggp.filters);
-            Ok((GroupGraphPattern { patterns, filters }, left_values.or(right_values)))
+            let mut optionals = left_ggp.optionals;
+            optionals.extend(right_ggp.optionals);
+            Ok((GroupGraphPattern { patterns, filters, optionals }, left_values.or(right_values)))
+        }
+
+        GraphPattern::LeftJoin { left, right, expression } => {
+            let (mut left_ggp, values) = extract_body(*left)?;
+            let (right_ggp, _right_values) = extract_body(*right)?;
+            let mut opt_filters = right_ggp.filters;
+            if let Some(expr) = expression {
+                opt_filters.extend(extract_filters(expr)?);
+            }
+            left_ggp.optionals.push(OptionalPattern {
+                patterns: right_ggp.patterns,
+                filters: opt_filters,
+            });
+            // Nested optionals from the right side get promoted to the left
+            left_ggp.optionals.extend(right_ggp.optionals);
+            Ok((left_ggp, values))
         }
 
         GraphPattern::Values { variables, bindings } => {
-            Ok((GroupGraphPattern { patterns: vec![], filters: vec![] }, Some(ValuesClause { variables, bindings })))
+            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![] }, Some(ValuesClause { variables, bindings })))
         }
 
         ref other => Err(DarqError::ParseError(format!(

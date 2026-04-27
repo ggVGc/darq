@@ -77,6 +77,14 @@ pub struct NullCheckFilter {
     pub field_names: Vec<String>,
 }
 
+/// An optional pattern group (from OPTIONAL { ... }).
+/// Lowered to a LEFT JOIN in SQL.
+#[derive(Debug, Clone)]
+pub struct OptionalGroup {
+    pub patterns: Vec<QueryPattern>,
+    pub expr_filters: Vec<FilterExpr>,
+}
+
 /// A complete resource-level query plan, lowered from SPARQL AST.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
@@ -84,6 +92,7 @@ pub struct QueryPlan {
     pub filters: Vec<NotExistsFilter>,
     pub null_checks: Vec<NullCheckFilter>,
     pub expr_filters: Vec<FilterExpr>,
+    pub optionals: Vec<OptionalGroup>,
     pub select: SelectClause,
     pub modifier: SolutionModifier,
     pub values: Option<InlineData>,
@@ -161,6 +170,35 @@ impl QueryPlan {
             }
         }
 
+        for opt in &self.optionals {
+            for pattern in &opt.patterns {
+                match pattern {
+                    QueryPattern::Resource { subject, constraints, type_variable, .. } => {
+                        if let Subject::Variable(v) = subject {
+                            if add(v) { vars.push(v.clone()); }
+                        }
+                        if let Some(tv) = type_variable {
+                            if add(tv) { vars.push(tv.clone()); }
+                        }
+                        for c in constraints {
+                            if let Value::Variable(v) = &c.value {
+                                if add(v) { vars.push(v.clone()); }
+                            }
+                        }
+                    }
+                    QueryPattern::FieldScan { subject, predicate_var, object, .. } => {
+                        if let Subject::Variable(v) = subject {
+                            if add(v) { vars.push(v.clone()); }
+                        }
+                        if add(predicate_var) { vars.push(predicate_var.clone()); }
+                        if let Value::Variable(v) = object {
+                            if add(v) { vars.push(v.clone()); }
+                        }
+                    }
+                }
+            }
+        }
+
         vars
     }
 }
@@ -198,6 +236,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -221,6 +260,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -253,6 +293,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -287,6 +328,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -303,6 +345,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 

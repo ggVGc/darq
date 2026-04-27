@@ -200,6 +200,115 @@ fn process_resource_pattern(
     assemble_from_join(&mut st.from_parts, &mut st.where_parts, &source, &alias, join_conds);
 }
 
+/// Process an OPTIONAL group as a LEFT JOIN.
+fn process_optional_group(
+    opt_idx: usize,
+    base_pattern_count: usize,
+    opt: &crate::ir::OptionalGroup,
+    ctx: &SqlContext<'_>,
+    st: &mut SqlBuildState,
+) -> Result<(), DarqError> {
+    let (schema, subject_column, id_column) = (ctx.schema, ctx.subject_column, ctx.id_column);
+
+    for (pi, pattern) in opt.patterns.iter().enumerate() {
+        match pattern {
+            QueryPattern::Resource { subject, type_iri, constraints, type_variable } => {
+                let i = base_pattern_count + opt_idx * 100 + pi;
+                let alias = format!("p{}", i);
+
+                let source = if let Some(ti) = type_iri {
+                    let tbl = resolve_table_name(schema, ti);
+                    format!("\"{}\"", tbl)
+                } else {
+                    return Err(DarqError::SqlError(
+                        "OPTIONAL pattern requires a known type".into(),
+                    ));
+                };
+
+                let mut on_conds: Vec<String> = Vec::new();
+
+                match subject {
+                    Subject::Variable(v) => {
+                        if let Some(existing) = st.join_bindings.get(v) {
+                            on_conds.push(format!(
+                                "\"{}\".\"{}\" = {}",
+                                alias, id_column, existing.to_sql()
+                            ));
+                        }
+                        st.select_bindings
+                            .entry(v.clone())
+                            .or_insert(SqlExpr::Column { pattern_idx: i, column: subject_column.to_string() });
+                        st.join_bindings
+                            .entry(v.clone())
+                            .or_insert(SqlExpr::Column { pattern_idx: i, column: id_column.to_string() });
+                    }
+                    Subject::Bound(iri) => {
+                        on_conds.push(format!(
+                            "\"{}\".\"{}\" = '{}'",
+                            alias, subject_column, iri.0
+                        ));
+                    }
+                }
+
+                if let Some(tv) = type_variable {
+                    if let Some(ti) = type_iri {
+                        let constant = SqlExpr::Constant(format!("'{}'", ti.0));
+                        st.select_bindings.entry(tv.clone()).or_insert(constant.clone());
+                        st.join_bindings.entry(tv.clone()).or_insert(constant);
+                    }
+                }
+
+                let fields = type_iri.as_ref().and_then(|ti| schema.fields_for_type(ti));
+                let fields_slice = fields.unwrap_or(&[]);
+                for c in constraints {
+                    let is_array = is_array_field(fields_slice, &c.field_name);
+                    match &c.value {
+                        Value::Variable(v) => {
+                            if let Some(existing) = st.join_bindings.get(v) {
+                                on_conds.push(field_comparison_sql(
+                                    &alias, &c.field_name, &existing.to_sql(), is_array,
+                                ));
+                            } else {
+                                let expr = SqlExpr::Column { pattern_idx: i, column: c.field_name.clone() };
+                                st.select_bindings.entry(v.clone()).or_insert(expr.clone());
+                                st.join_bindings.entry(v.clone()).or_insert(expr);
+                            }
+                        }
+                        Value::Bound(term) => {
+                            on_conds.push(field_comparison_sql(
+                                &alias, &c.field_name, &sql_literal(term), is_array,
+                            ));
+                        }
+                    }
+                }
+
+                let on_clause = if on_conds.is_empty() {
+                    "TRUE".to_string()
+                } else {
+                    on_conds.join(" AND ")
+                };
+                st.from_parts.push(format!(
+                    "LEFT JOIN {} AS \"{}\" ON {}",
+                    source, alias, on_clause
+                ));
+            }
+            QueryPattern::FieldScan { .. } => {
+                return Err(DarqError::SqlError(
+                    "FieldScan not supported in OPTIONAL".into(),
+                ));
+            }
+        }
+    }
+
+    // Process any expression filters within this OPTIONAL as additional WHERE conditions
+    for expr in &opt.expr_filters {
+        let sql = filter_expr_to_sql(expr, &st.select_bindings)?;
+        st.where_parts.push(sql);
+    }
+
+    Ok(())
+}
+
 /// Add LEFT JOINs for reference field variables not resolved by a subject pattern.
 fn resolve_ref_field_bindings(
     schema: &Schema,
@@ -449,6 +558,14 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
 
     resolve_ref_field_bindings(schema, subject_column, id_column, &mut st);
 
+    // Process OPTIONAL patterns as LEFT JOINs.
+    let pattern_count = plan.patterns.len();
+    for (oi, opt) in plan.optionals.iter().enumerate() {
+        process_optional_group(
+            oi, pattern_count, opt, &ctx, &mut st,
+        )?;
+    }
+
     if let Some(ref values) = plan.values {
         process_values_clause(values, &mut st);
     }
@@ -520,6 +637,7 @@ pub fn to_union_sql(
             filters: plan.filters.clone(),
             null_checks: plan.null_checks.clone(),
             expr_filters: plan.expr_filters.clone(),
+            optionals: plan.optionals.clone(),
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: plan.values.clone(),
@@ -905,6 +1023,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -940,6 +1059,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -989,6 +1109,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1019,6 +1140,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1054,6 +1176,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1091,6 +1214,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1123,6 +1247,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1168,6 +1293,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1201,6 +1327,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1230,6 +1357,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1266,6 +1394,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1300,6 +1429,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1367,6 +1497,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1396,6 +1527,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1446,6 +1578,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1493,6 +1626,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1526,6 +1660,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1563,6 +1698,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1652,6 +1788,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1700,6 +1837,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1772,6 +1910,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1815,6 +1954,7 @@ mod tests {
             modifier: empty_modifier(),
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1859,6 +1999,7 @@ mod tests {
             modifier: empty_modifier(),
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1903,6 +2044,7 @@ mod tests {
             modifier: empty_modifier(),
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -1955,6 +2097,7 @@ mod tests {
             modifier: empty_modifier(),
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -2006,6 +2149,7 @@ mod tests {
             modifier: empty_modifier(),
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -2051,6 +2195,7 @@ mod tests {
             modifier: empty_modifier(),
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -2092,6 +2237,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
         let plan_b = QueryPlan {
@@ -2112,6 +2258,7 @@ mod tests {
             filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
+            optionals: vec![],
             values: None,
         };
 
@@ -2146,6 +2293,7 @@ mod tests {
                 field_names: vec!["deprecated_by_a".into(), "deprecated_by_b".into()],
             }],
             expr_filters: vec![],
+            optionals: vec![],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: None,

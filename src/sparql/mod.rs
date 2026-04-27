@@ -14,11 +14,7 @@ pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
     };
 
     let mut bound: HashSet<&str> = HashSet::new();
-    for tp in &query.where_pattern.patterns {
-        collect_var(&tp.subject, &mut bound);
-        collect_var(&tp.predicate, &mut bound);
-        collect_var(&tp.object, &mut bound);
-    }
+    collect_ggp_vars(&query.where_pattern, &mut bound);
     if let Some(ref vc) = query.values {
         for v in &vc.variables {
             bound.insert(v.as_str());
@@ -35,6 +31,21 @@ pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
         Ok(())
     } else {
         Err(DarqError::UnboundVariables(unbound))
+    }
+}
+
+fn collect_ggp_vars<'a>(ggp: &'a ast::GroupGraphPattern, set: &mut HashSet<&'a str>) {
+    for tp in &ggp.patterns {
+        collect_var(&tp.subject, set);
+        collect_var(&tp.predicate, set);
+        collect_var(&tp.object, set);
+    }
+    for opt in &ggp.optionals {
+        for tp in &opt.patterns {
+            collect_var(&tp.subject, set);
+            collect_var(&tp.predicate, set);
+            collect_var(&tp.object, set);
+        }
     }
 }
 
