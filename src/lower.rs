@@ -308,10 +308,15 @@ fn lower_optionals(
         };
         let patterns = match lower_bgp(&ggp, schema) {
             Ok(p) => p,
-            Err(DarqError::AmbiguousType { ref candidates, .. }) if candidates.len() > 1 => {
-                // For ambiguous optional types, just try the first candidate
-                let augmented = augment_with_type(&ggp, &format!("__opt_{}", result.len()), &candidates[0]);
+            Err(DarqError::AmbiguousType { ref subject, ref candidates }) if candidates.len() > 1 => {
+                let augmented = augment_with_type(&ggp, subject, &candidates[0]);
                 lower_bgp(&augmented, schema)?
+            }
+            Err(DarqError::AmbiguousType { ref candidates, .. }) if candidates.is_empty() => {
+                continue;
+            }
+            Err(DarqError::UnknownPredicate(_)) => {
+                continue;
             }
             Err(e) => return Err(e),
         };
