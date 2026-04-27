@@ -25,7 +25,7 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             }
         }
 
-        let (filters, null_checks) = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
+        let (filters, null_checks, expr_filters) = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
 
         check_pattern_connectivity(&patterns, &filters, values.as_ref())?;
 
@@ -33,6 +33,7 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             patterns,
             filters,
             null_checks,
+            expr_filters,
             select: query.select.clone(),
             modifier: query.modifier.clone(),
             values: values.clone(),
@@ -249,9 +250,10 @@ fn lower_filters(
     filters: &[Filter],
     schema: &Schema,
     outer_var_types: &HashMap<String, Iri>,
-) -> Result<(Vec<NotExistsFilter>, Vec<NullCheckFilter>), DarqError> {
+) -> Result<(Vec<NotExistsFilter>, Vec<NullCheckFilter>, Vec<FilterExpr>), DarqError> {
     let mut not_exists = Vec::new();
     let mut null_checks = Vec::new();
+    let mut expr_filters = Vec::new();
     for filter in filters {
         match filter {
             Filter::NotExists(ggp) => {
@@ -278,9 +280,12 @@ fn lower_filters(
                     Err(e) => return Err(e),
                 }
             }
+            Filter::Expression(expr) => {
+                expr_filters.push(expr.clone());
+            }
         }
     }
-    Ok((not_exists, null_checks))
+    Ok((not_exists, null_checks, expr_filters))
 }
 
 /// Try to rewrite `FILTER NOT EXISTS {[] pred ?var}` as a null-check on the
@@ -650,11 +655,20 @@ fn to_ir_value(obj: &ObjectInfo) -> Value {
     }
 }
 
-fn sparql_lit_to_term(lit: &spargebra::term::Literal) -> Term {
+pub fn sparql_lit_to_term(lit: &spargebra::term::Literal) -> Term {
     let datatype = lit.datatype().as_str();
     let value = lit.value();
     match datatype {
-        "http://www.w3.org/2001/XMLSchema#integer" => {
+        "http://www.w3.org/2001/XMLSchema#integer"
+        | "http://www.w3.org/2001/XMLSchema#int"
+        | "http://www.w3.org/2001/XMLSchema#long"
+        | "http://www.w3.org/2001/XMLSchema#short"
+        | "http://www.w3.org/2001/XMLSchema#byte"
+        | "http://www.w3.org/2001/XMLSchema#nonNegativeInteger"
+        | "http://www.w3.org/2001/XMLSchema#positiveInteger"
+        | "http://www.w3.org/2001/XMLSchema#unsignedInt"
+        | "http://www.w3.org/2001/XMLSchema#unsignedLong"
+        | "http://www.w3.org/2001/XMLSchema#unsignedShort" => {
             value.parse::<i64>()
                 .map(|n| Term::Literal(Literal::Integer(n)))
                 .unwrap_or_else(|_| Term::Literal(Literal::String(value.to_owned())))

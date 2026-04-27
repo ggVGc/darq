@@ -97,6 +97,7 @@ fn validate_predicates_in_ggp(
     for filter in &ggp.filters {
         match filter {
             Filter::NotExists(inner) => validate_predicates_in_ggp(inner, schema)?,
+            Filter::Expression(_) => {}
         }
     }
     Ok(())

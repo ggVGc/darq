@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::rdf::{Iri, Term};
-use crate::sparql::ast::{SelectClause, SolutionModifier};
+use crate::sparql::ast::{FilterExpr, SelectClause, SolutionModifier};
 
 /// How a pattern references a resource's identity (subject position).
 #[derive(Debug, Clone)]
@@ -83,6 +83,7 @@ pub struct QueryPlan {
     pub patterns: Vec<QueryPattern>,
     pub filters: Vec<NotExistsFilter>,
     pub null_checks: Vec<NullCheckFilter>,
+    pub expr_filters: Vec<FilterExpr>,
     pub select: SelectClause,
     pub modifier: SolutionModifier,
     pub values: Option<InlineData>,
@@ -196,6 +197,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -218,6 +220,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -249,6 +252,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -282,6 +286,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -297,6 +302,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 

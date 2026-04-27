@@ -27,6 +27,27 @@ pub struct GroupGraphPattern {
 #[derive(Debug, Clone)]
 pub enum Filter {
     NotExists(GroupGraphPattern),
+    Expression(FilterExpr),
+}
+
+#[derive(Debug, Clone)]
+pub enum FilterExpr {
+    Equal(Box<FilterExpr>, Box<FilterExpr>),
+    NotEqual(Box<FilterExpr>, Box<FilterExpr>),
+    Less(Box<FilterExpr>, Box<FilterExpr>),
+    Greater(Box<FilterExpr>, Box<FilterExpr>),
+    LessOrEqual(Box<FilterExpr>, Box<FilterExpr>),
+    GreaterOrEqual(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Not(Box<FilterExpr>),
+    Variable(Variable),
+    Iri(Iri),
+    Literal(spargebra::term::Literal),
+    Bound(Variable),
+    Str(Box<FilterExpr>),
+    Contains(Box<FilterExpr>, Box<FilterExpr>),
+    Exists(GroupGraphPattern),
 }
 
 #[derive(Debug, Clone)]

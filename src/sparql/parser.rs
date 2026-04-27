@@ -297,7 +297,9 @@ fn extract_filters(expr: Expression) -> Result<Vec<Filter>, DarqError> {
                 let (ggp, _) = extract_body(*gp)?;
                 Ok(vec![Filter::NotExists(ggp)])
             } else {
-                Err(DarqError::ParseError("only FILTER NOT EXISTS is supported".into()))
+                Ok(vec![Filter::Expression(FilterExpr::Not(
+                    Box::new(convert_expression(*inner)?),
+                ))])
             }
         }
         Expression::And(left, right) => {
@@ -305,9 +307,96 @@ fn extract_filters(expr: Expression) -> Result<Vec<Filter>, DarqError> {
             filters.extend(extract_filters(*right)?);
             Ok(filters)
         }
-        _ => Err(DarqError::ParseError(
-            "only FILTER NOT EXISTS is supported".into(),
+        other => {
+            Ok(vec![Filter::Expression(convert_expression(other)?)])
+        }
+    }
+}
+
+fn convert_expression(expr: Expression) -> Result<FilterExpr, DarqError> {
+    match expr {
+        Expression::Variable(v) => Ok(FilterExpr::Variable(v)),
+        Expression::NamedNode(nn) => Ok(FilterExpr::Iri(Iri::new(nn.into_string()))),
+        Expression::Literal(lit) => Ok(FilterExpr::Literal(lit)),
+        Expression::Equal(left, right) => Ok(FilterExpr::Equal(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
         )),
+        Expression::SameTerm(left, right) => Ok(FilterExpr::Equal(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::Greater(left, right) => Ok(FilterExpr::Greater(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::GreaterOrEqual(left, right) => Ok(FilterExpr::GreaterOrEqual(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::Less(left, right) => Ok(FilterExpr::Less(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::LessOrEqual(left, right) => Ok(FilterExpr::LessOrEqual(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::Or(left, right) => Ok(FilterExpr::Or(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::And(left, right) => Ok(FilterExpr::And(
+            Box::new(convert_expression(*left)?),
+            Box::new(convert_expression(*right)?),
+        )),
+        Expression::Not(inner) => {
+            if let Expression::Exists(gp) = *inner {
+                let (ggp, _) = extract_body(*gp)?;
+                Ok(FilterExpr::Not(Box::new(FilterExpr::Exists(ggp))))
+            } else {
+                Ok(FilterExpr::Not(Box::new(convert_expression(*inner)?)))
+            }
+        }
+        Expression::Bound(v) => Ok(FilterExpr::Bound(v)),
+        Expression::Exists(gp) => {
+            let (ggp, _) = extract_body(*gp)?;
+            Ok(FilterExpr::Exists(ggp))
+        }
+        Expression::FunctionCall(func, args) => {
+            convert_function_call(func, args)
+        }
+        _ => Err(DarqError::ParseError(format!(
+            "unsupported FILTER expression: {:?}", expr
+        ))),
+    }
+}
+
+fn convert_function_call(
+    func: spargebra::algebra::Function,
+    args: Vec<Expression>,
+) -> Result<FilterExpr, DarqError> {
+    use spargebra::algebra::Function;
+    match func {
+        Function::Str => {
+            if args.len() != 1 {
+                return Err(DarqError::ParseError("str() takes exactly 1 argument".into()));
+            }
+            Ok(FilterExpr::Str(Box::new(convert_expression(args.into_iter().next().unwrap())?)))
+        }
+        Function::Contains => {
+            if args.len() != 2 {
+                return Err(DarqError::ParseError("CONTAINS() takes exactly 2 arguments".into()));
+            }
+            let mut iter = args.into_iter();
+            Ok(FilterExpr::Contains(
+                Box::new(convert_expression(iter.next().unwrap())?),
+                Box::new(convert_expression(iter.next().unwrap())?),
+            ))
+        }
+        _ => Err(DarqError::ParseError(format!(
+            "unsupported function: {:?}", func
+        ))),
     }
 }
 
@@ -386,6 +475,7 @@ mod tests {
         assert_eq!(q.where_pattern.filters.len(), 1);
         match &q.where_pattern.filters[0] {
             Filter::NotExists(ggp) => assert_eq!(ggp.patterns.len(), 1),
+            _ => panic!("expected NotExists filter"),
         }
     }
 

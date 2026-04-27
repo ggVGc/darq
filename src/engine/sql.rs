@@ -160,6 +160,7 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             patterns: plan.patterns.clone(),
             filters: plan.filters.clone(),
             null_checks: plan.null_checks.clone(),
+            expr_filters: plan.expr_filters.clone(),
             select: SelectClause::Star,
             modifier,
             values: plan.values.clone(),
@@ -1311,6 +1312,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1359,6 +1361,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1412,6 +1415,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1482,6 +1486,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1567,6 +1572,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1632,6 +1638,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1720,6 +1727,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1765,6 +1773,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1827,6 +1836,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1881,6 +1891,7 @@ mod tests {
             modifier: SolutionModifier::default(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1967,6 +1978,7 @@ mod tests {
             },
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 

@@ -4,7 +4,7 @@ use crate::error::DarqError;
 use crate::ir::{FieldConstraint, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term};
 use crate::schema::Schema;
-use crate::sparql::ast::{OrderDirection, SelectClause};
+use crate::sparql::ast::{FilterExpr, OrderDirection, SelectClause};
 use crate::sql_util::{
     assemble_from_join, build_ref_left_joins, field_comparison_sql, is_array_field,
     resolve_table_name,
@@ -467,6 +467,13 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         }
     }
 
+    // Expression filters use select_bindings so that subject/reference
+    // variables resolve to full IRIs rather than internal foreign-key IDs.
+    for expr in &plan.expr_filters {
+        let sql = filter_expr_to_sql(expr, &st.select_bindings)?;
+        st.where_parts.push(sql);
+    }
+
     Ok(assemble_final_sql(plan, &st))
 }
 
@@ -512,6 +519,7 @@ pub fn to_union_sql(
             patterns: plan.patterns.clone(),
             filters: plan.filters.clone(),
             null_checks: plan.null_checks.clone(),
+            expr_filters: plan.expr_filters.clone(),
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: plan.values.clone(),
@@ -564,6 +572,93 @@ pub(crate) fn sql_literal(term: &Term) -> String {
             Literal::Date(s) => format!("'{}'", s.replace('\'', "''")),
             Literal::DateTime(s) => format!("'{}'", s.replace('\'', "''")),
         },
+    }
+}
+
+/// Compile a FilterExpr to a SQL expression string, resolving variables
+/// via the join_bindings map (which maps SPARQL variable names to SQL expressions).
+fn filter_expr_to_sql(
+    expr: &FilterExpr,
+    bindings: &HashMap<String, SqlExpr>,
+) -> Result<String, DarqError> {
+    match expr {
+        FilterExpr::Variable(v) => {
+            let name = v.as_str();
+            match bindings.get(name) {
+                Some(sql_expr) => Ok(sql_expr.to_sql()),
+                None => Err(DarqError::SqlError(format!(
+                    "FILTER references unbound variable ?{}", name
+                ))),
+            }
+        }
+        FilterExpr::Iri(iri) => Ok(format!("'{}'", iri.0.replace('\'', "''"))),
+        FilterExpr::Literal(lit) => {
+            let term = crate::lower::sparql_lit_to_term(lit);
+            Ok(sql_literal(&term))
+        }
+        FilterExpr::Equal(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} = {})", l, r))
+        }
+        FilterExpr::NotEqual(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} != {})", l, r))
+        }
+        FilterExpr::Less(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} < {})", l, r))
+        }
+        FilterExpr::Greater(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} > {})", l, r))
+        }
+        FilterExpr::LessOrEqual(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} <= {})", l, r))
+        }
+        FilterExpr::GreaterOrEqual(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} >= {})", l, r))
+        }
+        FilterExpr::Or(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} OR {})", l, r))
+        }
+        FilterExpr::And(left, right) => {
+            let l = filter_expr_to_sql(left, bindings)?;
+            let r = filter_expr_to_sql(right, bindings)?;
+            Ok(format!("({} AND {})", l, r))
+        }
+        FilterExpr::Not(inner) => {
+            let s = filter_expr_to_sql(inner, bindings)?;
+            Ok(format!("NOT ({})", s))
+        }
+        FilterExpr::Bound(v) => {
+            let name = v.as_str();
+            match bindings.get(name) {
+                Some(sql_expr) => Ok(format!("({} IS NOT NULL)", sql_expr.to_sql())),
+                None => Ok("FALSE".to_string()),
+            }
+        }
+        FilterExpr::Str(inner) => {
+            let s = filter_expr_to_sql(inner, bindings)?;
+            Ok(format!("CAST({} AS TEXT)", s))
+        }
+        FilterExpr::Contains(haystack, needle) => {
+            let h = filter_expr_to_sql(haystack, bindings)?;
+            let n = filter_expr_to_sql(needle, bindings)?;
+            Ok(format!("({} LIKE '%%' || {} || '%%')", h, n))
+        }
+        FilterExpr::Exists(_) => {
+            Err(DarqError::SqlError("FILTER EXISTS not yet supported in SQL generation".into()))
+        }
     }
 }
 
@@ -809,6 +904,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -843,6 +939,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -891,6 +988,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -920,6 +1018,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -954,6 +1053,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -990,6 +1090,7 @@ mod tests {
             },
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1021,6 +1122,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1065,6 +1167,7 @@ mod tests {
             },
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1097,6 +1200,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1125,6 +1229,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1160,6 +1265,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1193,6 +1299,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1259,6 +1366,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1287,6 +1395,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1336,6 +1445,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1382,6 +1492,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1414,6 +1525,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1450,6 +1562,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1538,6 +1651,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1585,6 +1699,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1656,6 +1771,7 @@ mod tests {
             modifier: empty_modifier(),
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1698,6 +1814,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1741,6 +1858,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1784,6 +1902,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1835,6 +1954,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1885,6 +2005,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1929,6 +2050,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -1969,6 +2091,7 @@ mod tests {
             },
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
         let plan_b = QueryPlan {
@@ -1988,6 +2111,7 @@ mod tests {
             },
             filters: vec![],
             null_checks: vec![],
+            expr_filters: vec![],
             values: None,
         };
 
@@ -2021,6 +2145,7 @@ mod tests {
                 variable: "x".into(),
                 field_names: vec!["deprecated_by_a".into(), "deprecated_by_b".into()],
             }],
+            expr_filters: vec![],
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: None,
