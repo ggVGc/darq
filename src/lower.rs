@@ -42,6 +42,8 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             values: values.clone(),
             select_expressions: query.select_expressions.iter().map(|(v, e)| (v.as_str().to_owned(), e.clone())).collect(),
             binds: query.binds.iter().map(|(v, e)| (v.as_str().to_owned(), e.clone())).collect(),
+            group_by: query.group_by.iter().map(|v| v.as_str().to_owned()).collect(),
+            having: query.having.clone(),
         });
     }
     Ok(plans)
@@ -542,11 +544,11 @@ fn lower_subject_group(
         match pred {
             PredicateKind::RdfType => match obj {
                 ObjectInfo::Iri(iri) => {
-                    // Validate the type is known
-                    if schema.fields_for_type(iri).is_none() {
+                    let resolved = schema.resolve_type(iri);
+                    if schema.fields_for_type(&resolved).is_none() {
                         return Err(DarqError::UnknownType(iri.clone()));
                     }
-                    explicit_type = Some(iri.clone());
+                    explicit_type = Some(resolved);
                 }
                 ObjectInfo::Variable(name) => {
                     type_variable = Some(name.clone());
@@ -1535,6 +1537,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let plans = lower(&query, &schema).unwrap();
@@ -1616,6 +1620,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let plans = lower(&query, &schema).unwrap();
@@ -1716,6 +1722,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let plans = lower(&query, &schema).unwrap();
@@ -1761,6 +1769,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let schema = test_schema();

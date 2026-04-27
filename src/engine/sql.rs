@@ -156,17 +156,24 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
         } else {
             plan.modifier.clone()
         };
+        let select = if plan.group_by.is_empty() {
+            SelectClause::Star
+        } else {
+            plan.select.clone()
+        };
         let full_plan = QueryPlan {
             patterns: plan.patterns.clone(),
             filters: plan.filters.clone(),
             null_checks: plan.null_checks.clone(),
             expr_filters: plan.expr_filters.clone(),
             optionals: plan.optionals.clone(),
-            select: SelectClause::Star,
+            select,
             modifier,
             values: plan.values.clone(),
             select_expressions: plan.select_expressions.clone(),
             binds: plan.binds.clone(),
+            group_by: plan.group_by.clone(),
+            having: plan.having.clone(),
         };
         let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
@@ -1320,6 +1327,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1372,6 +1381,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1429,6 +1440,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1503,6 +1516,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1592,6 +1607,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1661,6 +1678,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1753,6 +1772,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1802,6 +1823,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1868,6 +1891,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1926,6 +1951,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -2017,6 +2044,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();

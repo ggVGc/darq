@@ -508,6 +508,28 @@ fn assemble_final_sql(
         sql.push_str(&format!("\nWHERE {}", st.where_parts.join(" AND ")));
     }
 
+    if !plan.group_by.is_empty() {
+        let group_parts: Vec<String> = plan
+            .group_by
+            .iter()
+            .filter_map(|v| st.select_bindings.get(v.as_str()).map(|e| e.to_sql()))
+            .collect();
+        if !group_parts.is_empty() {
+            sql.push_str(&format!("\nGROUP BY {}", group_parts.join(", ")));
+        }
+    }
+
+    if !plan.having.is_empty() {
+        let having_parts: Vec<String> = plan
+            .having
+            .iter()
+            .filter_map(|e| filter_expr_to_sql(e, &st.select_bindings).ok())
+            .collect();
+        if !having_parts.is_empty() {
+            sql.push_str(&format!("\nHAVING {}", having_parts.join(" AND ")));
+        }
+    }
+
     if !plan.modifier.order_by.is_empty() {
         let order_parts: Vec<String> = plan
             .modifier
@@ -667,6 +689,8 @@ pub fn to_union_sql(
             values: plan.values.clone(),
             select_expressions: plan.select_expressions.clone(),
             binds: plan.binds.clone(),
+            group_by: plan.group_by.clone(),
+            having: plan.having.clone(),
         };
         subqueries.push(to_sql(&inner_plan, schema, subject_column, id_column)?);
     }
@@ -844,6 +868,29 @@ fn filter_expr_to_sql(
         FilterExpr::ToIri(inner) => {
             let s = filter_expr_to_sql(inner, bindings)?;
             Ok(s)
+        }
+        FilterExpr::Count { expr, distinct } => {
+            let distinct_str = if *distinct { "DISTINCT " } else { "" };
+            match expr {
+                Some(inner) => {
+                    let s = filter_expr_to_sql(inner, bindings)?;
+                    Ok(format!("COUNT({}{})", distinct_str, s))
+                }
+                None => Ok(format!("COUNT({}*)", distinct_str)),
+            }
+        }
+        FilterExpr::Sum(inner) => {
+            let s = filter_expr_to_sql(inner, bindings)?;
+            Ok(format!("SUM({})", s))
+        }
+        FilterExpr::Sample(inner) => {
+            // PostgreSQL doesn't have SAMPLE; use MIN as an approximation
+            let s = filter_expr_to_sql(inner, bindings)?;
+            Ok(format!("MIN({})", s))
+        }
+        FilterExpr::GroupConcat { expr, separator } => {
+            let s = filter_expr_to_sql(expr, bindings)?;
+            Ok(format!("STRING_AGG({}, '{}')", s, separator.replace('\'', "''")))
         }
     }
 }
@@ -1095,6 +1142,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1133,6 +1182,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1185,6 +1236,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1218,6 +1271,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1256,6 +1311,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1297,6 +1354,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1332,6 +1391,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1381,6 +1442,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1417,6 +1480,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1449,6 +1514,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1488,6 +1555,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1525,6 +1594,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1595,6 +1666,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -1627,6 +1700,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -1680,6 +1755,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1730,6 +1807,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1766,6 +1845,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1806,6 +1887,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1898,6 +1981,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -1949,6 +2034,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -2024,6 +2111,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -2070,6 +2159,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2117,6 +2208,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2164,6 +2257,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_id").unwrap();
@@ -2219,6 +2314,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2273,6 +2370,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2321,6 +2420,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2365,6 +2466,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
         let plan_b = QueryPlan {
             patterns: vec![QueryPattern::Resource {
@@ -2388,6 +2491,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_union_sql(&[plan_a, plan_b], &Schema::new(), "_subject", "_subject").unwrap();
@@ -2427,6 +2532,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();

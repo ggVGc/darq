@@ -100,6 +100,10 @@ pub struct QueryPlan {
     pub select_expressions: Vec<(String, FilterExpr)>,
     /// BIND expressions: `BIND(expr AS ?var)` computed variables.
     pub binds: Vec<(String, FilterExpr)>,
+    /// GROUP BY variable names.
+    pub group_by: Vec<String>,
+    /// HAVING expressions.
+    pub having: Vec<FilterExpr>,
 }
 
 impl QueryPlan {
@@ -252,6 +256,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         assert_eq!(
@@ -278,6 +284,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         assert_eq!(plan.collect_variables(), vec!["s", "p", "o"]);
@@ -313,6 +321,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         // "p" appears in both patterns but should only appear once
@@ -350,6 +360,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         // Only "name" — bound subject and bound age value are excluded
@@ -369,6 +381,8 @@ mod tests {
             values: None,
             select_expressions: vec![],
             binds: vec![],
+            group_by: vec![],
+            having: vec![],
         };
 
         assert!(plan.collect_variables().is_empty());

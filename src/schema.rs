@@ -76,6 +76,7 @@ pub struct Schema {
     /// Key: (predicate IRI, target type IRI of ?var).
     /// Value: field names on the target type that must all be NULL.
     not_exists_rewrites: HashMap<(Iri, Iri), Vec<String>>,
+    type_aliases: HashMap<Iri, Iri>,
 }
 
 impl Schema {
@@ -84,7 +85,20 @@ impl Schema {
             types: HashMap::new(),
             predicate_to_types: HashMap::new(),
             not_exists_rewrites: HashMap::new(),
+            type_aliases: HashMap::new(),
         }
+    }
+
+    fn resolve_alias<'a>(&'a self, iri: &'a Iri) -> &'a Iri {
+        self.type_aliases.get(iri).unwrap_or(iri)
+    }
+
+    pub fn register_type_alias(&mut self, alias: Iri, canonical: Iri) {
+        self.type_aliases.insert(alias, canonical);
+    }
+
+    pub fn resolve_type(&self, iri: &Iri) -> Iri {
+        self.type_aliases.get(iri).cloned().unwrap_or_else(|| iri.clone())
     }
 
     /// Register a Resource type and all its predicates.
@@ -124,7 +138,7 @@ impl Schema {
 
     /// Look up the field name for a predicate on a given type.
     pub fn field_name(&self, type_iri: &Iri, predicate: &Iri) -> Option<&str> {
-        self.types.get(type_iri).and_then(|info| {
+        self.types.get(self.resolve_alias(type_iri)).and_then(|info| {
             info.fields
                 .iter()
                 .find(|fd| fd.predicate == *predicate)
@@ -134,7 +148,7 @@ impl Schema {
 
     /// Look up the predicate IRI for a field name on a given type.
     pub fn predicate_for_field(&self, type_iri: &Iri, field_name: &str) -> Option<&Iri> {
-        self.types.get(type_iri).and_then(|info| {
+        self.types.get(self.resolve_alias(type_iri)).and_then(|info| {
             info.fields
                 .iter()
                 .find(|fd| fd.name == field_name)
@@ -152,12 +166,12 @@ impl Schema {
 
     /// Return the field descriptors for a type.
     pub fn fields_for_type(&self, type_iri: &Iri) -> Option<&[FieldDescriptor]> {
-        self.types.get(type_iri).map(|info| info.fields.as_slice())
+        self.types.get(self.resolve_alias(type_iri)).map(|info| info.fields.as_slice())
     }
 
     /// Return the SQL table name for a registered type.
     pub fn table_name(&self, type_iri: &Iri) -> Option<&str> {
-        self.types.get(type_iri).map(|info| info.table_name.as_str())
+        self.types.get(self.resolve_alias(type_iri)).map(|info| info.table_name.as_str())
     }
 
     /// Iterate over all registered type IRIs.
@@ -168,7 +182,7 @@ impl Schema {
     /// Return the target types for a specific type's field (Reference or ReferenceArray).
     /// Returns None if the field is not a reference type or is unknown.
     pub fn field_range_for_type(&self, type_iri: &Iri, predicate: &Iri) -> Option<&[Iri]> {
-        self.types.get(type_iri).and_then(|info| {
+        self.types.get(self.resolve_alias(type_iri)).and_then(|info| {
             info.fields.iter().find(|fd| fd.predicate == *predicate).and_then(|fd| {
                 match &fd.field_type {
                     FieldType::Reference(iris) | FieldType::ReferenceArray(iris) => Some(iris.as_slice()),

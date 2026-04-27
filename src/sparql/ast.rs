@@ -13,6 +13,10 @@ pub struct SelectQuery {
     pub select_expressions: Vec<(Variable, FilterExpr)>,
     /// BIND expressions from the WHERE clause: `BIND(expr AS ?var)`.
     pub binds: Vec<(Variable, FilterExpr)>,
+    /// GROUP BY variables.
+    pub group_by: Vec<Variable>,
+    /// HAVING expressions.
+    pub having: Vec<FilterExpr>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +71,10 @@ pub enum FilterExpr {
     If(Box<FilterExpr>, Box<FilterExpr>, Box<FilterExpr>),
     UCase(Box<FilterExpr>),
     ToIri(Box<FilterExpr>),
+    Count { expr: Option<Box<FilterExpr>>, distinct: bool },
+    Sum(Box<FilterExpr>),
+    Sample(Box<FilterExpr>),
+    GroupConcat { expr: Box<FilterExpr>, separator: String },
 }
 
 #[derive(Debug, Clone)]

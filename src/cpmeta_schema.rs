@@ -517,6 +517,28 @@ pub fn cpmeta_schema() -> Schema {
     schema.register::<Collection>();
     schema.register::<PlainCollection>();
 
+    // Ontology-level class names → table-level type IRIs
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DocumentObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Collection")),
+        Iri::new(tbl!("ct_collections")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("SimpleObjectSpec")),
+        Iri::new(tbl!("ct_object_specs")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataObjectSpec")),
+        Iri::new(tbl!("ct_object_specs")),
+    );
+
     // NOT EXISTS rewrites: `FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?x}`
     // becomes null-checks on the deprecation fields of ?x's type.
     schema.register_not_exists_rewrite(

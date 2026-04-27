@@ -64,8 +64,10 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
     let mut limit = None;
     let mut offset = None;
     let mut select = SelectClause::Star;
-    let mut aggregate_alias: Option<Variable> = None;
     let mut select_expressions: Vec<(Variable, FilterExpr)> = Vec::new();
+    let mut group_by_vars: Vec<Variable> = Vec::new();
+    let having_exprs: Vec<FilterExpr> = Vec::new();
+    let mut aggregate_aliases: Vec<(Variable, Variable)> = Vec::new();
 
     loop {
         match pattern {
@@ -94,8 +96,8 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
                 pattern = *inner;
             }
             GraphPattern::Extend { inner, variable, expression } => {
-                if matches!(expression, Expression::Variable(_)) {
-                    aggregate_alias = Some(variable);
+                if let Expression::Variable(ref v) = expression {
+                    aggregate_aliases.push((variable, v.clone()));
                     pattern = *inner;
                 } else {
                     let filter_expr = convert_expression(expression)?;
@@ -104,22 +106,32 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
                 }
             }
             GraphPattern::Group { inner, variables, aggregates } => {
-                if !variables.is_empty() {
-                    return Err(DarqError::ParseError("GROUP BY is not supported".into()));
-                }
-                let (_, agg) = match aggregates.into_iter().next() {
-                    Some(pair) => pair,
-                    None => return Err(DarqError::ParseError("empty aggregate".into())),
-                };
-                if !matches!(agg, AggregateExpression::CountSolutions { distinct: false }) {
+                group_by_vars = variables;
+
+                if aggregates.len() == 1 && group_by_vars.is_empty() {
+                    let (_, agg) = aggregates.into_iter().next().unwrap();
+                    if matches!(agg, AggregateExpression::CountSolutions { distinct: false }) {
+                        let alias = aggregate_aliases.pop()
+                            .map(|(a, _)| a)
+                            .unwrap_or_else(|| Variable::new_unchecked("count"));
+                        select = SelectClause::Count { variable: alias };
+                        pattern = *inner;
+                        continue;
+                    }
                     return Err(DarqError::ParseError(
-                        "only COUNT(*) aggregate is supported".into(),
+                        "unsupported aggregate in non-GROUP BY query".into(),
                     ));
                 }
-                let alias = aggregate_alias.take().unwrap_or_else(|| {
-                    Variable::new_unchecked("count")
-                });
-                select = SelectClause::Count { variable: alias };
+
+                for (agg_var, agg_expr) in aggregates {
+                    let filter_expr = convert_aggregate(agg_expr)?;
+                    let alias = aggregate_aliases.iter()
+                        .find(|(_, src)| src == &agg_var)
+                        .map(|(a, _)| a.clone())
+                        .unwrap_or(agg_var);
+                    select_expressions.push((alias, filter_expr));
+                }
+
                 pattern = *inner;
             }
             _ => break,
@@ -135,7 +147,40 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
         values,
         select_expressions,
         binds,
+        group_by: group_by_vars,
+        having: having_exprs,
     })
+}
+
+fn convert_aggregate(agg: AggregateExpression) -> Result<FilterExpr, DarqError> {
+    use spargebra::algebra::AggregateFunction;
+    match agg {
+        AggregateExpression::CountSolutions { distinct } => {
+            Ok(FilterExpr::Count { expr: None, distinct })
+        }
+        AggregateExpression::FunctionCall { name, expr, distinct } => {
+            match name {
+                AggregateFunction::Count => {
+                    let inner = convert_expression(expr)?;
+                    Ok(FilterExpr::Count { expr: Some(Box::new(inner)), distinct })
+                }
+                AggregateFunction::Sum => {
+                    Ok(FilterExpr::Sum(Box::new(convert_expression(expr)?)))
+                }
+                AggregateFunction::Sample => {
+                    Ok(FilterExpr::Sample(Box::new(convert_expression(expr)?)))
+                }
+                AggregateFunction::GroupConcat { separator } => {
+                    let sep = separator.unwrap_or_else(|| " ".to_string());
+                    Ok(FilterExpr::GroupConcat {
+                        expr: Box::new(convert_expression(expr)?),
+                        separator: sep,
+                    })
+                }
+                _ => Err(DarqError::ParseError(format!("unsupported aggregate function: {:?}", name))),
+            }
+        }
+    }
 }
 
 fn convert_order_expressions(exprs: Vec<OrderExpression>) -> Result<Vec<OrderCondition>, DarqError> {
