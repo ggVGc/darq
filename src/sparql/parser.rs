@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
-use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
+use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression};
 use spargebra::term::{NamedNodePattern, TermPattern};
 use spargebra::{Query, SparqlParser};
 
@@ -9,10 +11,19 @@ use crate::rdf::Iri;
 use super::ast::*;
 
 static BLANK_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static PATH_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+// Thread-local map to track blank node IDs and their mapped variable names
+// within a single parse call
+thread_local! {
+    static BLANK_NODE_MAP: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+}
 
 /// Parse a SPARQL SELECT query string into our internal AST.
 pub fn parse(input: &str) -> Result<SelectQuery, DarqError> {
     BLANK_COUNTER.store(0, Ordering::Relaxed);
+    PATH_COUNTER.store(0, Ordering::Relaxed);
+    BLANK_NODE_MAP.with(|m| m.borrow_mut().clear());
 
     // Detect SELECT * before parsing (spargebra always wraps in Project)
     let is_select_star = detect_select_star(input);
@@ -142,11 +153,73 @@ fn convert_order_expressions(exprs: Vec<OrderExpression>) -> Result<Vec<OrderCon
     }).collect()
 }
 
+/// Desugar a property path expression into a sequence of triple patterns.
+///
+/// For example, `?dobj a/b ?obj` becomes:
+///   ?dobj a ?__path_0 .
+///   ?__path_0 b ?obj .
+///
+/// Note: spargebra currently desugars property paths to Bgp patterns with blank node
+/// intermediates before we see them. This handler is for potential future use if:
+/// 1. The parser produces GraphPattern::Path nodes
+/// 2. We need explicit control over path desugaring
+fn desugar_path(
+    subject: TermOrVariable,
+    path: &PropertyPathExpression,
+    object: TermOrVariable,
+    triples: &mut Vec<TriplePattern>,
+) -> Result<(), DarqError> {
+    match path {
+        PropertyPathExpression::NamedNode(nn) => {
+            let iri = Iri::new(nn.as_str().to_string());
+            triples.push(TriplePattern {
+                subject,
+                predicate: TermOrVariable::Iri(iri),
+                object,
+            });
+            Ok(())
+        }
+        PropertyPathExpression::Sequence(left, right) => {
+            let n = PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let intermediate = TermOrVariable::Variable(Variable::new_unchecked(format!("__path_{}", n)));
+            desugar_path(subject, left, intermediate.clone(), triples)?;
+            desugar_path(intermediate, right, object, triples)?;
+            Ok(())
+        }
+        PropertyPathExpression::Reverse(..) => {
+            Err(DarqError::ParseError("property path operator Reverse (^) is not supported".into()))
+        }
+        PropertyPathExpression::Alternative(..) => {
+            Err(DarqError::ParseError("property path operator Alternative (|) is not supported".into()))
+        }
+        PropertyPathExpression::ZeroOrMore(..) => {
+            Err(DarqError::ParseError("property path operator ZeroOrMore (*) is not supported".into()))
+        }
+        PropertyPathExpression::OneOrMore(..) => {
+            Err(DarqError::ParseError("property path operator OneOrMore (+) is not supported".into()))
+        }
+        PropertyPathExpression::ZeroOrOne(..) => {
+            Err(DarqError::ParseError("property path operator ZeroOrOne (?) is not supported".into()))
+        }
+        PropertyPathExpression::NegatedPropertySet(..) => {
+            Err(DarqError::ParseError("property path operator NegatedPropertySet is not supported".into()))
+        }
+    }
+}
+
 /// Extract the WHERE body and optional VALUES clause from the inner pattern.
 fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<ValuesClause>), DarqError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             let triples = patterns.into_iter().map(convert_triple).collect::<Result<_, _>>()?;
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![] }, None))
+        }
+
+        GraphPattern::Path { subject, path, object } => {
+            let subject_tv = convert_term_pattern(subject)?;
+            let object_tv = convert_term_pattern(object)?;
+            let mut triples = Vec::new();
+            desugar_path(subject_tv, &path, object_tv, &mut triples)?;
             Ok((GroupGraphPattern { patterns: triples, filters: vec![] }, None))
         }
 
@@ -251,9 +324,16 @@ fn convert_term_pattern(tp: TermPattern) -> Result<TermOrVariable, DarqError> {
         TermPattern::Variable(v) => Ok(TermOrVariable::Variable(v)),
         TermPattern::NamedNode(nn) => Ok(TermOrVariable::Iri(Iri::new(nn.into_string()))),
         TermPattern::Literal(lit) => Ok(TermOrVariable::Literal(lit)),
-        TermPattern::BlankNode(_bn) => {
-            let n = BLANK_COUNTER.fetch_add(1, Ordering::Relaxed);
-            Ok(TermOrVariable::Variable(Variable::new_unchecked(format!("__anon_{}", n))))
+        TermPattern::BlankNode(bn) => {
+            let bn_str = bn.as_str().to_string();
+            let var_name = BLANK_NODE_MAP.with(|m| {
+                let mut map = m.borrow_mut();
+                map.entry(bn_str).or_insert_with(|| {
+                    let n = BLANK_COUNTER.fetch_add(1, Ordering::Relaxed);
+                    format!("__anon_{}", n)
+                }).clone()
+            });
+            Ok(TermOrVariable::Variable(Variable::new_unchecked(var_name)))
         }
     }
 }
@@ -356,5 +436,100 @@ mod tests {
     fn test_unknown_prefix_is_parse_error() {
         let result = parse("SELECT ?x WHERE { ?s foaf:name ?x }");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_property_path_sequence() {
+        // Test parsing a property path sequence with correct blank node mapping
+        let query = "prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/> \
+                     prefix prov: <http://www.w3.org/ns/prov#> \
+                     select * where { ?dobj cpmeta:wasSubmittedBy/prov:endedAtTime ?submTime . }";
+        let q = parse(query).unwrap();
+
+        // Should desugar into 2 triple patterns with an intermediate variable
+        assert_eq!(q.where_pattern.patterns.len(), 2);
+
+        // Check first predicate
+        if let TermOrVariable::Iri(p1) = &q.where_pattern.patterns[0].predicate {
+            assert_eq!(p1.0, "http://meta.icos-cp.eu/ontologies/cpmeta/wasSubmittedBy");
+        } else {
+            panic!("expected Iri predicate for first triple");
+        }
+
+        // Check second predicate
+        if let TermOrVariable::Iri(p2) = &q.where_pattern.patterns[1].predicate {
+            assert_eq!(p2.0, "http://www.w3.org/ns/prov#endedAtTime");
+        } else {
+            panic!("expected Iri predicate for second triple");
+        }
+
+        // The subject of the second triple should match the object of the first
+        let first_object = &q.where_pattern.patterns[0].object;
+        let second_subject = &q.where_pattern.patterns[1].subject;
+        assert_eq!(
+            format!("{:?}", first_object),
+            format!("{:?}", second_subject),
+            "intermediate variable should be same"
+        );
+    }
+
+    #[test]
+    fn test_parse_simple_property_path() {
+        // Test with simpler property path syntax
+        let query = "prefix ex: <http://example.org/> SELECT ?x WHERE { ?s ex:a/ex:b ?x }";
+        let q = parse(query).unwrap();
+
+        assert_eq!(q.where_pattern.patterns.len(), 2);
+
+        // Check both predicates
+        if let TermOrVariable::Iri(p1) = &q.where_pattern.patterns[0].predicate {
+            assert_eq!(p1.0, "http://example.org/a");
+        } else {
+            panic!("expected Iri predicate for first triple");
+        }
+
+        if let TermOrVariable::Iri(p2) = &q.where_pattern.patterns[1].predicate {
+            assert_eq!(p2.0, "http://example.org/b");
+        } else {
+            panic!("expected Iri predicate for second triple");
+        }
+
+        // Check that the intermediate variable is consistent
+        let first_object = &q.where_pattern.patterns[0].object;
+        let second_subject = &q.where_pattern.patterns[1].subject;
+        assert_eq!(
+            format!("{:?}", first_object),
+            format!("{:?}", second_subject),
+            "intermediate variable should be same"
+        );
+    }
+
+    #[test]
+    fn test_parse_submission_times_query() {
+        // Test parsing the actual submission_times.rq query with property paths
+        let query = "prefix cpmeta: <http://meta.icos-cp.eu/ontologies/cpmeta/>
+prefix prov: <http://www.w3.org/ns/prov#>
+select *
+where {
+  ?dobj cpmeta:wasSubmittedBy/prov:endedAtTime ?submTime .
+}
+  offset 0 limit 20";
+        let q = parse(query).unwrap();
+
+        // Check that we got the right number of triple patterns
+        assert_eq!(q.where_pattern.patterns.len(), 2);
+
+        // Verify the predicates
+        assert!(matches!(&q.where_pattern.patterns[0].predicate, TermOrVariable::Iri(iri) if iri.0.contains("wasSubmittedBy")));
+        assert!(matches!(&q.where_pattern.patterns[1].predicate, TermOrVariable::Iri(iri) if iri.0.contains("endedAtTime")));
+
+        // Verify the variables
+        assert!(matches!(&q.where_pattern.patterns[0].subject, TermOrVariable::Variable(_)));
+        assert!(matches!(&q.where_pattern.patterns[1].object, TermOrVariable::Variable(_)));
+
+        // Verify limit and offset
+        assert_eq!(q.modifier.limit, Some(20));
+        // offset 0 is semantically equivalent to no offset
+        assert!(q.modifier.offset.is_none() || q.modifier.offset == Some(0));
     }
 }

@@ -63,13 +63,11 @@ fn lower_bgp_alternatives(
     }
 }
 
-/// Collect variables from a single QueryPattern, excluding anonymous variables.
+/// Collect variables from a single QueryPattern, including anonymous variables.
 fn pattern_variables(pattern: &QueryPattern) -> HashSet<String> {
     let mut vars = HashSet::new();
     let mut add = |name: &str| {
-        if !name.starts_with("__anon_") {
-            vars.insert(name.to_string());
-        }
+        vars.insert(name.to_string());
     };
     match pattern {
         QueryPattern::Resource {
@@ -203,13 +201,14 @@ fn check_pattern_connectivity(
         return Ok(());
     }
 
-    // Build groups for error message.
+    // Build groups for error message, excluding anonymous variables from the display
+    // (they exist for connectivity but are not user-visible)
     let mut components: HashMap<usize, Vec<String>> = HashMap::new();
     for (i, vs) in var_sets.iter().enumerate() {
         let r = find(&mut parent, i);
         let entry = components.entry(r).or_default();
         for v in vs {
-            if !entry.contains(v) {
+            if !v.starts_with("__anon_") && !entry.contains(v) {
                 entry.push(v.clone());
             }
         }
@@ -1651,5 +1650,44 @@ mod tests {
         assert_eq!(plan.null_checks.len(), 1, "expected 1 null check, got {:?}", plan.null_checks);
         assert_eq!(plan.null_checks[0].variable, "x");
         assert_eq!(plan.null_checks[0].field_names, vec!["deprecated_by"]);
+    }
+
+    #[test]
+    fn test_lower_property_path() {
+        // Test that property path sequences are properly lowered
+        // Property paths like ?a ex:p1/ex:p2 ?b desugar to:
+        //   ?a ex:p1 ?__anon_0 .
+        //   ?__anon_0 ex:p2 ?b .
+        // These should be recognized as connected through the intermediate blank node
+
+        let query = SelectQuery {
+            select: SelectClause::Star,
+            where_pattern: GroupGraphPattern {
+                patterns: vec![
+                    TriplePattern {
+                        subject: TermOrVariable::Variable(Variable::new_unchecked("a")),
+                        predicate: TermOrVariable::Iri(Iri::new("http://example.org/p1")),
+                        object: TermOrVariable::Variable(Variable::new_unchecked("__anon_0")),
+                    },
+                    TriplePattern {
+                        subject: TermOrVariable::Variable(Variable::new_unchecked("__anon_0")),
+                        predicate: TermOrVariable::Iri(Iri::new("http://example.org/p2")),
+                        object: TermOrVariable::Variable(Variable::new_unchecked("b")),
+                    },
+                ],
+                filters: vec![],
+            },
+            modifier: SolutionModifier::default(),
+            values: None,
+        };
+
+        let schema = test_schema();
+        // This should not error with "disconnected patterns" despite the __anon_0 variable
+        // because __anon_0 is included in connectivity checks
+        let result = lower(&query, &schema);
+        // It may fail for other reasons (unknown types) but should not fail for connectivity
+        if let Err(DarqError::DisconnectedPatterns { .. }) = result {
+            panic!("property path patterns should be recognized as connected");
+        }
     }
 }
