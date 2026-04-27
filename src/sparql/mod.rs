@@ -20,6 +20,12 @@ pub fn validate_select_variables(query: &SelectQuery) -> Result<(), DarqError> {
             bound.insert(v.as_str());
         }
     }
+    for (v, _) in &query.select_expressions {
+        bound.insert(v.as_str());
+    }
+    for (v, _) in &query.binds {
+        bound.insert(v.as_str());
+    }
 
     let unbound: Vec<String> = select_vars
         .iter()

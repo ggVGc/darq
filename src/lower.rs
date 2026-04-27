@@ -40,6 +40,8 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             select: query.select.clone(),
             modifier: query.modifier.clone(),
             values: values.clone(),
+            select_expressions: query.select_expressions.iter().map(|(v, e)| (v.as_str().to_owned(), e.clone())).collect(),
+            binds: query.binds.iter().map(|(v, e)| (v.as_str().to_owned(), e.clone())).collect(),
         });
     }
     Ok(plans)
@@ -1531,6 +1533,8 @@ mod tests {
             },
             modifier: SolutionModifier::default(),
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let plans = lower(&query, &schema).unwrap();
@@ -1610,6 +1614,8 @@ mod tests {
             },
             modifier: SolutionModifier::default(),
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let plans = lower(&query, &schema).unwrap();
@@ -1708,6 +1714,8 @@ mod tests {
             },
             modifier: SolutionModifier::default(),
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let plans = lower(&query, &schema).unwrap();
@@ -1751,6 +1759,8 @@ mod tests {
             },
             modifier: SolutionModifier::default(),
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let schema = test_schema();

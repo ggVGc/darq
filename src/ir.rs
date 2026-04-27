@@ -96,6 +96,10 @@ pub struct QueryPlan {
     pub select: SelectClause,
     pub modifier: SolutionModifier,
     pub values: Option<InlineData>,
+    /// SELECT expressions: `(expr AS ?alias)` computed columns.
+    pub select_expressions: Vec<(String, FilterExpr)>,
+    /// BIND expressions: `BIND(expr AS ?var)` computed variables.
+    pub binds: Vec<(String, FilterExpr)>,
 }
 
 impl QueryPlan {
@@ -199,6 +203,14 @@ impl QueryPlan {
             }
         }
 
+        for (name, _) in &self.binds {
+            if add(name) { vars.push(name.clone()); }
+        }
+
+        for (name, _) in &self.select_expressions {
+            if add(name) { vars.push(name.clone()); }
+        }
+
         vars
     }
 }
@@ -238,6 +250,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         assert_eq!(
@@ -262,6 +276,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         assert_eq!(plan.collect_variables(), vec!["s", "p", "o"]);
@@ -295,6 +311,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         // "p" appears in both patterns but should only appear once
@@ -330,6 +348,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         // Only "name" — bound subject and bound age value are excluded
@@ -347,6 +367,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         assert!(plan.collect_variables().is_empty());

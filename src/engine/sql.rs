@@ -165,6 +165,8 @@ impl<E: SqlExecutor> SqlEngine<'_, E> {
             select: SelectClause::Star,
             modifier,
             values: plan.values.clone(),
+            select_expressions: plan.select_expressions.clone(),
+            binds: plan.binds.clone(),
         };
         let sql = crate::sql::to_sql(&full_plan, schema, &self.subject_column, &self.id_column)?;
         let result = self.executor.execute_sql(&sql)?;
@@ -1316,6 +1318,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1366,6 +1370,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1421,6 +1427,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1493,6 +1501,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1580,6 +1590,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1647,6 +1659,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1737,6 +1751,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1784,6 +1800,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1848,6 +1866,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1904,6 +1924,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let _bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();
@@ -1983,6 +2005,7 @@ mod tests {
                 order_by: vec![crate::sparql::ast::OrderCondition {
                     variable: Variable::new_unchecked("age"),
                     direction: crate::sparql::ast::OrderDirection::Descending,
+                    expression: None,
                 }],
                 limit: Some(5),
                 offset: None,
@@ -1992,6 +2015,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let bindings = engine.evaluate_plans(&[plan.clone()], &schema).unwrap();

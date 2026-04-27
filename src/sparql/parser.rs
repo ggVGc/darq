@@ -65,6 +65,7 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
     let mut offset = None;
     let mut select = SelectClause::Star;
     let mut aggregate_alias: Option<Variable> = None;
+    let mut select_expressions: Vec<(Variable, FilterExpr)> = Vec::new();
 
     loop {
         match pattern {
@@ -97,9 +98,9 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
                     aggregate_alias = Some(variable);
                     pattern = *inner;
                 } else {
-                    return Err(DarqError::ParseError(
-                        "only aggregate aliases are supported in SELECT expressions".into(),
-                    ));
+                    let filter_expr = convert_expression(expression)?;
+                    select_expressions.push((variable, filter_expr));
+                    pattern = *inner;
                 }
             }
             GraphPattern::Group { inner, variables, aggregates } => {
@@ -125,13 +126,15 @@ fn unwrap_algebra(mut pattern: GraphPattern, is_select_star: bool) -> Result<Sel
         }
     }
 
-    let (where_pattern, values) = extract_body(pattern)?;
+    let (where_pattern, values, binds) = extract_body(pattern)?;
 
     Ok(SelectQuery {
         select,
         where_pattern,
         modifier: SolutionModifier { distinct, order_by, limit, offset },
         values,
+        select_expressions,
+        binds,
     })
 }
 
@@ -141,14 +144,29 @@ fn convert_order_expressions(exprs: Vec<OrderExpression>) -> Result<Vec<OrderCon
             OrderExpression::Asc(Expression::Variable(v)) => Ok(OrderCondition {
                 variable: v,
                 direction: OrderDirection::Ascending,
+                expression: None,
             }),
             OrderExpression::Desc(Expression::Variable(v)) => Ok(OrderCondition {
                 variable: v,
                 direction: OrderDirection::Descending,
+                expression: None,
             }),
-            _ => Err(DarqError::ParseError(
-                "only ORDER BY on variables (ASC/DESC) is supported".into(),
-            )),
+            OrderExpression::Asc(expr) => {
+                let filter_expr = convert_expression(expr)?;
+                Ok(OrderCondition {
+                    variable: Variable::new_unchecked("__order_expr"),
+                    direction: OrderDirection::Ascending,
+                    expression: Some(filter_expr),
+                })
+            }
+            OrderExpression::Desc(expr) => {
+                let filter_expr = convert_expression(expr)?;
+                Ok(OrderCondition {
+                    variable: Variable::new_unchecked("__order_expr"),
+                    direction: OrderDirection::Descending,
+                    expression: Some(filter_expr),
+                })
+            }
         }
     }).collect()
 }
@@ -207,12 +225,14 @@ fn desugar_path(
     }
 }
 
-/// Extract the WHERE body and optional VALUES clause from the inner pattern.
-fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<ValuesClause>), DarqError> {
+type BodyResult = (GroupGraphPattern, Option<ValuesClause>, Vec<(Variable, FilterExpr)>);
+
+/// Extract the WHERE body, optional VALUES clause, and BIND expressions from the inner pattern.
+fn extract_body(pattern: GraphPattern) -> Result<BodyResult, DarqError> {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             let triples = patterns.into_iter().map(convert_triple).collect::<Result<_, _>>()?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None, vec![]))
         }
 
         GraphPattern::Path { subject, path, object } => {
@@ -220,33 +240,33 @@ fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<Valu
             let object_tv = convert_term_pattern(object)?;
             let mut triples = Vec::new();
             desugar_path(subject_tv, &path, object_tv, &mut triples)?;
-            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None))
+            Ok((GroupGraphPattern { patterns: triples, filters: vec![], optionals: vec![] }, None, vec![]))
         }
 
         GraphPattern::Filter { expr, inner } => {
             let filters = extract_filters(expr)?;
-            let (mut ggp, values) = extract_body(*inner)?;
+            let (mut ggp, values, binds) = extract_body(*inner)?;
             ggp.filters.extend(filters);
-            Ok((ggp, values))
+            Ok((ggp, values, binds))
         }
 
         GraphPattern::Join { left, right } => {
             if let GraphPattern::Values { variables, bindings } = *right {
-                let (ggp, existing_values) = extract_body(*left)?;
+                let (ggp, existing_values, binds) = extract_body(*left)?;
                 if existing_values.is_some() {
                     return Err(DarqError::ParseError("multiple VALUES clauses not supported".into()));
                 }
-                return Ok((ggp, Some(ValuesClause { variables, bindings })));
+                return Ok((ggp, Some(ValuesClause { variables, bindings }), binds));
             }
             if let GraphPattern::Values { variables, bindings } = *left {
-                let (ggp, existing_values) = extract_body(*right)?;
+                let (ggp, existing_values, binds) = extract_body(*right)?;
                 if existing_values.is_some() {
                     return Err(DarqError::ParseError("multiple VALUES clauses not supported".into()));
                 }
-                return Ok((ggp, Some(ValuesClause { variables, bindings })));
+                return Ok((ggp, Some(ValuesClause { variables, bindings }), binds));
             }
-            let (left_ggp, left_values) = extract_body(*left)?;
-            let (right_ggp, right_values) = extract_body(*right)?;
+            let (left_ggp, left_values, left_binds) = extract_body(*left)?;
+            let (right_ggp, right_values, right_binds) = extract_body(*right)?;
             if left_values.is_some() && right_values.is_some() {
                 return Err(DarqError::ParseError("multiple VALUES clauses not supported".into()));
             }
@@ -256,12 +276,14 @@ fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<Valu
             filters.extend(right_ggp.filters);
             let mut optionals = left_ggp.optionals;
             optionals.extend(right_ggp.optionals);
-            Ok((GroupGraphPattern { patterns, filters, optionals }, left_values.or(right_values)))
+            let mut binds = left_binds;
+            binds.extend(right_binds);
+            Ok((GroupGraphPattern { patterns, filters, optionals }, left_values.or(right_values), binds))
         }
 
         GraphPattern::LeftJoin { left, right, expression } => {
-            let (mut left_ggp, values) = extract_body(*left)?;
-            let (right_ggp, _right_values) = extract_body(*right)?;
+            let (mut left_ggp, values, left_binds) = extract_body(*left)?;
+            let (right_ggp, _right_values, right_binds) = extract_body(*right)?;
             let mut opt_filters = right_ggp.filters;
             if let Some(expr) = expression {
                 opt_filters.extend(extract_filters(expr)?);
@@ -270,13 +292,21 @@ fn extract_body(pattern: GraphPattern) -> Result<(GroupGraphPattern, Option<Valu
                 patterns: right_ggp.patterns,
                 filters: opt_filters,
             });
-            // Nested optionals from the right side get promoted to the left
             left_ggp.optionals.extend(right_ggp.optionals);
-            Ok((left_ggp, values))
+            let mut binds = left_binds;
+            binds.extend(right_binds);
+            Ok((left_ggp, values, binds))
+        }
+
+        GraphPattern::Extend { inner, variable, expression } => {
+            let filter_expr = convert_expression(expression)?;
+            let (ggp, values, mut binds) = extract_body(*inner)?;
+            binds.push((variable, filter_expr));
+            Ok((ggp, values, binds))
         }
 
         GraphPattern::Values { variables, bindings } => {
-            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![] }, Some(ValuesClause { variables, bindings })))
+            Ok((GroupGraphPattern { patterns: vec![], filters: vec![], optionals: vec![] }, Some(ValuesClause { variables, bindings }), vec![]))
         }
 
         ref other => Err(DarqError::ParseError(format!(
@@ -312,7 +342,7 @@ fn extract_filters(expr: Expression) -> Result<Vec<Filter>, DarqError> {
     match expr {
         Expression::Not(inner) => {
             if let Expression::Exists(gp) = *inner {
-                let (ggp, _) = extract_body(*gp)?;
+                let (ggp, _, _) = extract_body(*gp)?;
                 Ok(vec![Filter::NotExists(ggp)])
             } else {
                 Ok(vec![Filter::Expression(FilterExpr::Not(
@@ -370,7 +400,7 @@ fn convert_expression(expr: Expression) -> Result<FilterExpr, DarqError> {
         )),
         Expression::Not(inner) => {
             if let Expression::Exists(gp) = *inner {
-                let (ggp, _) = extract_body(*gp)?;
+                let (ggp, _, _) = extract_body(*gp)?;
                 Ok(FilterExpr::Not(Box::new(FilterExpr::Exists(ggp))))
             } else {
                 Ok(FilterExpr::Not(Box::new(convert_expression(*inner)?)))
@@ -378,8 +408,21 @@ fn convert_expression(expr: Expression) -> Result<FilterExpr, DarqError> {
         }
         Expression::Bound(v) => Ok(FilterExpr::Bound(v)),
         Expression::Exists(gp) => {
-            let (ggp, _) = extract_body(*gp)?;
+            let (ggp, _, _) = extract_body(*gp)?;
             Ok(FilterExpr::Exists(ggp))
+        }
+        Expression::Coalesce(exprs) => {
+            let converted: Vec<FilterExpr> = exprs.into_iter()
+                .map(|e| convert_expression(e))
+                .collect::<Result<_, _>>()?;
+            Ok(FilterExpr::Coalesce(converted))
+        }
+        Expression::If(cond, then, otherwise) => {
+            Ok(FilterExpr::If(
+                Box::new(convert_expression(*cond)?),
+                Box::new(convert_expression(*then)?),
+                Box::new(convert_expression(*otherwise)?),
+            ))
         }
         Expression::FunctionCall(func, args) => {
             convert_function_call(func, args)
@@ -411,6 +454,61 @@ fn convert_function_call(
                 Box::new(convert_expression(iter.next().unwrap())?),
                 Box::new(convert_expression(iter.next().unwrap())?),
             ))
+        }
+        Function::Concat => {
+            let converted: Vec<FilterExpr> = args.into_iter()
+                .map(|e| convert_expression(e))
+                .collect::<Result<_, _>>()?;
+            Ok(FilterExpr::Concat(converted))
+        }
+        Function::Replace => {
+            if args.len() < 3 {
+                return Err(DarqError::ParseError("REPLACE() takes at least 3 arguments".into()));
+            }
+            let mut iter = args.into_iter();
+            Ok(FilterExpr::Replace(
+                Box::new(convert_expression(iter.next().unwrap())?),
+                Box::new(convert_expression(iter.next().unwrap())?),
+                Box::new(convert_expression(iter.next().unwrap())?),
+            ))
+        }
+        Function::StrAfter => {
+            if args.len() != 2 {
+                return Err(DarqError::ParseError("STRAFTER() takes exactly 2 arguments".into()));
+            }
+            let mut iter = args.into_iter();
+            Ok(FilterExpr::StrAfter(
+                Box::new(convert_expression(iter.next().unwrap())?),
+                Box::new(convert_expression(iter.next().unwrap())?),
+            ))
+        }
+        Function::StrStarts => {
+            if args.len() != 2 {
+                return Err(DarqError::ParseError("STRSTARTS() takes exactly 2 arguments".into()));
+            }
+            let mut iter = args.into_iter();
+            Ok(FilterExpr::StrStarts(
+                Box::new(convert_expression(iter.next().unwrap())?),
+                Box::new(convert_expression(iter.next().unwrap())?),
+            ))
+        }
+        Function::UCase => {
+            if args.len() != 1 {
+                return Err(DarqError::ParseError("UCASE() takes exactly 1 argument".into()));
+            }
+            Ok(FilterExpr::UCase(Box::new(convert_expression(args.into_iter().next().unwrap())?)))
+        }
+        Function::Custom(nn) if nn.as_str() == "http://www.w3.org/2001/XMLSchema#integer" => {
+            if args.len() != 1 {
+                return Err(DarqError::ParseError("xsd:integer() takes exactly 1 argument".into()));
+            }
+            Ok(convert_expression(args.into_iter().next().unwrap())?)
+        }
+        Function::Iri => {
+            if args.len() != 1 {
+                return Err(DarqError::ParseError("IRI() takes exactly 1 argument".into()));
+            }
+            Ok(FilterExpr::ToIri(Box::new(convert_expression(args.into_iter().next().unwrap())?)))
         }
         _ => Err(DarqError::ParseError(format!(
             "unsupported function: {:?}", func

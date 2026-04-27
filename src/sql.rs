@@ -479,12 +479,22 @@ fn assemble_final_sql(
         SelectClause::Count { .. } => unreachable!(),
     };
 
+    let expr_map: HashMap<&str, &FilterExpr> = plan.select_expressions.iter()
+        .map(|(name, expr)| (name.as_str(), expr))
+        .collect();
+
     let select_cols: Vec<String> = vars
         .iter()
         .filter_map(|v| {
-            st.select_bindings
-                .get(v)
-                .map(|expr| format!("{} AS \"{}\"", expr.to_sql(), v))
+            if let Some(expr) = expr_map.get(v.as_str()) {
+                filter_expr_to_sql(expr, &st.select_bindings)
+                    .ok()
+                    .map(|sql| format!("{} AS \"{}\"", sql, v))
+            } else {
+                st.select_bindings
+                    .get(v)
+                    .map(|expr| format!("{} AS \"{}\"", expr.to_sql(), v))
+            }
         })
         .collect();
 
@@ -503,14 +513,20 @@ fn assemble_final_sql(
             .modifier
             .order_by
             .iter()
-            .map(|oc| {
+            .filter_map(|oc| {
                 let dir = match oc.direction {
                     OrderDirection::Ascending => "ASC",
                     OrderDirection::Descending => "DESC",
                 };
-                match st.select_bindings.get(oc.variable.as_str()) {
-                    Some(expr) => format!("{} {}", expr.to_sql(), dir),
-                    None => format!("\"{}\" {}", oc.variable.as_str(), dir),
+                if let Some(ref expr) = oc.expression {
+                    filter_expr_to_sql(expr, &st.select_bindings)
+                        .ok()
+                        .map(|s| format!("{} {}", s, dir))
+                } else {
+                    match st.select_bindings.get(oc.variable.as_str()) {
+                        Some(expr) => Some(format!("{} {}", expr.to_sql(), dir)),
+                        None => Some(format!("\"{}\" {}", oc.variable.as_str(), dir)),
+                    }
                 }
             })
             .collect();
@@ -568,6 +584,14 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
 
     if let Some(ref values) = plan.values {
         process_values_clause(values, &mut st);
+    }
+
+    // Process BIND expressions: resolve to SQL and add to bindings.
+    for (var_name, expr) in &plan.binds {
+        let sql_str = filter_expr_to_sql(expr, &st.select_bindings)?;
+        let sql_expr = SqlExpr::Constant(sql_str);
+        st.select_bindings.insert(var_name.clone(), sql_expr.clone());
+        st.join_bindings.insert(var_name.clone(), sql_expr);
     }
 
     process_not_exists_filters(
@@ -641,6 +665,8 @@ pub fn to_union_sql(
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: plan.values.clone(),
+            select_expressions: plan.select_expressions.clone(),
+            binds: plan.binds.clone(),
         };
         subqueries.push(to_sql(&inner_plan, schema, subject_column, id_column)?);
     }
@@ -776,6 +802,48 @@ fn filter_expr_to_sql(
         }
         FilterExpr::Exists(_) => {
             Err(DarqError::SqlError("FILTER EXISTS not yet supported in SQL generation".into()))
+        }
+        FilterExpr::Coalesce(exprs) => {
+            let parts: Vec<String> = exprs.iter()
+                .map(|e| filter_expr_to_sql(e, bindings))
+                .collect::<Result<_, _>>()?;
+            Ok(format!("COALESCE({})", parts.join(", ")))
+        }
+        FilterExpr::Concat(exprs) => {
+            let parts: Vec<String> = exprs.iter()
+                .map(|e| filter_expr_to_sql(e, bindings))
+                .collect::<Result<_, _>>()?;
+            Ok(format!("({})", parts.join(" || ")))
+        }
+        FilterExpr::Replace(input, pattern, replacement) => {
+            let i = filter_expr_to_sql(input, bindings)?;
+            let p = filter_expr_to_sql(pattern, bindings)?;
+            let r = filter_expr_to_sql(replacement, bindings)?;
+            Ok(format!("REPLACE({}, {}, {})", i, p, r))
+        }
+        FilterExpr::StrAfter(input, separator) => {
+            let i = filter_expr_to_sql(input, bindings)?;
+            let s = filter_expr_to_sql(separator, bindings)?;
+            Ok(format!("CASE WHEN POSITION({s} IN {i}) > 0 THEN SUBSTRING({i} FROM POSITION({s} IN {i}) + LENGTH({s})) ELSE '' END"))
+        }
+        FilterExpr::StrStarts(input, prefix) => {
+            let i = filter_expr_to_sql(input, bindings)?;
+            let p = filter_expr_to_sql(prefix, bindings)?;
+            Ok(format!("({i} LIKE {p} || '%%')"))
+        }
+        FilterExpr::If(cond, then, otherwise) => {
+            let c = filter_expr_to_sql(cond, bindings)?;
+            let t = filter_expr_to_sql(then, bindings)?;
+            let e = filter_expr_to_sql(otherwise, bindings)?;
+            Ok(format!("CASE WHEN {} THEN {} ELSE {} END", c, t, e))
+        }
+        FilterExpr::UCase(inner) => {
+            let s = filter_expr_to_sql(inner, bindings)?;
+            Ok(format!("UPPER({})", s))
+        }
+        FilterExpr::ToIri(inner) => {
+            let s = filter_expr_to_sql(inner, bindings)?;
+            Ok(s)
         }
     }
 }
@@ -1025,6 +1093,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1061,6 +1131,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1111,6 +1183,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1142,6 +1216,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1178,6 +1254,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1207,6 +1285,7 @@ mod tests {
                 order_by: vec![OrderCondition {
                     variable: Variable::new_unchecked("name"),
                     direction: OrderDirection::Ascending,
+                    expression: None,
                 }],
                 limit: Some(10),
                 offset: Some(5),
@@ -1216,6 +1295,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1249,6 +1330,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1286,6 +1369,7 @@ mod tests {
                 order_by: vec![OrderCondition {
                     variable: Variable::new_unchecked("age"),
                     direction: OrderDirection::Descending,
+                    expression: None,
                 }],
                 limit: Some(1),
                 offset: None,
@@ -1295,6 +1379,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1329,6 +1415,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1359,6 +1447,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1396,6 +1486,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1431,6 +1523,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -1499,6 +1593,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -1529,6 +1625,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_subject").unwrap();
@@ -1580,6 +1678,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1628,6 +1728,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1662,6 +1764,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1700,6 +1804,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "rdf_subject", "id").unwrap();
@@ -1790,6 +1896,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -1839,6 +1947,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -1912,6 +2022,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "rdf_subject", "id").unwrap();
@@ -1956,6 +2068,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2001,6 +2115,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2046,6 +2162,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &schema, "_subject", "_id").unwrap();
@@ -2099,6 +2217,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2151,6 +2271,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2197,6 +2319,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();
@@ -2239,6 +2363,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
         let plan_b = QueryPlan {
             patterns: vec![QueryPattern::Resource {
@@ -2260,6 +2386,8 @@ mod tests {
             expr_filters: vec![],
             optionals: vec![],
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_union_sql(&[plan_a, plan_b], &Schema::new(), "_subject", "_subject").unwrap();
@@ -2297,6 +2425,8 @@ mod tests {
             select: SelectClause::Star,
             modifier: SolutionModifier::default(),
             values: None,
+            select_expressions: vec![],
+            binds: vec![],
         };
 
         let sql = to_sql(&plan, &Schema::new(), "_subject", "_subject").unwrap();

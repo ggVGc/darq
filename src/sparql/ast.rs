@@ -9,6 +9,10 @@ pub struct SelectQuery {
     pub where_pattern: GroupGraphPattern,
     pub modifier: SolutionModifier,
     pub values: Option<ValuesClause>,
+    /// SELECT expressions: `(expr AS ?alias)` computed columns.
+    pub select_expressions: Vec<(Variable, FilterExpr)>,
+    /// BIND expressions from the WHERE clause: `BIND(expr AS ?var)`.
+    pub binds: Vec<(Variable, FilterExpr)>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +59,14 @@ pub enum FilterExpr {
     Str(Box<FilterExpr>),
     Contains(Box<FilterExpr>, Box<FilterExpr>),
     Exists(GroupGraphPattern),
+    Coalesce(Vec<FilterExpr>),
+    Concat(Vec<FilterExpr>),
+    Replace(Box<FilterExpr>, Box<FilterExpr>, Box<FilterExpr>),
+    StrAfter(Box<FilterExpr>, Box<FilterExpr>),
+    StrStarts(Box<FilterExpr>, Box<FilterExpr>),
+    If(Box<FilterExpr>, Box<FilterExpr>, Box<FilterExpr>),
+    UCase(Box<FilterExpr>),
+    ToIri(Box<FilterExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +95,7 @@ pub struct SolutionModifier {
 pub struct OrderCondition {
     pub variable: Variable,
     pub direction: OrderDirection,
+    pub expression: Option<FilterExpr>,
 }
 
 #[derive(Debug, Clone)]
