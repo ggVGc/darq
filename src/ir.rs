@@ -66,6 +66,12 @@ pub struct NotExistsFilter {
     pub inner_patterns: Vec<QueryPattern>,
 }
 
+/// An EXISTS filter: inner patterns that must produce at least one match.
+#[derive(Debug, Clone)]
+pub struct ExistsFilter {
+    pub inner_patterns: Vec<QueryPattern>,
+}
+
 /// A null-check filter: specified fields on a variable's resource must be NULL.
 /// Used as an optimized replacement for `FILTER NOT EXISTS {[] pred ?var}`
 /// when the schema registers a rewrite via `register_not_exists_rewrite`.
@@ -98,6 +104,7 @@ pub struct SubqueryPlan {
 pub struct QueryPlan {
     pub patterns: Vec<QueryPattern>,
     pub filters: Vec<NotExistsFilter>,
+    pub exists_filters: Vec<ExistsFilter>,
     pub null_checks: Vec<NullCheckFilter>,
     pub expr_filters: Vec<FilterExpr>,
     pub optionals: Vec<OptionalGroup>,
@@ -260,6 +267,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -289,6 +297,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -327,6 +336,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -367,6 +377,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -389,6 +400,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],

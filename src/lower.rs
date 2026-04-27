@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, InlineData, NotExistsFilter, NullCheckFilter, OptionalGroup, QueryPattern, QueryPlan, Subject, SubqueryPlan, Value};
+use crate::ir::{ExistsFilter, FieldConstraint, InlineData, NotExistsFilter, NullCheckFilter, OptionalGroup, QueryPattern, QueryPlan, Subject, SubqueryPlan, Value};
 use crate::rdf::{Iri, Literal, Term, RDF_TYPE};
 use crate::schema::Schema;
 use crate::sparql::ast::*;
@@ -25,7 +25,7 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
             }
         }
 
-        let (filters, null_checks, expr_filters) = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
+        let (filters, exists_filters, null_checks, expr_filters) = lower_filters(&query.where_pattern.filters, schema, &outer_var_types)?;
 
         let optionals = lower_optionals(&query.where_pattern.optionals, schema)?;
 
@@ -34,6 +34,7 @@ pub fn lower(query: &SelectQuery, schema: &Schema) -> Result<Vec<QueryPlan>, Dar
         plans.push(QueryPlan {
             patterns,
             filters,
+            exists_filters,
             null_checks,
             expr_filters,
             optionals,
@@ -284,8 +285,9 @@ fn lower_filters(
     filters: &[Filter],
     schema: &Schema,
     outer_var_types: &HashMap<String, Iri>,
-) -> Result<(Vec<NotExistsFilter>, Vec<NullCheckFilter>, Vec<FilterExpr>), DarqError> {
+) -> Result<(Vec<NotExistsFilter>, Vec<ExistsFilter>, Vec<NullCheckFilter>, Vec<FilterExpr>), DarqError> {
     let mut not_exists = Vec::new();
+    let mut exists = Vec::new();
     let mut null_checks = Vec::new();
     let mut expr_filters = Vec::new();
     for filter in filters {
@@ -314,12 +316,32 @@ fn lower_filters(
                     Err(e) => return Err(e),
                 }
             }
+            Filter::Expression(FilterExpr::Exists(ggp)) => {
+                match lower_bgp(ggp, schema) {
+                    Ok(patterns) => {
+                        exists.push(ExistsFilter { inner_patterns: patterns });
+                    }
+                    Err(DarqError::AmbiguousType { ref subject, ref candidates })
+                        if candidates.len() > 1 =>
+                    {
+                        let narrowed = narrow_candidates_by_outer_types(
+                            candidates, ggp, schema, outer_var_types,
+                        );
+                        for candidate in &narrowed {
+                            let augmented = augment_with_type(ggp, subject, candidate);
+                            let patterns = lower_bgp(&augmented, schema)?;
+                            exists.push(ExistsFilter { inner_patterns: patterns });
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             Filter::Expression(expr) => {
                 expr_filters.push(expr.clone());
             }
         }
     }
-    Ok((not_exists, null_checks, expr_filters))
+    Ok((not_exists, exists, null_checks, expr_filters))
 }
 
 fn lower_optionals(

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::error::DarqError;
-use crate::ir::{FieldConstraint, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
+use crate::ir::{ExistsFilter, FieldConstraint, NotExistsFilter, QueryPattern, QueryPlan, Subject, Value};
 use crate::rdf::{Iri, Literal, Term};
 use crate::schema::Schema;
 use crate::sparql::ast::{FilterExpr, OrderDirection, SelectClause};
@@ -49,6 +49,19 @@ impl SqlExpr {
                 )
             }
         }
+    }
+
+    fn to_scalar_sql(&self) -> String {
+        match self {
+            SqlExpr::Unnest { pattern_idx, column } => {
+                format!("\"p{}\".\"{}\"", pattern_idx, column)
+            }
+            other => other.to_sql(),
+        }
+    }
+
+    fn is_array(&self) -> bool {
+        matches!(self, SqlExpr::Unnest { .. })
     }
 }
 
@@ -468,6 +481,24 @@ fn process_not_exists_filters(
     Ok(())
 }
 
+fn process_exists_filters(
+    filters: &[ExistsFilter],
+    schema: &Schema,
+    subject_column: &str,
+    id_column: &str,
+    join_bindings: &HashMap<String, SqlExpr>,
+    where_parts: &mut Vec<String>,
+) -> Result<(), DarqError> {
+    for (fi, filter) in filters.iter().enumerate() {
+        let ne_filter = NotExistsFilter { inner_patterns: filter.inner_patterns.clone() };
+        let subquery = generate_not_exists_subquery(
+            &ne_filter, 1000 + fi, schema, subject_column, id_column, join_bindings,
+        )?;
+        where_parts.push(format!("EXISTS ({})", subquery));
+    }
+    Ok(())
+}
+
 /// Assemble the final SQL string from accumulated build state.
 fn assemble_final_sql(
     plan: &QueryPlan,
@@ -652,6 +683,10 @@ pub fn to_sql(plan: &QueryPlan, schema: &Schema, subject_column: &str, id_column
         &plan.filters, schema, subject_column, id_column,
         &st.join_bindings, &mut st.where_parts,
     )?;
+    process_exists_filters(
+        &plan.exists_filters, schema, subject_column, id_column,
+        &st.join_bindings, &mut st.where_parts,
+    )?;
 
     // Null-check filters.
     for nc in &plan.null_checks {
@@ -713,6 +748,7 @@ pub fn to_union_sql(
         let inner_plan = QueryPlan {
             patterns: plan.patterns.clone(),
             filters: plan.filters.clone(),
+            exists_filters: plan.exists_filters.clone(),
             null_checks: plan.null_checks.clone(),
             expr_filters: plan.expr_filters.clone(),
             optionals: plan.optionals.clone(),
@@ -923,7 +959,7 @@ fn filter_expr_to_sql(
         }
         FilterExpr::GroupConcat { expr, separator } => {
             let s = filter_expr_to_sql(expr, bindings)?;
-            Ok(format!("STRING_AGG({}, '{}')", s, separator.replace('\'', "''")))
+            Ok(format!("STRING_AGG(CAST({} AS TEXT), '{}')", s, separator.replace('\'', "''")))
         }
     }
 }
@@ -1047,11 +1083,7 @@ fn generate_not_exists_subquery(
                 match subject {
                     Subject::Variable(v) => {
                         if let Some(outer_expr) = outer_bindings.get(v) {
-                            // Correlate with outer query
-                            join_conds.push(format!(
-                                "\"{}\".\"{}\" = {}",
-                                alias, id_column, outer_expr.to_sql()
-                            ));
+                            join_conds.push(outer_expr.to_join_sql(&alias, id_column));
                         } else if let Some(inner_expr) = inner_bindings.get(v) {
                             join_conds.push(format!(
                                 "\"{}\".\"{}\" = {}",
@@ -1088,9 +1120,21 @@ fn generate_not_exists_subquery(
                         Value::Variable(v) => {
                             // Check outer bindings first (correlation), then inner
                             if let Some(outer_expr) = outer_bindings.get(v) {
-                                join_conds.push(field_comparison_sql(
-                                    &alias, &c.field_name, &outer_expr.to_sql(), is_array,
-                                ));
+                                if outer_expr.is_array() && is_array {
+                                    join_conds.push(format!(
+                                        "\"{}\".\"{}\" && {}",
+                                        alias, c.field_name, outer_expr.to_scalar_sql()
+                                    ));
+                                } else if outer_expr.is_array() {
+                                    join_conds.push(format!(
+                                        "\"{}\".\"{}\" = ANY({})",
+                                        alias, c.field_name, outer_expr.to_scalar_sql()
+                                    ));
+                                } else {
+                                    join_conds.push(field_comparison_sql(
+                                        &alias, &c.field_name, &outer_expr.to_sql(), is_array,
+                                    ));
+                                }
                             } else if let Some(inner_expr) = inner_bindings.get(v) {
                                 join_conds.push(field_comparison_sql(
                                     &alias, &c.field_name, &inner_expr.to_sql(), is_array,
@@ -1169,6 +1213,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1210,6 +1255,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1265,6 +1311,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1301,6 +1348,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1342,6 +1390,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1386,6 +1435,7 @@ mod tests {
                 offset: Some(5),
             },
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1424,6 +1474,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1476,6 +1527,7 @@ mod tests {
                 offset: None,
             },
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1515,6 +1567,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("p")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1550,6 +1603,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("p")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1592,6 +1646,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("x")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1632,6 +1687,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1705,6 +1761,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("tag")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1740,6 +1797,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("s")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1796,6 +1854,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1849,6 +1908,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1888,6 +1948,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -1931,6 +1992,7 @@ mod tests {
             select: SelectClause::Star,
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2026,6 +2088,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2080,6 +2143,7 @@ mod tests {
             ]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2158,6 +2222,7 @@ mod tests {
             select: SelectClause::Variables(vec![Variable::new_unchecked("pet")]),
             modifier: empty_modifier(),
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2207,6 +2272,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2257,6 +2323,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2307,6 +2374,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2365,6 +2433,7 @@ mod tests {
             ],
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2422,6 +2491,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2473,6 +2543,7 @@ mod tests {
             }],
             select: SelectClause::Variables(vec![Variable::new_unchecked("name")]),
             modifier: empty_modifier(),
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2520,6 +2591,7 @@ mod tests {
                 ..SolutionModifier::default()
             },
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2546,6 +2618,7 @@ mod tests {
                 ..SolutionModifier::default()
             },
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![],
             expr_filters: vec![],
             optionals: vec![],
@@ -2583,6 +2656,7 @@ mod tests {
                 type_variable: None,
             }],
             filters: vec![],
+            exists_filters: vec![],
             null_checks: vec![NullCheckFilter {
                 variable: "x".into(),
                 field_names: vec!["deprecated_by_a".into(), "deprecated_by_b".into()],
