@@ -33,6 +33,23 @@ impl SqlExpr {
             SqlExpr::Constant(s) => s.clone(),
         }
     }
+
+    fn to_join_sql(&self, target_alias: &str, target_column: &str) -> String {
+        match self {
+            SqlExpr::Unnest { pattern_idx, column } => {
+                format!(
+                    "\"{}\".\"{}\" = ANY(\"p{}\".\"{}\")",
+                    target_alias, target_column, pattern_idx, column
+                )
+            }
+            other => {
+                format!(
+                    "\"{}\".\"{}\" = {}",
+                    target_alias, target_column, other.to_sql()
+                )
+            }
+        }
+    }
 }
 
 /// Schema and column-name context shared across all pattern processing.
@@ -108,10 +125,7 @@ fn process_resource_pattern(
     match subject {
         Subject::Variable(v) => {
             if let Some(existing) = st.join_bindings.get(v) {
-                join_conds.push(format!(
-                    "\"{}\".\"{}\" = {}",
-                    alias, id_column, existing.to_sql()
-                ));
+                join_conds.push(existing.to_join_sql(&alias, id_column));
                 st.select_bindings.insert(
                     v.clone(),
                     SqlExpr::Column { pattern_idx: i, column: subject_column.to_string() },
@@ -230,10 +244,7 @@ fn process_optional_group(
                 match subject {
                     Subject::Variable(v) => {
                         if let Some(existing) = st.join_bindings.get(v) {
-                            on_conds.push(format!(
-                                "\"{}\".\"{}\" = {}",
-                                alias, id_column, existing.to_sql()
-                            ));
+                            on_conds.push(existing.to_join_sql(&alias, id_column));
                         }
                         st.select_bindings
                             .entry(v.clone())

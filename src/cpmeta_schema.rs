@@ -234,7 +234,7 @@ define_resource!(
     Membership, tbl!("ct_memberships"), [
         ("label",                  rdfs!("label"),                    FieldType::StringArray),
         ("has_role",               cpmeta!("hasRole"),                ref_to!(tbl!("ct_roles"))),
-        ("at_organization",        cpmeta!("atOrganization"),         ref_to!(tbl!("ct_organizations"))),
+        ("at_organization",        cpmeta!("atOrganization"),         ref_to!(tbl!("ct_organizations"), tbl!("ct_stations"))),
         ("has_start_time",         cpmeta!("hasStartTime"),           FieldType::DateTime),
         ("has_attribution_weight", cpmeta!("hasAttributionWeight"),   FieldType::Integer),
         ("has_end_time",           cpmeta!("hasEndTime"),             FieldType::DateTime),

@@ -66,7 +66,15 @@ impl SqlExecutor for PostgresExecutor {
         let mut client = self.client.borrow_mut();
         let rows = client
             .query(sql, &[])
-            .map_err(|e| DarqError::SqlError(e.to_string()))?;
+            .map_err(|e| {
+                let mut msg = e.to_string();
+                if let Some(db_err) = e.as_db_error() {
+                    msg = format!("{}: {} (detail: {:?}, hint: {:?})",
+                        db_err.severity(), db_err.message(),
+                        db_err.detail(), db_err.hint());
+                }
+                DarqError::SqlError(msg)
+            })?;
 
         if rows.is_empty() {
             return Ok(SqlResultSet {
