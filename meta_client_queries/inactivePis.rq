@@ -1,0 +1,23 @@
+prefix stentry: <http://meta.icos-cp.eu/ontologies/stationentry/>
+prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+select distinct ?stationTheme ?stationName ?email#(group_concat(distinct ?email; separator = ";") as ?list)
+from <http://meta.icos-cp.eu/ontologies/stationentry/>
+from named <http://meta.icos-cp.eu/resources/stationlabeling/>
+from named <http://meta.icos-cp.eu/resources/stationentry/>
+where{
+	graph <http://meta.icos-cp.eu/resources/stationentry/> {
+		?s a ?stationClass .
+		?s stentry:hasLongName ?stationName .
+		?s stentry:hasPi ?pi .
+		?pi stentry:hasEmail ?email .
+	}
+	filter not exists{
+		graph <http://meta.icos-cp.eu/resources/stationlabeling/> {
+			?s ?p ?o .
+		}
+	}
+	?stationClass rdfs:subClassOf stentry:Station .
+	?stationClass rdfs:label ?stationTheme .
+}
+order by ?stationTheme ?stationName

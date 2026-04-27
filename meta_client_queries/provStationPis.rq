@@ -1,0 +1,14 @@
+prefix st: <http://meta.icos-cp.eu/ontologies/stationentry/>
+select distinct ?stationTheme ?stationId ?stationName ?firstName ?lastName ?email
+from <http://meta.icos-cp.eu/resources/stationentry/>
+where{
+  ?s st:hasShortName ?stationId .
+  ?s st:hasLongName ?stationName .
+  ?s st:hasPi ?pi .
+  ?pi st:hasFirstName ?firstName .
+  ?pi st:hasLastName ?lastName .
+  ?pi st:hasEmail ?email .
+  ?s a ?stationClass .
+  BIND (replace(str(?stationClass), "http://meta.icos-cp.eu/ontologies/stationentry/", "") AS ?stationTheme )
+}
+order by ?stationTheme ?stationId UCASE(?lastName) ?firstName
