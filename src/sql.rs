@@ -957,9 +957,10 @@ fn filter_expr_to_sql(
             let s = filter_expr_to_sql(inner, bindings)?;
             Ok(format!("MIN({})", s))
         }
-        FilterExpr::GroupConcat { expr, separator } => {
+        FilterExpr::GroupConcat { expr, separator, distinct } => {
             let s = filter_expr_to_sql(expr, bindings)?;
-            Ok(format!("STRING_AGG(CAST({} AS TEXT), '{}')", s, separator.replace('\'', "''")))
+            let dist = if *distinct { "DISTINCT " } else { "" };
+            Ok(format!("STRING_AGG({}CAST({} AS TEXT), '{}')", dist, s, separator.replace('\'', "''")))
         }
     }
 }

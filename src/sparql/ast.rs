@@ -76,7 +76,7 @@ pub enum FilterExpr {
     Count { expr: Option<Box<FilterExpr>>, distinct: bool },
     Sum(Box<FilterExpr>),
     Sample(Box<FilterExpr>),
-    GroupConcat { expr: Box<FilterExpr>, separator: String },
+    GroupConcat { expr: Box<FilterExpr>, separator: String, distinct: bool },
 }
 
 #[derive(Debug, Clone)]

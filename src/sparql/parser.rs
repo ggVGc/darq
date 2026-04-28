@@ -250,6 +250,7 @@ fn convert_aggregate(agg: AggregateExpression) -> Result<FilterExpr, DarqError> 
                     Ok(FilterExpr::GroupConcat {
                         expr: Box::new(convert_expression(expr)?),
                         separator: sep,
+                        distinct,
                     })
                 }
                 _ => Err(DarqError::ParseError(format!("unsupported aggregate function: {:?}", name))),
