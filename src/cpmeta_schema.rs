@@ -477,6 +477,259 @@ define_resource!(
 );
 
 // ---------------------------------------------------------------------------
+// Ontology class IRIs and rdfs:subClassOf relationships
+// ---------------------------------------------------------------------------
+
+/// All `(child, parent)` rdfs:subClassOf edges declared in `ontology/cpmeta.owl`.
+/// Restrictions on anonymous classes are intentionally omitted: only edges
+/// pointing at named superclasses are listed.
+const CPMETA_SUBCLASS_EDGES: &[(&str, &str)] = &[
+    (cpmeta!("AS"), cpmeta!("IcosStation")),
+    (cpmeta!("AncillaryEntry"), cpmeta!("AncillaryDatum")),
+    (cpmeta!("AncillaryValue"), cpmeta!("AncillaryDatum")),
+    (cpmeta!("AtmoStation"), cpmeta!("Station")),
+    (cpmeta!("CentralFacility"), cpmeta!("Organization")),
+    (cpmeta!("CityMidLowCostStation"), cpmeta!("IcosCitiesStation")),
+    (cpmeta!("Collection"), cpmeta!("PlainCollection")),
+    (cpmeta!("DataAcquisition"), "http://www.w3.org/ns/prov#Activity"),
+    (cpmeta!("DataObject"), cpmeta!("StaticObject")),
+    (cpmeta!("DataObjectSpec"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("DataProduction"), "http://www.w3.org/ns/prov#Activity"),
+    (cpmeta!("DataSubmission"), "http://www.w3.org/ns/prov#Activity"),
+    (cpmeta!("DataTheme"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("DatasetColumn"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("DatasetSpec"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("DatasetVariable"), "http://www.w3.org/ns/sosa/ObservableProperty"),
+    (cpmeta!("DocumentObject"), cpmeta!("StaticObject")),
+    (cpmeta!("ES"), cpmeta!("IcosStation")),
+    (cpmeta!("EtcNetwork"), cpmeta!("Network")),
+    (cpmeta!("FluxnetStation"), cpmeta!("Station")),
+    (cpmeta!("Funder"), cpmeta!("Organization")),
+    (cpmeta!("IcosCitiesStation"), cpmeta!("Station")),
+    (cpmeta!("IcosStation"), cpmeta!("Station")),
+    (cpmeta!("IngosStation"), cpmeta!("Station")),
+    (cpmeta!("Instrument"), "http://www.w3.org/ns/sosa/Sensor"),
+    (cpmeta!("LinkBox"), cpmeta!("WebpageSpecifyingThing")),
+    (cpmeta!("MunichMidLow"), cpmeta!("CityMidLowCostStation")),
+    (cpmeta!("NeonStation"), cpmeta!("Station")),
+    (cpmeta!("OS"), cpmeta!("IcosStation")),
+    (cpmeta!("ObjectEncoding"), "http://purl.org/dc/terms/FileFormat"),
+    (cpmeta!("ObjectFormat"), "http://purl.org/dc/terms/FileFormat"),
+    (cpmeta!("Organization"), "http://www.w3.org/ns/prov#Agent"),
+    (cpmeta!("ParisMidLow"), cpmeta!("CityMidLowCostStation")),
+    (cpmeta!("Person"), "http://www.w3.org/ns/prov#Agent"),
+    (cpmeta!("PlainCollection"), "http://www.w3.org/ns/prov#Entity"),
+    (cpmeta!("Position"), cpmeta!("SpatialCoverage")),
+    (cpmeta!("Project"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("QuantityKind"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("SailDrone"), cpmeta!("Station")),
+    (cpmeta!("SimpleObjectSpec"), cpmeta!("DataObjectSpec")),
+    (cpmeta!("Site"), "http://www.opengis.net/ont/geosparql#Feature"),
+    (cpmeta!("SpatialCoverage"), "http://www.opengis.net/ont/geosparql#Geometry"),
+    (cpmeta!("SpecificDatasetType"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("StaticObject"), "http://www.w3.org/ns/prov#Entity"),
+    (cpmeta!("Station"), cpmeta!("Organization")),
+    (cpmeta!("StringVocabulary"), cpmeta!("ValueFormat")),
+    (cpmeta!("TabularDatasetSpec"), cpmeta!("DatasetSpec")),
+    (cpmeta!("ThematicCenter"), cpmeta!("CentralFacility")),
+    (cpmeta!("ValueFormat"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("ValueType"), "http://www.w3.org/2004/02/skos/core#Concept"),
+    (cpmeta!("VariableInfo"), cpmeta!("DataObjectSpecifyingThing")),
+    (cpmeta!("WdcggStation"), cpmeta!("Station")),
+    (cpmeta!("WebpageElements"), cpmeta!("WebpageSpecifyingThing")),
+    (cpmeta!("ZurichMidLow"), cpmeta!("CityMidLowCostStation")),
+    ("http://www.opengis.net/ont/geosparql#Feature", "http://www.opengis.net/ont/geosparql#SpatialObject"),
+    ("http://www.opengis.net/ont/geosparql#Geometry", "http://www.opengis.net/ont/geosparql#SpatialObject"),
+    ("https://meta.fieldsites.se/ontologies/sites/Station", cpmeta!("Station")),
+];
+
+/// Class-IRI-to-table mappings derived from the OWL ontology. Each ontology
+/// class IRI is mapped to the canonical SQL-table type IRI it should resolve
+/// to. Most of these are inferred automatically by
+/// `Schema::finalize_subclass_aliases`, but a handful are listed here for
+/// classes whose names happen to coincide with a table type.
+fn register_ontology_classes(schema: &mut Schema) {
+    // The class IRIs that exactly correspond to single registered tables.
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Station")),
+        Iri::new(tbl!("ct_stations")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("StaticObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Person")),
+        Iri::new(tbl!("ct_persons")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Organization")),
+        Iri::new(tbl!("ct_organizations")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("CentralFacility")),
+        Iri::new(tbl!("ct_central_facilities")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Funder")),
+        Iri::new(tbl!("ct_funders")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ThematicCenter")),
+        Iri::new(tbl!("ct_thematic_centers")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Instrument")),
+        Iri::new(tbl!("ct_instruments")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Membership")),
+        Iri::new(tbl!("ct_memberships")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Funding")),
+        Iri::new(tbl!("ct_fundings")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Project")),
+        Iri::new(tbl!("ct_projects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataTheme")),
+        Iri::new(tbl!("ct_data_themes")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataSubmission")),
+        Iri::new(tbl!("ct_data_submissions")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataProduction")),
+        Iri::new(tbl!("ct_data_productions")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataAcquisition")),
+        Iri::new(tbl!("ct_data_acquisitions")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ObjectEncoding")),
+        Iri::new(tbl!("ct_object_encodings")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ObjectFormat")),
+        Iri::new(tbl!("ct_object_formats")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ValueFormat")),
+        Iri::new(tbl!("ct_value_formats")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ValueType")),
+        Iri::new(tbl!("ct_value_types")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("VariableInfo")),
+        Iri::new(tbl!("ct_variable_infos")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DatasetColumn")),
+        Iri::new(tbl!("ct_dataset_columns")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DatasetVariable")),
+        Iri::new(tbl!("ct_dataset_variables")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DatasetSpec")),
+        Iri::new(tbl!("ct_dataset_specs")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("TabularDatasetSpec")),
+        Iri::new(tbl!("ct_dataset_specs")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("EcosystemType")),
+        Iri::new(tbl!("ct_ecosystem_types")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ClimateZone")),
+        Iri::new(tbl!("ct_climate_zones")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("QuantityKind")),
+        Iri::new(tbl!("ct_quantity_kinds")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Role")),
+        Iri::new(tbl!("ct_roles")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("LinkBox")),
+        Iri::new(tbl!("ct_link_boxes")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("WebpageElements")),
+        Iri::new(tbl!("ct_webpage_elements")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("SpecificDatasetType")),
+        Iri::new(tbl!("ct_specific_dataset_types")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("SpatialCoverage")),
+        Iri::new(tbl!("ct_spatial_coverages")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("LatLonBox")),
+        Iri::new(tbl!("ct_spatial_coverages")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Position")),
+        Iri::new(tbl!("ct_spatial_coverages")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DocumentObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("SimpleDataObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("SpatialDataObject")),
+        Iri::new(tbl!("ct_static_objects")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("Collection")),
+        Iri::new(tbl!("ct_collections")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("PlainCollection")),
+        Iri::new(tbl!("ct_plain_collections")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("ObjectSpec")),
+        Iri::new(tbl!("ct_object_specs")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("SimpleObjectSpec")),
+        Iri::new(tbl!("ct_object_specs")),
+    );
+    schema.register_type_alias(
+        Iri::new(cpmeta!("DataObjectSpec")),
+        Iri::new(tbl!("ct_object_specs")),
+    );
+
+    // rdfs:subClassOf edges from the OWL ontology.
+    for (child, parent) in CPMETA_SUBCLASS_EDGES {
+        schema.register_subclass_of(Iri::new(*child), Iri::new(*parent));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Schema construction
 // ---------------------------------------------------------------------------
 
@@ -517,27 +770,12 @@ pub fn cpmeta_schema() -> Schema {
     schema.register::<Collection>();
     schema.register::<PlainCollection>();
 
-    // Ontology-level class names → table-level type IRIs
-    schema.register_type_alias(
-        Iri::new(cpmeta!("DataObject")),
-        Iri::new(tbl!("ct_static_objects")),
-    );
-    schema.register_type_alias(
-        Iri::new(cpmeta!("DocumentObject")),
-        Iri::new(tbl!("ct_static_objects")),
-    );
-    schema.register_type_alias(
-        Iri::new(cpmeta!("Collection")),
-        Iri::new(tbl!("ct_collections")),
-    );
-    schema.register_type_alias(
-        Iri::new(cpmeta!("SimpleObjectSpec")),
-        Iri::new(tbl!("ct_object_specs")),
-    );
-    schema.register_type_alias(
-        Iri::new(cpmeta!("DataObjectSpec")),
-        Iri::new(tbl!("ct_object_specs")),
-    );
+    register_ontology_classes(&mut schema);
+
+    // Resolve every ontology class whose subclass closure unambiguously points
+    // at one registered table. After this call, e.g. `cpmeta:IcosStation`
+    // resolves to `ct_stations` because all of its descendants do.
+    schema.finalize_subclass_aliases();
 
     // NOT EXISTS rewrites: `FILTER NOT EXISTS {[] cpmeta:isNextVersionOf ?x}`
     // becomes null-checks on the deprecation fields of ?x's type.
@@ -553,4 +791,86 @@ pub fn cpmeta_schema() -> Schema {
     );
 
     schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ct(s: &str) -> Iri {
+        Iri::new(format!("http://meta.icos-cp.eu/tables/{}", s))
+    }
+    fn cp(s: &str) -> Iri {
+        Iri::new(format!("http://meta.icos-cp.eu/ontologies/cpmeta/{}", s))
+    }
+
+    #[test]
+    fn ontology_class_resolves_to_table() {
+        let schema = cpmeta_schema();
+        assert_eq!(schema.resolve_type(&cp("Station")), ct("ct_stations"));
+        assert_eq!(schema.resolve_type(&cp("DataObject")), ct("ct_static_objects"));
+        assert_eq!(schema.resolve_type(&cp("Collection")), ct("ct_collections"));
+    }
+
+    #[test]
+    fn subclass_resolves_to_ancestor_table() {
+        // Direct and transitive subclasses of `cpmeta:Station` all live in
+        // `ct_stations`; the auto-alias step should pick that up.
+        let schema = cpmeta_schema();
+        for sub in &[
+            "AS", "ES", "OS", "AtmoStation", "IcosStation", "IngosStation",
+            "SailDrone", "FluxnetStation", "NeonStation", "WdcggStation",
+            "IcosCitiesStation", "CityMidLowCostStation", "MunichMidLow",
+            "ParisMidLow", "ZurichMidLow",
+        ] {
+            assert_eq!(
+                schema.resolve_type(&cp(sub)),
+                ct("ct_stations"),
+                "expected {} to resolve to ct_stations",
+                sub,
+            );
+        }
+    }
+
+    #[test]
+    fn subclass_resolves_to_static_objects() {
+        let schema = cpmeta_schema();
+        for sub in &["DataObject", "DocumentObject", "SimpleDataObject", "SpatialDataObject"] {
+            assert_eq!(
+                schema.resolve_type(&cp(sub)),
+                ct("ct_static_objects"),
+                "expected {} to resolve to ct_static_objects",
+                sub,
+            );
+        }
+    }
+
+    #[test]
+    fn subclass_relationships_recorded() {
+        let schema = cpmeta_schema();
+        let parents = schema.direct_superclasses(&cp("AS"));
+        assert!(parents.contains(&cp("IcosStation")));
+
+        let ancestors = schema.ancestors_of(&cp("AS"));
+        assert!(ancestors.contains(&cp("IcosStation")));
+        assert!(ancestors.contains(&cp("Station")));
+        assert!(ancestors.contains(&cp("Organization")));
+    }
+
+    #[test]
+    fn ambiguous_superclass_is_not_aliased() {
+        // `cpmeta:Organization` has subclasses spread across multiple tables
+        // (ct_central_facilities, ct_funders, ct_organizations,
+        // ct_thematic_centers, ct_stations). It must not auto-alias.
+        let schema = cpmeta_schema();
+        // Organization has its own table; alias should still be exact.
+        assert_eq!(
+            schema.resolve_type(&cp("Organization")),
+            ct("ct_organizations"),
+        );
+        // But prov:Agent — a superclass of Organization AND Person —
+        // straddles ct_organizations and ct_persons, so it stays unresolved.
+        let agent = Iri::new("http://www.w3.org/ns/prov#Agent");
+        assert_eq!(schema.resolve_type(&agent), agent);
+    }
 }

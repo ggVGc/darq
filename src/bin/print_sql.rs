@@ -1,5 +1,6 @@
 use std::process;
 
+use darq::cpmeta_schema;
 use darq::lower;
 use darq::sparql;
 use darq::sql;
@@ -33,7 +34,11 @@ fn main() {
         process::exit(1);
     }
 
-    let schema = test_schema::test_schema();
+    let schema = if input.contains("meta.icos-cp.eu") {
+        cpmeta_schema::cpmeta_schema()
+    } else {
+        test_schema::test_schema()
+    };
 
     let plans = match lower::lower(&query, &schema) {
         Ok(plans) => plans,
