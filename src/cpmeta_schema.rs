@@ -772,6 +772,11 @@ pub fn cpmeta_schema() -> Schema {
 
     register_ontology_classes(&mut schema);
 
+    // Also register the stationentry ontology so SPARQL queries that use
+    // both `cpmeta:` and `stationentry:` predicates can be resolved against
+    // a single Schema.
+    crate::stationentry_schema::register_stationentry(&mut schema);
+
     // Resolve every ontology class whose subclass closure unambiguously points
     // at one registered table. After this call, e.g. `cpmeta:IcosStation`
     // resolves to `ct_stations` because all of its descendants do.
